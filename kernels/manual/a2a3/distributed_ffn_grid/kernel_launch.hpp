@@ -36,4 +36,34 @@ void launchDistributedFfnGridAllGatherMixedKernel(uint8_t *ffts, uint8_t *gather
                                                   uint8_t *yOutput, uint8_t *hcclCtx, int gridRows, int gridCols,
                                                   void *stream);
 
+// ===========================================================================
+// pto::comm variants.  The cross-column combine is done with the existing
+// collective communication API (pto::comm::TREDUCE / pto::comm::TGATHER)
+// instead of the GridPipe mock.  Each variant runs in two launches with a host
+// stream-sync barrier between them: a compute kernel publishes each cell's
+// partial into its HCCL window slot, then a collective kernel combines them.
+// ===========================================================================
+
+// ReduceSum: phase-1 compute writes fp32 down partials [T,H] into window slots.
+void launchFfnCommReduceSumComputeKernel(uint8_t *ffts, uint8_t *windows, uint8_t *x, uint8_t *wGate, uint8_t *wUp,
+                                         uint8_t *wDown, uint8_t *gatePartial, uint8_t *upPartial, uint8_t *hiddenIn,
+                                         uint8_t *downPartial, int gridRows, int gridCols, void *stream);
+// ReduceSum: phase-2 collective, gridRows roots run pto::comm::TREDUCE(Sum).
+// windowsBase is the window arena base (== windowsIn[0]); the kernel folds the
+// row offset into the HcclRemotePtr pe index.
+void launchFfnCommReduceSumCollectiveKernel(uint8_t *ffts, uint8_t *windowsBase, uint8_t *yOutput, uint8_t *hcclCtx,
+                                            int gridRows, int gridCols, void *stream);
+
+// AllGather: phase-1 compute writes fp16 hidden shards [T,Fi] into window slots.
+void launchFfnCommAllGatherComputeKernel(uint8_t *ffts, uint8_t *windows, uint8_t *x, uint8_t *wGate, uint8_t *wUp,
+                                         uint8_t *gatePartial, uint8_t *upPartial, int gridRows, int gridCols,
+                                         void *stream);
+// AllGather: phase-2 collective, each cell runs pto::comm::TGATHER then the down
+// GEMM.  gatherScratch holds the [gridCols*T,Fi] TGATHER destination; hidden /
+// down scratch back the V2C / C2V FIFOs of the in-kernel down projection.
+void launchFfnCommAllGatherCollectiveKernel(uint8_t *ffts, uint8_t *windowsBase, uint8_t *gatherScratch,
+                                            uint8_t *hiddenScratch, uint8_t *downScratch, uint8_t *wDown,
+                                            uint8_t *yOutput, uint8_t *hcclCtx, int gridRows, int gridCols,
+                                            void *stream);
+
 #endif // DISTRIBUTED_FFN_GRID_KERNEL_LAUNCH_HPP
