@@ -25,6 +25,12 @@ template <pto::GridDirection Dir, int Dist, typename Pipe, typename TileCons>
 AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
     static_assert(Dist >= 1, "GridPipe TPOP distance must be >= 1 (routed K-hop unicast)");
+    // Plain bit test, not GridDirInMask(): that helper is host-callable (see
+    // grid_intrinsic.hpp) and this body is AICORE.
+    static_assert(
+        ((Pipe::DirMask >> static_cast<int>(Dir)) & 1) != 0,
+        "GridPipe TPOP<Dir> needs Dir in the pipe's DirMask -- that direction has no slot ring "
+        "(add GridDirBit(Dir) to the GridPipe DirMask template argument).");
 
     constexpr int dirIdx = GridDirectionIndex(Dir);
 
@@ -52,9 +58,23 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = g
         return false;
     }
 
-    // Step 2: compute local SRAM slot address; producer wrote it here.
-    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotBytes;
+    // Step 2: compute local SRAM slot address; producer wrote it here.  Mirrors
+    // the push side: SlotStride addresses the ring, the payload window picks the
+    // sub-window this pop drains.  It must describe the SAME region the producer
+    // pushed -- both sides derive it from the topology, exactly as a5's producer
+    // and consumer both derive entryOffset from the tile id.
+    const GridPayloadWindow win = pipe.popWindow[dirIdx];
+    if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
+        __gm__ uint32_t* rangeFault =
+            pipe.freeScb[dirIdx] ? pipe.freeScb[dirIdx] + grid_mock::kFaultFlagWordOffset : nullptr;
+        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultPopPayloadRange);
+        return false;
+    }
+    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotStride + win.entryOffset;
     __gm__ uint8_t* localSlot = pipe.slotBase[dirIdx] + slotOff;
+    // Bytes this pop touches, measured from `localSlot` (the arena guard below and
+    // the 1-D drain both want the span, not the whole slot).
+    const uint32_t spanBytes = GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) - win.entryOffset;
 
     // Step 2.5: NoC read-locality guard.  A TPOP may only drain *this* core's own
     // SRAM segment -- the fabric has no remote-read path (TPUSH writes across
@@ -63,7 +83,7 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = g
     // PopSlotIsLocal validates `localSlot` against this core's GmSramArena segment
     // and traps a cross-segment read as kFaultPopNonLocal instead of servicing it.
     const int selfRank = RankFromCoord(pipe.coord, pipe.shape);
-    if (!a2a3_grid_payload::PopSlotIsLocal(pipe.runtimeCtx, localSlot, Pipe::SlotBytes, selfRank)) {
+    if (!a2a3_grid_payload::PopSlotIsLocal(pipe.runtimeCtx, localSlot, spanBytes, selfRank)) {
         __gm__ uint32_t* freeFault =
             pipe.freeScb[dirIdx] ? pipe.freeScb[dirIdx] + grid_mock::kFaultFlagWordOffset : nullptr;
         grid_mock::MockSetFault(freeFault, grid_mock::kFaultPopNonLocal);
@@ -73,7 +93,13 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = g
     // Step 3 (V7 C3): drain the local slot into the consumer tile.  V7 has no
     //   cross-core read of payload -- this is a purely local read (the existing
     //   local TLOAD/TMOV), via the payload hook.
-    a2a3_grid_payload::CopyLocalSlotToTile<TileCons>(tile, localSlot, Pipe::SlotBytes);
+    if (win.rowCount == 0) {
+        a2a3_grid_payload::CopyLocalSlotToTile<TileCons>(tile, localSlot, static_cast<int>(spanBytes));
+    } else {
+        // pop: slot is the source, tile the destination (mirror of the push).
+        a2a3_grid_payload::CopyLocalSlotToTile2D<TileCons>(
+            tile, localSlot, win.rowBytes, win.rowCount, GridPayloadSlotStride(win), GridPayloadTileStride(win));
+    }
 
     // Step 4 (V7 C4): notify the upstream producer that the slot is free --
     //   sync_hscb (SYNC_HSCB) store of cons_idx (= idx+1) into the upstream

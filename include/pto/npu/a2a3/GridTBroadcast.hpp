@@ -86,8 +86,22 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
     const int myRank = pto::RankInGroup(Group, pipe.coord, pipe.groupRect); // prefix-offset base, count_k = 1
     const int groupSize = pto::GridGroupSize(Group, pipe.shape, pipe.groupRect);
     const uint32_t gidx = static_cast<uint32_t>(myRank); // this source's single global index
+
+    // Payload sub-window inside the ring slot (see GridTPush.hpp).  Disabled =
+    // whole slot, which is what this path always did.
+    const GridPayloadWindow win = pipe.bcastWindow;
+    const uint32_t payloadBytes = GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride));
+    if (payloadBytes > static_cast<uint32_t>(Pipe::SlotStride)) {
+        __gm__ uint32_t* rangeFault =
+            pipe.bcastReadyLanes ?
+                pipe.bcastReadyLanes + myRank * grid_mock::kBcastLaneStrideU32 + grid_mock::kFaultFlagWordOffset :
+                nullptr;
+        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultBcastPayloadRange);
+        return false;
+    }
     const uint32_t slotOff =
-        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotBytes);
+        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) +
+        win.entryOffset;
 
     // Producer-side free backpressure (slot reuse only).  Dormant for the
     // single-shot AllGather (SC >= group size ⟹ threshold <= 0).  The producer
@@ -118,7 +132,7 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
     __gm__ uint8_t* myRingSlot = pipe.bcastRingBase + slotOff; // offset is identical in every window
     const int rankFirst = pto::GroupMemberRank(Group, pipe.coord, pipe.shape, 0, pipe.groupRect);
     __gm__ uint8_t* slotFirst = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, myRingSlot, rankFirst);
-    uint32_t memberStride = static_cast<uint32_t>(Pipe::SlotBytes);
+    uint32_t memberStride = static_cast<uint32_t>(Pipe::SlotStride);
     bool uniformArena = false;
     if constexpr (Group == pto::GridGroup::ROW || Group == pto::GridGroup::COL) {
         // ROW/COL members are always uniformly spaced (consecutive col / row ranks).
@@ -153,15 +167,27 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
         }
     }
     __ubuf__ void* srcUb = a2a3_grid_payload::TileUbPtr<TileProd>(tile);
+    auto* srcUbBytes = reinterpret_cast<__ubuf__ uint8_t*>(srcUb);
+    // Normalised window: a disabled window is one row of the whole slot, so the
+    // loops below cover both cases without branching on rowCount per row.
+    const uint32_t rowCount = (win.rowCount == 0) ? 1u : win.rowCount;
+    const uint32_t rowBytes = (win.rowCount == 0) ? static_cast<uint32_t>(Pipe::SlotStride) : win.rowBytes;
+    const uint32_t tileRowStride = (win.rowCount == 0) ? 0u : GridPayloadTileStride(win);
+    const uint32_t slotRowStride = (win.rowCount == 0) ? 0u : GridPayloadSlotStride(win);
     if (uniformArena) {
-        // One intrinsic fans the tile out to every member's slot.  This includes
+        // One intrinsic fans one ROW out to every member's slot.  This includes
         // this source's OWN slot (member myRank); that write is harmless -- a
         // receiver never drains its own shard (srcRank == myRank is skipped), and
         // the bytes written are this source's own shard anyway.  op=COPY selects
         // the broadcast (replicate-fan-out) NoC mode of mov_ubuf_group.
-        pto::mov_ubuf_group(
-            srcUb, reinterpret_cast<__gm__ void*>(slotFirst), static_cast<uint32_t>(Pipe::SlotBytes),
-            static_cast<uint32_t>(groupSize), memberStride, pto::GridCollOp::COPY, /*eltype=*/1, pipe.groupRect);
+        // mov_ubuf_group moves a CONTIGUOUS run per member, so a 2-D window costs
+        // one intrinsic per row -- still a single batched doorbell pass below.
+        for (uint32_t r = 0; r < rowCount; ++r) {
+            pto::mov_ubuf_group(
+                reinterpret_cast<__ubuf__ void*>(srcUbBytes + r * tileRowStride),
+                reinterpret_cast<__gm__ void*>(slotFirst + r * slotRowStride), rowBytes,
+                static_cast<uint32_t>(groupSize), memberStride, pto::GridCollOp::COPY, /*eltype=*/1, pipe.groupRect);
+        }
     } else {
         // Non-uniform SUBRECT fallback: one copy_ubuf_to_neighbor_ubuf per peer.
         for (int m = 0; m < groupSize; ++m) {
@@ -170,7 +196,12 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
             }
             const int peerRank = pto::GroupMemberRank(Group, pipe.coord, pipe.shape, m, pipe.groupRect);
             __gm__ uint8_t* peerSlot = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, myRingSlot, peerRank);
-            a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(peerSlot, tile, Pipe::SlotBytes);
+            if (win.rowCount == 0) {
+                a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(peerSlot, tile, Pipe::SlotStride);
+            } else {
+                a2a3_grid_payload::CopyTileToNeighborSramSlot2D<TileProd>(
+                    peerSlot, tile, win.rowBytes, win.rowCount, GridPayloadTileStride(win), GridPayloadSlotStride(win));
+            }
         }
     }
 
@@ -238,11 +269,25 @@ AICORE bool GRID_TRY_TBPOP_IMPL(
     }
 
     // Local read of this receiver's own ring slot (design doc: TPOP reads only
-    // local SRAM -- the payload was pushed here, never read cross-core).
+    // local SRAM -- the payload was pushed here, never read cross-core).  Same
+    // payload window as the send half -- in a group collective both sides move
+    // the same geometry, so one window describes both.
+    const GridPayloadWindow win = pipe.bcastWindow;
+    if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
+        __gm__ uint32_t* rangeFault = readyLane ? readyLane + grid_mock::kFaultFlagWordOffset : nullptr;
+        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultBcastPayloadRange);
+        return false;
+    }
     const uint32_t slotOff =
-        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotBytes);
+        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) +
+        win.entryOffset;
     __gm__ uint8_t* localSlot = pipe.bcastRingBase + slotOff;
-    a2a3_grid_payload::CopyLocalSlotToTile<TileCons>(tile, localSlot, Pipe::SlotBytes);
+    if (win.rowCount == 0) {
+        a2a3_grid_payload::CopyLocalSlotToTile<TileCons>(tile, localSlot, Pipe::SlotStride);
+    } else {
+        a2a3_grid_payload::CopyLocalSlotToTile2D<TileCons>(
+            tile, localSlot, win.rowBytes, win.rowCount, GridPayloadSlotStride(win), GridPayloadTileStride(win));
+    }
 
     // consume-before-free fence (design doc C3): the local read above must
     // complete before we tell the next occupant the slot is free.

@@ -205,7 +205,111 @@ AICORE constexpr int GroupMemberRank(GridGroup g, GridCoord self, GridShape s, i
 AICORE constexpr int GroupOwnerOfIndex(int gidx) { return gidx; }
 
 // ---------------------------------------------------------------------------
-// GridPipe<TileT, SlotBytes, SlotCount, BcastSlotCount = 0, GroupMax = 0>
+// Direction mask -- which per-direction unicast slot rings a pipe allocates.
+//
+// Before this existed, every GridPipe paid kGridDirectionCount (5) rings even
+// though no kernel uses more than two directions on one pipe (a relay uses an
+// opposite pair; a pure-broadcast pipe uses none).  The mask makes the ring set
+// part of the pipe's type, so the window carries popcount(mask) rings instead of
+// 5 and the ring index is packed (mask EAST|WEST -> EAST is ring 0, WEST ring 1).
+// Default kGridDirAll reproduces the original 5-ring layout byte for byte.
+// ---------------------------------------------------------------------------
+// These four are deliberately NOT AICORE-qualified: the host-side window-size
+// templates in grid_pipe_runtime.hpp evaluate them, and an [aicore] function
+// cannot be called from a host context.  They therefore also must not call any
+// AICORE helper (hence static_cast<int> rather than GridDirectionIndex).  Device
+// code sticks to plain bit arithmetic on DirMask instead of calling these.
+inline constexpr int GridDirBit(GridDirection d) { return 1 << static_cast<int>(d); }
+
+inline constexpr int kGridDirNone = 0;
+inline constexpr int kGridDirAll = (1 << kGridDirectionCount) - 1; // 0x1F
+
+inline constexpr bool GridDirInMask(int dirMask, GridDirection d)
+{
+    return ((dirMask >> static_cast<int>(d)) & 1) != 0;
+}
+
+// Number of rings the mask allocates.
+inline constexpr int GridDirRingCount(int dirMask)
+{
+    int n = 0;
+    for (int i = 0; i < kGridDirectionCount; ++i) {
+        n += (dirMask >> i) & 1;
+    }
+    return n;
+}
+
+// Packed index of `d`'s ring inside the slot region (-1 when not allocated).
+inline constexpr int GridDirRingIndex(int dirMask, GridDirection d)
+{
+    if (!GridDirInMask(dirMask, d)) {
+        return -1;
+    }
+    int idx = 0;
+    for (int i = 0; i < static_cast<int>(d); ++i) {
+        idx += (dirMask >> i) & 1;
+    }
+    return idx;
+}
+
+// ---------------------------------------------------------------------------
+// GridPayloadWindow -- the sub-window of a slot that one TPUSH/TPOP actually
+// moves.  This is the GridPipe equivalent of a5 TPipe's `entryOffset` plus the
+// shape/stride pair its TSTORE/TLOAD descriptors carry (a5 TPush.hpp:78/274/289):
+// the SLOT STRIDE (Pipe::SlotStride) addresses the ring, while the fields below
+// describe the transfer.  Previously both were the single constant SlotBytes, so
+// every push moved a whole slot even when only a prefix was valid.
+//
+//   entryOffset  byte offset of the sub-window inside the slot
+//   rowBytes     bytes moved per row
+//   rowCount     number of rows; 0 DISABLES the window (whole slot, 1-D,
+//                Pipe::SlotStride bytes at offset 0 -- the original behaviour)
+//   tileStride   byte stride between rows in the local tile (0 => rowBytes)
+//   slotStride   byte stride between rows inside the slot   (0 => rowBytes)
+//
+// The strides are named by WHICH BUFFER they walk, not by src/dst, because the
+// two swap roles between the halves: a push reads the tile and writes the slot, a
+// pop reads the slot and writes the tile.  (`slotStride` is the per-row stride
+// INSIDE one slot; the ring's slot-to-slot stride is Pipe::SlotStride.)
+//
+// rowCount > 1 expresses a 2-D sub-block (e.g. the valid column prefix of a
+// row-major tile).  The COPY_UBUF_TO_NBR machine instruction takes a single
+// `bytes` operand, so the lowering emits one burst per row and ONE ready
+// doorbell for the whole window -- the doorbell count per TPUSH is unchanged.
+// Hardware that grows src/dst stride operands can fold the loop into one burst.
+// ---------------------------------------------------------------------------
+struct GridPayloadWindow {
+    uint32_t entryOffset = 0;
+    uint32_t rowBytes = 0;
+    uint32_t rowCount = 0; // 0 => disabled: whole slot
+    uint32_t tileStride = 0;
+    uint32_t slotStride = 0;
+};
+
+AICORE inline uint32_t GridPayloadTileStride(const GridPayloadWindow& w)
+{
+    return w.tileStride != 0 ? w.tileStride : w.rowBytes;
+}
+
+AICORE inline uint32_t GridPayloadSlotStride(const GridPayloadWindow& w)
+{
+    return w.slotStride != 0 ? w.slotStride : w.rowBytes;
+}
+
+// Bytes spanned inside the slot, measured from the SLOT base (entryOffset
+// included).  A disabled window spans the whole slot.  This is what the range
+// guard compares against SlotStride.
+AICORE inline uint32_t GridPayloadSlotExtent(const GridPayloadWindow& w, uint32_t slotStride)
+{
+    if (w.rowCount == 0) {
+        return slotStride;
+    }
+    return w.entryOffset + (w.rowCount - 1) * GridPayloadSlotStride(w) + w.rowBytes;
+}
+
+// ---------------------------------------------------------------------------
+// GridPipe<TileT, SlotStride, SlotCount, BcastSlotCount = 0, GroupMax = 0,
+//          DirMask = kGridDirAll>
 //
 // One instance describes the FIFO state for a single logical channel that the
 // current core uses; each (core, direction) pair has its own ring buffer with
@@ -219,18 +323,33 @@ AICORE constexpr int GroupOwnerOfIndex(int gidx) { return gidx; }
 // only ReduceSum / K-hop smoke pipes) carries no broadcast state and its window
 // is byte-identical to the pre-TBROADCAST layout.
 // ---------------------------------------------------------------------------
-template <typename TileT_, int SlotBytes_, int SlotCount_, int BcastSlotCount_ = 0, int GroupMax_ = 0>
+template <
+    typename TileT_, int SlotStride_, int SlotCount_, int BcastSlotCount_ = 0, int GroupMax_ = 0,
+    int DirMask_ = kGridDirAll>
 struct GridPipe {
     static_assert(SlotCount_ > 0, "GridPipe requires SlotCount > 0");
-    static_assert(SlotBytes_ > 0, "GridPipe requires SlotBytes > 0");
+    static_assert(SlotStride_ > 0, "GridPipe requires SlotStride > 0");
     static_assert(BcastSlotCount_ >= 0, "GridPipe requires BcastSlotCount >= 0");
     static_assert(GroupMax_ >= 0, "GridPipe requires GroupMax >= 0");
+    static_assert(DirMask_ >= 0 && DirMask_ <= kGridDirAll, "GridPipe DirMask must be a kGridDirBit(...) OR-mask");
 
     using TileType = TileT_;
-    static constexpr int SlotBytes = SlotBytes_;
+    // Ring addressing stride.  NOT the transfer length -- that comes from the
+    // per-direction GridPayloadWindow below (or defaults to the whole slot).
+    static constexpr int SlotStride = SlotStride_;
+    // Compatibility spelling of the same constant.  Reads as "one slot is this
+    // many bytes"; kept so existing call sites and window mirrors keep working.
+    static constexpr int SlotBytes = SlotStride_;
     static constexpr int SlotCount = SlotCount_;
     static constexpr int BcastSlotCount = BcastSlotCount_;
     static constexpr int GroupMax = GroupMax_;
+    static constexpr int DirMask = DirMask_;
+    // popcount(DirMask), spelled out rather than calling GridDirRingCount: this
+    // initializer is evaluated while instantiating the pipe from AICORE code, and
+    // that context may not call a host constexpr function.
+    static_assert(kGridDirectionCount == 5, "RingCount below enumerates exactly 5 direction bits");
+    static constexpr int RingCount = ((DirMask_ >> 0) & 1) + ((DirMask_ >> 1) & 1) + ((DirMask_ >> 2) & 1) +
+                                     ((DirMask_ >> 3) & 1) + ((DirMask_ >> 4) & 1);
 
     // Shape + coord cached from runtime (design doc 2.1 / 2.2).
     GridShape shape{};
@@ -276,6 +395,27 @@ struct GridPipe {
 
     // Stable logical id used for runtime telemetry / per-direction scoreboard id.
     uint32_t pipeId = 0;
+
+    // Per-direction payload sub-window (a5 TPipe's prod/cons `entryOffset` plus a
+    // transfer descriptor).  All zero = disabled = move the whole slot, which is
+    // what every call site did before these existed.  Set them right before the
+    // TPUSH/TPOP they apply to; they persist until reset.
+    GridPayloadWindow pushWindow[kGridDirectionCount] = {};
+    GridPayloadWindow popWindow[kGridDirectionCount] = {};
+    // Same for the broadcast ring.  One window covers both halves of the
+    // collective: a source replicates its own shard and a receiver drains another
+    // source's shard, and in a group collective those are the same geometry.
+    GridPayloadWindow bcastWindow{};
+
+    AICORE void SetPushWindow(GridDirection dir, const GridPayloadWindow& w)
+    {
+        pushWindow[GridDirectionIndex(dir)] = w;
+    }
+    AICORE void SetPopWindow(GridDirection dir, const GridPayloadWindow& w) { popWindow[GridDirectionIndex(dir)] = w; }
+    AICORE void ResetPushWindow(GridDirection dir) { pushWindow[GridDirectionIndex(dir)] = GridPayloadWindow{}; }
+    AICORE void ResetPopWindow(GridDirection dir) { popWindow[GridDirectionIndex(dir)] = GridPayloadWindow{}; }
+    AICORE void SetBcastWindow(const GridPayloadWindow& w) { bcastWindow = w; }
+    AICORE void ResetBcastWindow() { bcastWindow = GridPayloadWindow{}; }
 };
 
 // ---------------------------------------------------------------------------
@@ -285,8 +425,8 @@ struct GridPipe {
 template <typename T>
 struct is_grid_pipe : std::false_type {};
 
-template <typename TileT, int SlotBytes, int SlotCount, int BcastSlotCount, int GroupMax>
-struct is_grid_pipe<GridPipe<TileT, SlotBytes, SlotCount, BcastSlotCount, GroupMax>> : std::true_type {};
+template <typename TileT, int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int DirMask>
+struct is_grid_pipe<GridPipe<TileT, SlotStride, SlotCount, BcastSlotCount, GroupMax, DirMask>> : std::true_type {};
 
 template <typename T>
 inline constexpr bool is_grid_pipe_v = is_grid_pipe<std::remove_reference_t<T>>::value;
@@ -621,6 +761,16 @@ inline constexpr uint32_t kFaultPopSouth = 0x204;
 inline constexpr uint32_t kFaultPopNonLocal = 0x205;
 inline constexpr uint32_t kFaultWaitReadyTimeout = 0x301;
 inline constexpr uint32_t kFaultWaitFreeTimeout = 0x302;
+// A GridPayloadWindow reaches past the end of its slot.  Once the transfer
+// length stopped being the compile-time SlotStride, nothing statically bounds it
+// any more, and a push whose window overruns writes into the PEER's window --
+// silent cross-core corruption that is far harder to trace than a local overrun.
+// So the range is checked at runtime and trapped here instead.  (a5 gets this for
+// free: its lengths come from the tile/GlobalTensor descriptors, so the geometry
+// is self-consistent by construction.)
+inline constexpr uint32_t kFaultPushPayloadRange = 0x401;
+inline constexpr uint32_t kFaultPopPayloadRange = 0x402;
+inline constexpr uint32_t kFaultBcastPayloadRange = 0x403;
 
 // Direction-keyed fault code lookup.  Explicit switch avoids relying on the
 // numeric layout of GridDirection so renumbering the enum cannot silently

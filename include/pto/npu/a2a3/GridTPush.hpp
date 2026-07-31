@@ -57,10 +57,22 @@ AICORE __gm__ uint32_t* RemoteScbPtr(__gm__ void* runtimeCtx, __gm__ uint32_t* l
 template <typename TileT>
 __tf__ AICORE void CopyTileToNeighborSramSlot(__gm__ uint8_t* dstNeighborSlot, TileT& tile, int slotBytes);
 
+// 2-D form, used when the caller set a GridPayloadWindow with rowCount > 0.
+template <typename TileT>
+__tf__ AICORE void CopyTileToNeighborSramSlot2D(
+    __gm__ uint8_t* dstNeighborSlot, TileT& tile, uint32_t rowBytes, uint32_t rowCount, uint32_t tileStride,
+    uint32_t slotStride);
+
 // Drain this core's local GM slot into the tile (V7 TPOP local read: the existing
 // local copy; deliberately no cross-core read of payload).
 template <typename TileT>
 __tf__ AICORE void CopyLocalSlotToTile(TileT& tile, __gm__ uint8_t* localSlot, int slotBytes);
+
+// 2-D form of the drain (slot is the source, tile the destination).
+template <typename TileT>
+__tf__ AICORE void CopyLocalSlotToTile2D(
+    TileT& tile, __gm__ uint8_t* localSlot, uint32_t rowBytes, uint32_t rowCount, uint32_t slotStride,
+    uint32_t tileStride);
 
 // Mock-only read-locality guard: true iff [localSlot, +bytes) is inside
 // callerRank's own GmSramArena segment (native: always local by construction).
@@ -80,6 +92,12 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
 {
     static_assert(Dir != GridDirection::SOURCE, "GridPipe TPUSH<SOURCE> is illegal (design doc 4.3)");
     static_assert(Dist >= 1, "GridPipe TPUSH distance must be >= 1 (routed K-hop unicast)");
+    // Plain bit test, not GridDirInMask(): that helper is host-callable (see
+    // grid_intrinsic.hpp) and this body is AICORE.
+    static_assert(
+        ((Pipe::DirMask >> static_cast<int>(Dir)) & 1) != 0,
+        "GridPipe TPUSH<Dir> needs Dir in the pipe's DirMask -- that direction has no slot ring "
+        "(add GridDirBit(Dir) to the GridPipe DirMask template argument).");
 
     constexpr int dirIdx = GridDirectionIndex(Dir);
 
@@ -112,8 +130,23 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
     }
 
     // Step 2 (V7 P2): compute the local slot address from the producer GPR
-    //   (slot_off = (prod_idx % SlotCount) * SlotBytes); pure local scalar math.
-    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotBytes;
+    //   (slot_off = (prod_idx % SlotCount) * SlotStride); pure local scalar math.
+    //   SlotStride addresses the ring; the payload window says what part of the
+    //   slot this push actually moves (a5 TPipe: entryBase + entryOffset, with the
+    //   length coming from the transfer descriptor rather than the slot size).
+    const GridPayloadWindow win = pipe.pushWindow[dirIdx];
+
+    // Range guard (differs from a5: there the length is implied by the tile /
+    // GlobalTensor descriptors and cannot exceed the slot; here it is a runtime
+    // number, and an overrun writes into the PEER's window).
+    if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
+        __gm__ uint32_t* rangeFault =
+            pipe.freeScb[dirIdx] ? pipe.freeScb[dirIdx] + grid_mock::kFaultFlagWordOffset : nullptr;
+        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultPushPayloadRange);
+        return false;
+    }
+
+    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotStride + win.entryOffset;
     __gm__ uint8_t* localSlot = pipe.slotBase[dirIdx] + slotOff;
 
     // Step 3 (V7 P3): payload transfer to the *target's* SRAM/L1 slot region.
@@ -124,7 +157,13 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
     //   facade (V7 COPY_UBUF_TO_NBR).
     const int peerRank = RankForPushK(Dir, pipe.coord, pipe.shape, Dist);
     __gm__ uint8_t* neighborSlot = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, localSlot, peerRank);
-    a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(neighborSlot, tile, Pipe::SlotBytes);
+    if (win.rowCount == 0) {
+        a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(neighborSlot, tile, Pipe::SlotStride);
+    } else {
+        // push: tile is the source, slot the destination.
+        a2a3_grid_payload::CopyTileToNeighborSramSlot2D<TileProd>(
+            neighborSlot, tile, win.rowBytes, win.rowCount, GridPayloadTileStride(win), GridPayloadSlotStride(win));
+    }
 
     // Publish fence (V7 P4, data-before-ready / R5). Orders the payload write
     // (MTE3 into the peer window) before the ready sync_hscb store below.  V7's
