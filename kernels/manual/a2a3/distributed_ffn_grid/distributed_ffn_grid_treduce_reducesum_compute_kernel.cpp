@@ -73,7 +73,14 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-using FfnReducePipe = GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT>;
+// Kept for shape/type documentation only -- this variant reduces through
+// GRID_TREDUCE_GROUP_IMPL, which reads each member's contribution in place out of
+// partialBuf (bytes and memberStride are independent runtime operands) and so
+// needs no slot ring at all.  Same DirMask as the TPUSH relay variant so the type
+// and FFN_RS_REDUCE_WIN stay consistent if it is ever wired up.
+constexpr int kFfnReduceDirMask = pto::GridDirBit(GridDirection::EAST) | pto::GridDirBit(GridDirection::SOUTH);
+using FfnReducePipe =
+    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceDirMask>;
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
 

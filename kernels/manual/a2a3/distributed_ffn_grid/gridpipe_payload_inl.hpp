@@ -95,6 +95,24 @@ __tf__ AICORE inline void CopyTileToNeighborSramSlot(__gm__ uint8_t* dstNeighbor
         static_cast<uint32_t>(slotBytes));
 }
 
+// 2-D form of the above: move `rowCount` runs of `rowBytes`, striding the tile by
+// `srcStride` and the slot by `dstStride`.  COPY_UBUF_TO_NBR carries a single
+// `bytes` operand, so a 2-D sub-block lowers to one burst per row; the caller
+// (GRID_TRY_TPUSH_IMPL) still fires exactly ONE ready doorbell afterwards, so the
+// handshake cost per TPUSH does not change.  rowCount == 1 is the 1-D case.
+template <typename TileT>
+__tf__ AICORE inline void CopyTileToNeighborSramSlot2D(
+    __gm__ uint8_t* dstNeighborSlot, TileT& tile, uint32_t rowBytes, uint32_t rowCount, uint32_t tileStride,
+    uint32_t slotStride)
+{
+    auto* srcUb = reinterpret_cast<__ubuf__ uint8_t*>(__cce_get_tile_ptr(tile.data()));
+    for (uint32_t r = 0; r < rowCount; ++r) {
+        copy_ubuf_to_neighbor_ubuf(
+            reinterpret_cast<__gm__ void*>(dstNeighborSlot + r * slotStride),
+            reinterpret_cast<__ubuf__ void*>(srcUb + r * tileStride), rowBytes);
+    }
+}
+
 template <typename TileT>
 __tf__ AICORE inline void CopyLocalSlotToTile(TileT& tile, __gm__ uint8_t* localSlot, int slotBytes)
 {
@@ -109,6 +127,29 @@ __tf__ AICORE inline void CopyLocalSlotToTile(TileT& tile, __gm__ uint8_t* local
         uint32_t chunk = (bytes - offset > kChunkBytes) ? kChunkBytes : (bytes - offset);
         copy_gm_to_ubuf_align_b8(dstUb + offset, localSlot + offset, 0, 1, chunk, 0, 0, 0, 0);
         offset += chunk;
+    }
+}
+
+// 2-D counterpart of CopyLocalSlotToTile: drain `rowCount` runs of `rowBytes`
+// from the slot into the tile.  Strides are named by which buffer they walk, so
+// the argument order matches the push helper even though the data flows the
+// other way.
+template <typename TileT>
+__tf__ AICORE inline void CopyLocalSlotToTile2D(
+    TileT& tile, __gm__ uint8_t* localSlot, uint32_t rowBytes, uint32_t rowCount, uint32_t slotStride,
+    uint32_t tileStride)
+{
+    auto* dstUb = reinterpret_cast<__ubuf__ uint8_t*>(__cce_get_tile_ptr(tile.data()));
+    constexpr uint32_t kChunkBytes = 256;
+    for (uint32_t r = 0; r < rowCount; ++r) {
+        __ubuf__ uint8_t* rowDst = dstUb + r * tileStride;
+        __gm__ uint8_t* rowSrc = localSlot + r * slotStride;
+        uint32_t offset = 0;
+        while (offset < rowBytes) {
+            uint32_t chunk = (rowBytes - offset > kChunkBytes) ? kChunkBytes : (rowBytes - offset);
+            copy_gm_to_ubuf_align_b8(rowDst + offset, rowSrc + offset, 0, 1, chunk, 0, 0, 0, 0);
+            offset += chunk;
+        }
     }
 }
 

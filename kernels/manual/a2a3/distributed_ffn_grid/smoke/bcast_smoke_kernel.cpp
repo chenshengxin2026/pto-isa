@@ -50,7 +50,9 @@ constexpr bool DAV_VEC = false;
 #endif
 
 using SmokeTile = Tile<TileType::Vec, float, BCAST_T, BCAST_W, BLayout::RowMajor>;
-using SmokePipe = GridPipe<SmokeTile, BCAST_SLOT_BYTES, BCAST_SLOT_COUNT, BCAST_BCAST_SLOT_COUNT, BCAST_GROUP_MAX>;
+// Pure broadcast (TBROADCAST + TPOP<GridGroup>), no unicast: DirMask = none.
+using SmokePipe =
+    GridPipe<SmokeTile, BCAST_SLOT_BYTES, BCAST_SLOT_COUNT, BCAST_BCAST_SLOT_COUNT, BCAST_GROUP_MAX, pto::kGridDirNone>;
 
 using ShapeTW = Shape<1, 1, 1, BCAST_T, BCAST_W>;
 using StrideTW = Stride<BCAST_T * BCAST_W, BCAST_T * BCAST_W, BCAST_T * BCAST_W, BCAST_W, 1>;

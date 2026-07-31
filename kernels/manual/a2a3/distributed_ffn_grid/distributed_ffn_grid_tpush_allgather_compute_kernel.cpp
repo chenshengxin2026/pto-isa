@@ -105,8 +105,14 @@ using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
 using RowBlockTile = Tile<TileType::Vec, half, kT, kRowBlock, BLayout::RowMajor>;
 using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
-using FfnGatherPipeP1 = GridPipe<RowBlockTile, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT>;
-using FfnGatherPipeP2 = GridPipe<HiddenFullTile, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT>;
+// DirMask names exactly the relay's opposite pair, so each pipe allocates two
+// slot rings instead of five.
+constexpr int kFfnP1DirMask = pto::GridDirBit(GridDirection::EAST) | pto::GridDirBit(GridDirection::WEST);
+constexpr int kFfnP2DirMask = pto::GridDirBit(GridDirection::SOUTH) | pto::GridDirBit(GridDirection::NORTH);
+using FfnGatherPipeP1 =
+    GridPipe<RowBlockTile, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnP1DirMask>;
+using FfnGatherPipeP2 =
+    GridPipe<HiddenFullTile, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnP2DirMask>;
 
 // Cube GEMM accumulator tiles (L0C): gate/up [16,96] (8 valid), down [16,224].
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>;
@@ -193,17 +199,48 @@ AICORE inline void FfnCubeGemmFill(TileAcc<float, kBaseM, N, kT, N>& cTile, __gm
 //             TPOP<bDir> it and TPUSH<bDir> it on -- cascades so every cell ends
 //             with the complete tile in `relayTile`.
 // Linear fan-in-1 chain each way (a DAG), so it is serialization-safe.
+//
+// Valid-prefix forwarding.  On the forward pass the tile is only partly filled --
+// the cell at rank k has k+1 of the N contributions -- so pushing a whole slot
+// ships mostly not-yet-valid columns.  A GridPayloadWindow sends just the valid
+// part.  It has to be 2-D: relayTile is row-major, so "the first k+1 shards" is a
+// COLUMN prefix, i.e. `Rows` runs of (k+1)*unitCols elements strided by the tile's
+// row pitch -- not a byte prefix.  The backward pass carries the complete tile, so
+// it resets the window and moves the whole slot.
+//
+// The receiver derives its own window from its rank: the upstream neighbour (rank
+// k-1) pushed k*unitCols columns, which is exactly this cell's `ownOff`.  Both
+// sides compute it from the topology, the same way a5's producer and consumer both
+// derive entryOffset from the tile id rather than exchanging it.
 template <
     pto::GridDirection fDir, pto::GridDirection bDir, typename Pipe, typename RelayTile, typename RecvTile,
     typename OwnTile>
 AICORE inline void FfnRelayGather(
     Pipe& pipe, pto::GridShape shape, pto::GridCoord coord, RelayTile& relayTile, RecvTile& recvTile, OwnTile& ownTile,
-    uint16_t ownOff)
+    uint16_t ownOff, int unitCols)
 {
     const bool isFwdSource = !pto::CanPopK(fDir, coord, shape, 1); // no upstream -> relay start
     const bool isFwdSink = !pto::CanPushK(fDir, coord, shape, 1);  // no downstream -> relay end
     const bool isBwdSource = isFwdSink;                            // fwd sink starts the backward scatter
     const bool isBwdSink = !pto::CanPushK(bDir, coord, shape, 1);  // no downstream on bDir -> scatter end
+
+    // recvTile must have the relay tile's row pitch: the slot's rows are laid out
+    // with the producer's relayTile stride, and the consumer walks them with the
+    // same one.
+    static_assert(
+        static_cast<int>(RelayTile::Rows) == static_cast<int>(RecvTile::Rows) &&
+            static_cast<int>(RelayTile::Cols) == static_cast<int>(RecvTile::Cols),
+        "FfnRelayGather: recvTile must match relayTile's shape (shared slot row pitch)");
+    constexpr uint32_t kElemBytes = sizeof(typename RelayTile::DType);
+    constexpr uint32_t kRowPitch = static_cast<uint32_t>(RelayTile::Cols) * kElemBytes;
+    constexpr uint32_t kRowsU = static_cast<uint32_t>(RelayTile::Rows);
+
+    // Columns valid after this cell inserts its own contribution / columns the
+    // upstream neighbour sent us.
+    const uint32_t fwdPushCols = static_cast<uint32_t>(ownOff) + static_cast<uint32_t>(unitCols);
+    const uint32_t fwdPopCols = static_cast<uint32_t>(ownOff);
+    const GridPayloadWindow fwdPushWin{0, fwdPushCols * kElemBytes, kRowsU, kRowPitch, kRowPitch};
+    const GridPayloadWindow fwdPopWin{0, fwdPopCols * kElemBytes, kRowsU, kRowPitch, kRowPitch};
 
     // TPOP writes the INDEPENDENT recvTile (MTE2 async DMA); relayTile is then built
     // from recvTile + own shard by V (TINSERT) only. relayTile therefore never
@@ -213,6 +250,7 @@ AICORE inline void FfnRelayGather(
     if (isFwdSource) {
         TINSERT(relayTile, ownTile, 0, ownOff); // V: seed with own contribution
     } else {
+        pipe.SetPopWindow(fDir, fwdPopWin);                                      // drain only what upstream sent
         (void)pto::GRID_TRY_TPOP_IMPL<fDir, 1>(pipe, recvTile, kGatherMaxSpins); // MTE2 -> recvTile
         FfnRelayDrain();                                                         // MTE2 (async DMA) drain
         TINSERT(relayTile, recvTile, 0, 0);                                      // V: recvTile -> relayTile
@@ -220,11 +258,15 @@ AICORE inline void FfnRelayGather(
     }
     FfnRelayDrain(); // V before MTE3 push
     if (!isFwdSink) {
+        pipe.SetPushWindow(fDir, fwdPushWin);                                      // ship only the valid column prefix
         (void)pto::GRID_TRY_TPUSH_IMPL<fDir, 1>(pipe, relayTile, kGatherMaxSpins); // MTE3 <- relayTile
         FfnRelayDrain();
     }
 
     // --- backward relay: scatter the complete tile to every cell ---
+    // Complete tile from here on: reset both windows so the whole slot moves.
+    pipe.ResetPopWindow(bDir);
+    pipe.ResetPushWindow(bDir);
     if (!isBwdSource) { // not the fwd sink -> receive the complete tile
         (void)pto::GRID_TRY_TPOP_IMPL<bDir, 1>(pipe, recvTile, kGatherMaxSpins); // MTE2 -> recvTile
         FfnRelayDrain();
@@ -407,7 +449,7 @@ __global__ AICORE void DistributedFfnGridTpushAllGatherMixedKernel(
 
             // Relay-gather the row block: each cell contributes its shard at col*kIShard.
             FfnRelayGather<GridDirection::EAST, GridDirection::WEST>(
-                gatherPipe, shape, coord, rowBlock, recvTile, shardOwn, static_cast<uint16_t>(col * kIShard));
+                gatherPipe, shape, coord, rowBlock, recvTile, shardOwn, static_cast<uint16_t>(col * kIShard), kIShard);
             FfnRelayDrain();
 
             // Store the rebuilt row block [8,768] to GM for Phase 2 to gather.
@@ -451,7 +493,8 @@ __global__ AICORE void DistributedFfnGridTpushAllGatherMixedKernel(
 
             // cell (row, col) holds row `row`'s I-segment -> offset row*768.
             FfnRelayGather<GridDirection::SOUTH, GridDirection::NORTH>(
-                gatherPipe, shape, coord, hiddenFull, recvTile, blockOwn, static_cast<uint16_t>(row * kRowBlock));
+                gatherPipe, shape, coord, hiddenFull, recvTile, blockOwn, static_cast<uint16_t>(row * kRowBlock),
+                kRowBlock);
             FfnRelayDrain();
 
             // Store the full hidden [8,3072] to GM for Phase 3 (down) to consume.

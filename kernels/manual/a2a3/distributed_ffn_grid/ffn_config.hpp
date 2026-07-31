@@ -286,14 +286,21 @@ constexpr int FFN_NCUT_W_UP_SHARD_BYTES = FFN_NCUT_H * FFN_NCUT_I_SHARD * 2;
 constexpr int FFN_NCUT_W_DOWN_SHARD_BYTES = FFN_NCUT_I * FFN_NCUT_H_SHARD * 2; // [3072,224] half weight shard
 constexpr int FFN_NCUT_Y_SHARD_BYTES = FFN_NCUT_T * FFN_NCUT_H_SHARD * 4;      // [8,224] fp32 (final output shard)
 
-// Two GridPipe arenas (different SlotBytes ⟹ different window layouts):
+// Two GridPipe arenas (different SlotStride ⟹ different window layouts):
 //   P1 carries the [8,96] hidden shard (Phase-1 row gather, group = a row of 8);
 //   P2 carries the [8,768] row block    (Phase-2 col gather, group = a col of 4).
 // Each carries one tile per source (single-shot, no slot reuse) ⟹ SlotCount = 1
-// and BcastSlotCount = group size.  Window = flags(128) + 5*SlotCount*SlotBytes
-// + (BcastSlotCount*SlotBytes + 2*Group*4), matching the unicast+bcast layout in
-// include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int FFN_NCUT_GRID_DIRECTION_COUNT = 5;
+// and BcastSlotCount = group size.
+//
+// These are PURE-BROADCAST pipes: the payload travels through the broadcast ring
+// (bcastRingBase), and no TPUSH<Dir>/TPOP<Dir> ever runs on them.  So their
+// GridPipe DirMask is kGridDirNone and the unicast slot region is ZERO bytes --
+// it used to be 5*SlotCount*SlotStride of never-touched window.  Window =
+// flags(128) + 0 + (BcastSlotCount*SlotStride + 2*Group*kBcastLaneStride),
+// matching the layout in include/pto/npu/a2a3/grid_pipe_runtime.hpp.
+constexpr int FFN_NCUT_GRID_DIRECTION_COUNT = 5;  // full mesh fan-out (mask = kGridDirAll)
+constexpr int FFN_NCUT_BCAST_DIRECTION_COUNT = 0; // pure-broadcast pipes: no unicast rings
+constexpr int FFN_NCUT_RELAY_DIRECTION_COUNT = 2; // a relay uses one opposite pair
 constexpr int FFN_NCUT_GRID_FLAGS_BYTES = 128;
 constexpr int FFN_NCUT_SLOT_COUNT = 1;
 constexpr int FFN_NCUT_SLOT_BYTES_P1 = FFN_NCUT_HIDDEN_SHARD_BYTES;
@@ -308,10 +315,10 @@ constexpr int FFN_NCUT_BCAST_SLOTS_P2 = FFN_NCUT_GROUP_P2;
 // layout constant kBcastLaneStride in grid_intrinsic.hpp.
 constexpr int FFN_NCUT_LANE_STRIDE = 64;
 constexpr int FFN_NCUT_WIN_P1 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P1 +
+    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_BCAST_DIRECTION_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P1 +
     FFN_NCUT_BCAST_SLOTS_P1 * FFN_NCUT_SLOT_BYTES_P1 + 2 * FFN_NCUT_GROUP_P1 * FFN_NCUT_LANE_STRIDE;
 constexpr int FFN_NCUT_WIN_P2 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P2 +
+    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_BCAST_DIRECTION_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P2 +
     FFN_NCUT_BCAST_SLOTS_P2 * FFN_NCUT_SLOT_BYTES_P2 + 2 * FFN_NCUT_GROUP_P2 * FFN_NCUT_LANE_STRIDE;
 
 // ---------------------------------------------------------------------------
@@ -320,8 +327,10 @@ constexpr int FFN_NCUT_WIN_P2 =
 // TPUSH/TPOP unicast primitives via a nearest-neighbor relay instead of the
 // TBROADCAST MPSC collective.  The relay is fan-in-1 per direction, so it needs
 // NO broadcast region (GroupMax = 0): the window is the plain unicast layout
-//   flags(128) + 5 dirs * SlotCount * SlotBytes
-// (mirrors FFN_RS_REDUCE_WIN).  P1 relays the [8,768] row block (row gather),
+//   flags(128) + 2 dirs * SlotCount * SlotStride
+// (mirrors FFN_RS_REDUCE_WIN).  Two dirs, not five: a relay only ever touches its
+// forward/backward pair, so the GridPipe DirMask names exactly that pair and the
+// other three rings are never allocated.  P1 relays the [8,768] row block (row gather),
 // P2 relays the [8,3072] full hidden (col gather); each relay uses two opposite
 // directions (EAST forward + WEST backward for P1; SOUTH forward + NORTH backward
 // for P2), so SlotCount = 2 double-buffers the two hops.  The slot must hold the
@@ -331,10 +340,10 @@ constexpr int FFN_NCUT_WIN_P2 =
 constexpr int FFN_NCUT_TPUSH_SLOT_COUNT = 2; // double-buffer the relay's two opposite directions
 constexpr int FFN_NCUT_TPUSH_SLOT_BYTES_P1 = FFN_NCUT_ROW_BLOCK_BYTES;   // [8,768]  half (row relay)
 constexpr int FFN_NCUT_TPUSH_SLOT_BYTES_P2 = FFN_NCUT_HIDDEN_FULL_BYTES; // [8,3072] half (col relay)
-constexpr int FFN_NCUT_TPUSH_WIN_P1 = FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT *
+constexpr int FFN_NCUT_TPUSH_WIN_P1 = FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_RELAY_DIRECTION_COUNT *
                                                                       FFN_NCUT_TPUSH_SLOT_COUNT *
                                                                       FFN_NCUT_TPUSH_SLOT_BYTES_P1;
-constexpr int FFN_NCUT_TPUSH_WIN_P2 = FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT *
+constexpr int FFN_NCUT_TPUSH_WIN_P2 = FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_RELAY_DIRECTION_COUNT *
                                                                       FFN_NCUT_TPUSH_SLOT_COUNT *
                                                                       FFN_NCUT_TPUSH_SLOT_BYTES_P2;
 
@@ -370,7 +379,9 @@ constexpr int FFN_RS_REDUCE_TILE_BYTES = FFN_NCUT_T * FFN_RS_REDUCE_H_BASE * 4; 
 // One slot per H-segment so the H-chunked reduce never waits a cross-segment
 // free doorbell (each segment lands in its own slot; prodIndex < SlotCount always).
 constexpr int FFN_RS_REDUCE_SLOT_COUNT = FFN_NCUT_H / FFN_RS_REDUCE_H_BASE; // = kHSegs (7)
+// The reduce chain only ever pushes/pops EAST (row) then SOUTH (col), so its pipe
+// allocates two rings, not five.
 constexpr int FFN_RS_REDUCE_WIN =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT * FFN_RS_REDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES;
+    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_RELAY_DIRECTION_COUNT * FFN_RS_REDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES;
 
 #endif // DISTRIBUTED_FFN_GRID_CONFIG_HPP

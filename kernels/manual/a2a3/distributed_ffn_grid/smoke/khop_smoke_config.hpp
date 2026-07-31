@@ -54,10 +54,12 @@ constexpr int KHOP_TILE_BYTES = KHOP_TILE_ELEMS * 4; // fp32 payload tile
 constexpr int KHOP_SLOT_BYTES = KHOP_TILE_BYTES;
 constexpr int KHOP_SLOT_COUNT = 2;
 
-// Host-visible mirror of pto::a2a3_grid::kWindowBytes<SlotBytes, SlotCount>():
-//   layout = kFlagsBytes (128) + 5 dirs * SlotCount * SlotBytes.
+// Host-visible mirror of pto::a2a3_grid::kWindowBytes<SlotStride, SlotCount, DirMask>():
+//   layout = kFlagsBytes (128) + R dirs * SlotCount * SlotStride,
+//   R = popcount(DirMask).  This smoke only pushes/pops EAST, so its GridPipe
+//   DirMask has one bit and R = 1 (it used to pay all five rings).
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int KHOP_GRID_DIRECTION_COUNT = 5;
+constexpr int KHOP_GRID_DIRECTION_COUNT = 1; // == popcount(kKhopDirMask)
 constexpr int KHOP_GRID_FLAGS_BYTES = 128;
 constexpr int KHOP_WINDOW_BYTES = KHOP_GRID_FLAGS_BYTES + KHOP_GRID_DIRECTION_COUNT * KHOP_SLOT_COUNT * KHOP_SLOT_BYTES;
 

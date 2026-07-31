@@ -114,16 +114,24 @@ constexpr int BCAST_GROUP_MAX = (BCAST_SUBRECT != 0) ?
 constexpr int BCAST_BCAST_SLOT_COUNT = BCAST_GROUP_MAX;
 
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>():
-//   unicast layout = kFlagsBytes (128) + 5 dirs * SlotCount * SlotBytes
-//   + TBROADCAST region: BcastSlotCount * SlotBytes (shared ring)
-//                       + 2 * GroupMax * 4        (per-source ready + free lanes)
+//   unicast layout = kFlagsBytes (128) + R dirs * SlotCount * SlotStride,
+//                    R = popcount(DirMask); this smoke is pure broadcast, so
+//                    DirMask = kGridDirNone and R = 0.
+//   + TBROADCAST region: BcastSlotCount * SlotStride (shared ring)
+//                       + 2 * GroupMax * BCAST_LANE_STRIDE (ready + free lanes)
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int BCAST_GRID_DIRECTION_COUNT = 5;
+constexpr int BCAST_GRID_DIRECTION_COUNT = 0; // pure broadcast: no unicast rings
 constexpr int BCAST_GRID_FLAGS_BYTES = 128;
+// One full cache line per lane -- must match grid_mock::kBcastLaneStride.  This
+// was sizeof(uint32_t) here while the device had already moved to 64, so every
+// window was short by 2*GroupMax*60 bytes and the ready lanes ran off the end
+// into the next cell's window; receivers then waited on a doorbell that had been
+// written outside their window and the smoke hung.
+constexpr int BCAST_LANE_STRIDE = 64;
 constexpr int BCAST_UNICAST_WINDOW_BYTES =
     BCAST_GRID_FLAGS_BYTES + BCAST_GRID_DIRECTION_COUNT * BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
 constexpr int BCAST_BCAST_REGION_BYTES =
-    BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES + 2 * BCAST_GROUP_MAX * static_cast<int>(sizeof(uint32_t));
+    BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES + 2 * BCAST_GROUP_MAX * BCAST_LANE_STRIDE;
 constexpr int BCAST_WINDOW_BYTES = BCAST_UNICAST_WINDOW_BYTES + BCAST_BCAST_REGION_BYTES;
 
 #endif // BCAST_SMOKE_CONFIG_HPP

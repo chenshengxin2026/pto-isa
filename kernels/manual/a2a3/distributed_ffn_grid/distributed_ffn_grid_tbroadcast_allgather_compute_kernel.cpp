@@ -98,10 +98,15 @@ using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
 using RowBlockTile = Tile<TileType::Vec, half, kT, kRowBlock, BLayout::RowMajor>;
 using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
-using FfnGatherPipeP1 =
-    GridPipe<HiddenShardTile, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1>;
-using FfnGatherPipeP2 =
-    GridPipe<RowBlockTile, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2>;
+// DirMask = kGridDirNone: both phases move their payload through the broadcast
+// ring only (TBROADCAST + TPOP<GridGroup>), never TPUSH<Dir>/TPOP<Dir>, so the
+// per-direction unicast rings are not allocated at all.
+using FfnGatherPipeP1 = GridPipe<
+    HiddenShardTile, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1,
+    pto::kGridDirNone>;
+using FfnGatherPipeP2 = GridPipe<
+    RowBlockTile, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2,
+    pto::kGridDirNone>;
 
 // Cube GEMM accumulator tiles (L0C): gate/up [16,96] (8 valid), down [16,224].
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>;
