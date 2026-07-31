@@ -856,12 +856,8 @@ PTO_INTERNAL void TExtractVecToVecNDDispatch(DstTileData& dst, SrcTileData& src,
     uint16_t validRow = static_cast<uint16_t>(dst.GetValidRow());
     uint16_t validCol = static_cast<uint16_t>(dst.GetValidCol());
 
-    PTO_ASSERT(
-        indexRow + DstTileData::ValidRow <= SrcTileData::Rows,
-        "TEXTRACT ND_VEC : indexRow + dstValidRows exceeds srcRows!");
-    PTO_ASSERT(
-        indexCol + DstTileData::ValidCol <= SrcTileData::Cols,
-        "TEXTRACT ND_VEC : indexCol + dstValidCols exceeds srcCols!");
+    PTO_ASSERT(indexRow + validRow <= SrcTileData::Rows, "TEXTRACT ND_VEC : indexRow + dstValidRows exceeds srcRows!");
+    PTO_ASSERT(indexCol + validCol <= SrcTileData::Cols, "TEXTRACT ND_VEC : indexCol + dstValidCols exceeds srcCols!");
 
     // fp4 (float4_e2m1x2_t / float4_e1m2x2_t) is sub-byte: each T packs 2 elements into 1 byte.
     // Vector intrinsics cannot address individual fp4 elements, so only the byte-DMA path

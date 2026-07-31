@@ -34,3 +34,17 @@ bool RunGetAsyncMultiCore(
 template <typename T, size_t count>
 bool RunGetAsyncConcurrentRank(
     int n_ranks, int n_devices, int first_rank_id, int first_device_id, int iters, int freshSession);
+
+bool IsTGetAsyncPostStabilityDeviceRangeAvailable(int nRanks, int firstDeviceId);
+
+bool RunTGetAsyncImmediatePostWait(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum);
+
+bool RunTGetAsyncConsecutivePostsWaitEach(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum);
+
+bool RunTGetAsyncPostsWaitFinal(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum);

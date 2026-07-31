@@ -446,9 +446,8 @@ __tf__ PTO_INTERNAL OP_NAME(TINSERT) OP_TYPE(element_wise) void TInsertVecToVecN
     constexpr uint32_t dstRowStride = DstTileData::RowStride;
     constexpr uint32_t srcRowStride = SrcTileData::RowStride;
     constexpr uint32_t elementsPerRepeat = CCE_VL / sizeof(T);
-    constexpr uint32_t kValidCol = SrcTileData::ValidCol;
-    constexpr uint16_t kFullRepeats = static_cast<uint16_t>(kValidCol / elementsPerRepeat);
-    constexpr uint32_t kRemainder = kValidCol % elementsPerRepeat;
+    uint16_t fullRepeats = static_cast<uint16_t>(validCol / elementsPerRepeat);
+    uint32_t remainder = validCol % elementsPerRepeat;
 
     __VEC_SCOPE__
     {
@@ -458,13 +457,13 @@ __tf__ PTO_INTERNAL OP_NAME(TINSERT) OP_TYPE(element_wise) void TInsertVecToVecN
         for (uint16_t i = 0; i < validRow; ++i) {
             uint32_t srcRowOff = static_cast<uint32_t>(i) * srcRowStride;
             __ubuf__ T* pdst = dstAddr + (indexRow + static_cast<uint32_t>(i)) * dstRowStride + indexCol;
-            for (uint16_t j = 0; j < kFullRepeats; ++j) {
+            for (uint16_t j = 0; j < fullRepeats; ++j) {
                 vlds(vreg, srcAddr, srcRowOff + static_cast<uint32_t>(j) * elementsPerRepeat, NORM);
                 vstus(ureg, elementsPerRepeat, vreg, pdst, POST_UPDATE);
             }
-            if constexpr (kRemainder > 0) {
-                vlds(vreg, srcAddr, srcRowOff + static_cast<uint32_t>(kFullRepeats) * elementsPerRepeat, NORM);
-                vstus(ureg, kRemainder, vreg, pdst, POST_UPDATE);
+            if (remainder > 0) {
+                vlds(vreg, srcAddr, srcRowOff + static_cast<uint32_t>(fullRepeats) * elementsPerRepeat, NORM);
+                vstus(ureg, remainder, vreg, pdst, POST_UPDATE);
             }
             vstas(ureg, pdst, 0, POST_UPDATE);
         }
@@ -493,12 +492,8 @@ PTO_INTERNAL void TInsertVecToVecNDDispatch(DstTileData& dst, SrcTileData& src, 
     uint16_t validRow = static_cast<uint16_t>(src.GetValidRow());
     uint16_t validCol = static_cast<uint16_t>(src.GetValidCol());
 
-    PTO_ASSERT(
-        indexRow + SrcTileData::ValidRow <= DstTileData::Rows,
-        "TINSERT ND_VEC : indexRow + srcValidRows exceeds dstRows!");
-    PTO_ASSERT(
-        indexCol + SrcTileData::ValidCol <= DstTileData::Cols,
-        "TINSERT ND_VEC : indexCol + srcValidCols exceeds dstCols!");
+    PTO_ASSERT(indexRow + validRow <= DstTileData::Rows, "TINSERT ND_VEC : indexRow + srcValidRows exceeds dstRows!");
+    PTO_ASSERT(indexCol + validCol <= DstTileData::Cols, "TINSERT ND_VEC : indexCol + srcValidCols exceeds dstCols!");
 
     constexpr bool kStridesAligned = (SrcTileData::RowStride * sizeof(T) % BLOCK_BYTE_SIZE == 0) &&
                                      (DstTileData::RowStride * sizeof(T) % BLOCK_BYTE_SIZE == 0);

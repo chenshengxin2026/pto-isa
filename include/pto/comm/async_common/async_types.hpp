@@ -26,6 +26,11 @@ constexpr uint32_t kSdmaFlagLength = 128U;
 constexpr uint32_t kUbAlignSize = 256U;
 constexpr uint32_t kSdmaEventRecordBytes = 16U;
 constexpr uint32_t kSdmaEventSlotCount = kSdmaFlagLength / kSdmaEventRecordBytes;
+constexpr uint32_t kSdmaContextWorkspaceBytes = 16U * 1024U;
+constexpr uint32_t kSdmaFlagPayloadBytesPerGroup = 512U;
+constexpr uint32_t kSdmaMaxChannelGroups = 48U;
+constexpr uint32_t kSdmaWorkspaceBytes =
+    kSdmaContextWorkspaceBytes + kSdmaMaxChannelGroups * kSdmaFlagPayloadBytesPerGroup;
 
 constexpr uint32_t SDMA_FLAG_LENGTH = kSdmaFlagLength;
 constexpr uint32_t UB_ALIGN_SIZE = kUbAlignSize;
@@ -63,12 +68,32 @@ struct SdmaEventContext {
     uint32_t syncId;
 };
 
+namespace detail {
+
+constexpr uint32_t kPostStateMaxQueues = 48U;
+constexpr uint32_t kFlagPayloadDepth = 64U;
+
+struct SdmaRuntimeContext {
+    uint64_t nextPostId;
+    uint64_t postDoneId[kPostStateMaxQueues];
+    // Per-slot metadata for the shared flag payload ring. Slot index is postId % flag payload depth.
+    uint8_t flagPayloadQueueCount[kFlagPayloadDepth];
+    uint32_t sqTail[kPostStateMaxQueues];
+    uint32_t sqHead[kPostStateMaxQueues];
+    // Cumulative queue prefix used by this session. Every Post fences these queues.
+    uint32_t usedQueueCount;
+    __gm__ uint8_t* postDoneBase;
+};
+
+} // namespace detail
+
 // ============================================================================
 // SdmaSession: bundles ExecContext + EventContext for convenient async usage.
 // ============================================================================
 struct SdmaSession {
     SdmaExecContext execCtx{};
     SdmaEventContext eventCtx{};
+    mutable detail::SdmaRuntimeContext runtimeCtx{};
     bool valid{false};
 };
 
@@ -107,9 +132,24 @@ struct UrmaSession {
 // ============================================================================
 struct AsyncSession {
     DmaEngine engine{DmaEngine::SDMA};
-    sdma::SdmaSession sdmaSession{};
-    urma::UrmaSession urmaSession{};
     bool valid{false};
+
+    __gm__ uint8_t* contextGm{nullptr};
+    __ubuf__ uint8_t* tmpBufAddr{nullptr};
+    uint32_t tmpBufSize{0};
+    uint32_t syncId{0};
+    uint32_t channelGroupIdx{sdma::kAutoChannelGroupIdx};
+    uint64_t blockBytes{sdma::kDefaultSdmaBlockBytes};
+    uint64_t commBlockOffset{0};
+    uint32_t queueNum{1};
+
+    // Persistent SDMA runtime state. The SDMA backend threads this across
+    // successive posts/waits, so it lives in the session and is mutated even
+    // through const references (mirrors sdma::SdmaSession::runtimeCtx).
+    mutable sdma::detail::SdmaRuntimeContext sdmaRuntimeCtx{};
+
+    uint32_t destRankId{0};
+    uint32_t qpIdx{0};
 };
 
 } // namespace comm

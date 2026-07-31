@@ -93,11 +93,14 @@ inline void FlushTailsForPipe(auto pipe)
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::L1_TO_L0B);
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::L1_TO_BT);
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::L1_TO_FB);
-            FlushPipeTail(::pto::mocker::evaluator::PipeKey::L1_FILL);
             break;
         case PIPE_MTE2:
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::GM_TO_UB);
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::GM_TO_L1);
+            // create_cbuf_matrix writes L1(cbuf) with an immediate; MTE2 is the
+            // L1-write engine (GM_TO_L1 is MTE2 too), MTE1 only reads L1->L0.
+            // Grouping here settles the fill's tail on the MTE2->consumer sync.
+            FlushPipeTail(::pto::mocker::evaluator::PipeKey::L1_FILL);
             break;
         case PIPE_MTE3:
             FlushPipeTail(::pto::mocker::evaluator::PipeKey::UB_TO_GM);

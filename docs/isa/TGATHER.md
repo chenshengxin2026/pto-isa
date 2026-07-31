@@ -100,7 +100,7 @@ For each row `i` in `src0`, compare each element `src0[i, j]` against threshold 
     - `src1.GetValidCol() == TmpTileData::Cols` and `src1.GetValidRow() == TmpTileData::Rows`.
     - `dst.GetValidCol() == DstTileData::Cols` (continuous dst storage).
 - **Index-based gather: implementation checks (A5)**:
-    - `sizeof(DstTileData::DType)` must be `int16_t`, `uint16_t`, `int32_t`, `uint32_t`, `half`, `float`.
+    - `sizeof(DstTileData::DType)` must be 1, 2, or 4 bytes: `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`, `half`, `bfloat16_t`, `float`.
     - `sizeof(Src1TileData::DType)` must be `int16_t`, `uint16_t`, `int32_t`, `uint32_t`.
     - `DstTileData::DType` must be the same type as `Src0TileData::DType`.
     - `src1.GetValidCol() == Src1TileData::Cols` and `dst.GetValidCol() == DstTileData::Cols`.

@@ -22,8 +22,8 @@ namespace detail {
 
 #ifdef PTO_URMA_SUPPORTED
 template <typename GlobalDstData, typename GlobalSrcData>
-PTO_INTERNAL AsyncEvent
-TGET_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const urma::UrmaExecContext& execCtx)
+PTO_INTERNAL AsyncEvent TGET_ASYNC_URMA_IMPL(
+    GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer)
 {
     (void)TGetAsyncCheckTensorCompatibility<GlobalDstData, GlobalSrcData>();
 
@@ -48,8 +48,15 @@ TGET_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData,
 
     const uint64_t eventHandle = urma::__urma_get_async(
         reinterpret_cast<__gm__ uint8_t*>(dstGlobalData.data()),
-        reinterpret_cast<__gm__ uint8_t*>(srcGlobalData.data()), transferSize, execCtx);
+        reinterpret_cast<__gm__ uint8_t*>(srcGlobalData.data()), transferSize, session, peer);
     return AsyncEvent(eventHandle, DmaEngine::URMA);
+}
+
+template <typename GlobalDstData, typename GlobalSrcData>
+PTO_INTERNAL AsyncEvent
+TGET_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
+{
+    return TGET_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session, session.destRankId);
 }
 #endif
 
@@ -65,10 +72,30 @@ PTO_INTERNAL AsyncEvent
 TGET_ASYNC_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
 {
     if constexpr (engine == DmaEngine::SDMA) {
-        return detail::TGET_ASYNC_SDMA_IMPL(dstGlobalData, srcGlobalData, session.sdmaSession.execCtx);
+        return detail::TGET_ASYNC_SDMA_IMPL(dstGlobalData, srcGlobalData, session);
     } else if constexpr (engine == DmaEngine::URMA) {
 #ifdef PTO_URMA_SUPPORTED
-        return detail::TGET_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session.urmaSession.execCtx);
+        return detail::TGET_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session);
+#else
+        static_assert(engine != DmaEngine::URMA, "TGET_ASYNC: URMA engine requires NPU_ARCH 3510");
+        return AsyncEvent(0, engine);
+#endif
+    } else {
+        PTO_ASSERT(false, "TGET_ASYNC: unsupported engine");
+        return AsyncEvent(0, engine);
+    }
+}
+
+// peer overload: URMA uses peer for SQ/CQ/MemInfo; SDMA ignores peer.
+template <DmaEngine engine = DmaEngine::SDMA, typename GlobalDstData, typename GlobalSrcData>
+PTO_INTERNAL AsyncEvent
+TGET_ASYNC_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer)
+{
+    if constexpr (engine == DmaEngine::SDMA) {
+        return detail::TGET_ASYNC_SDMA_IMPL(dstGlobalData, srcGlobalData, session);
+    } else if constexpr (engine == DmaEngine::URMA) {
+#ifdef PTO_URMA_SUPPORTED
+        return detail::TGET_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session, peer);
 #else
         static_assert(engine != DmaEngine::URMA, "TGET_ASYNC: URMA engine requires NPU_ARCH 3510");
         return AsyncEvent(0, engine);

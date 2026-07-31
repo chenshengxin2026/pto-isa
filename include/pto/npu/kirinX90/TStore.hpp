@@ -123,7 +123,7 @@ PTO_INTERNAL void TStoreUb2gmNz2nz(
     PTO_ASSERT(gShape1 < 4096, "The gshape1 (which equals nBurst) must be less than 4096 for kirinX90");
     uint16_t nBurst = gShape1;
     uint32_t lenBurst = validRow * C0_SIZE_BYTE;
-    uint32_t gmGap = (gStride1 - gShape2 * gShape3 * gShape4) * sizeof(typename TileData::DType);
+    uint32_t gmGap = (gStride1 - validRow * gShape4) * sizeof(typename TileData::DType);
     uint32_t ubGap = TileData::Rows - validRow;
 
     __ubuf__ typename TileData::DType* srcTileAddr = srcAddr;
@@ -288,9 +288,7 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
             dst.GetShape(GlobalTensorDim::DIM_2) > 0 && dst.GetShape(GlobalTensorDim::DIM_3) > 0 &&
             dst.GetShape(GlobalTensorDim::DIM_4) > 0 && src.GetValidRow() > 0 && src.GetValidCol() > 0,
         "The shape of src and dst must be greater than 0!");
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicAdd<typename GlobalData::DType>();
-    }
+    static_assert(currentAtomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirinX90.");
     if constexpr (TileData::Loc == TileType::Vec) {
         CheckStaticForVecAndMat<TileData, GlobalData>();
         TStore<GlobalData, TileData>(
@@ -320,9 +318,6 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
             dst.GetStride(GlobalTensorDim::DIM_3), dst.GetStride(GlobalTensorDim::DIM_4), src.GetValidRow(),
             src.GetValidCol());
     }
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicNone();
-    }
 }
 
 template <
@@ -331,10 +326,8 @@ template <
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
 {
     static_assert(TileData::Loc == TileType::Acc, "Source TileType only support Acc!");
+    static_assert(currentAtomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirinX90.");
     CheckAcc2gm<TileData, GlobalData, false>(dst, src);
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicAdd<typename GlobalData::DType>();
-    }
     constexpr QuantMode_t quantMode = GetCastPreQuantModeGm<typename TileData::DType, typename GlobalData::DType>();
     TStoreAcc<GlobalData, TileData, quantMode, reluPreMode, Phase>(
         dst.data(), src.data(), dst.GetShape(GlobalTensorDim::DIM_0), dst.GetShape(GlobalTensorDim::DIM_1),
@@ -343,9 +336,6 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
         dst.GetStride(GlobalTensorDim::DIM_1), dst.GetStride(GlobalTensorDim::DIM_2),
         dst.GetStride(GlobalTensorDim::DIM_3), dst.GetStride(GlobalTensorDim::DIM_4), src.GetValidRow(),
         src.GetValidCol());
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicNone();
-    }
 }
 
 template <
@@ -354,10 +344,8 @@ template <
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, uint64_t preQuantScalar)
 {
     static_assert(TileData::Loc == TileType::Acc, "Source TileType only support Acc!");
+    static_assert(currentAtomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirinX90.");
     CheckAcc2gm<TileData, GlobalData, true>(dst, src);
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicAdd<typename GlobalData::DType>();
-    }
     set_quant_pre(preQuantScalar);
     constexpr QuantMode_t quantMode = GetScalarPreQuantModeGm<typename TileData::DType, typename GlobalData::DType>();
     TStoreAcc<GlobalData, TileData, quantMode, reluPreMode, Phase>(
@@ -367,9 +355,6 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, uint64_t preQuantS
         dst.GetStride(GlobalTensorDim::DIM_1), dst.GetStride(GlobalTensorDim::DIM_2),
         dst.GetStride(GlobalTensorDim::DIM_3), dst.GetStride(GlobalTensorDim::DIM_4), src.GetValidRow(),
         src.GetValidCol());
-    if constexpr (AtomicType::AtomicAdd == currentAtomicType) {
-        SetAtomicNone();
-    }
 }
 
 template <
@@ -379,9 +364,7 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, FpTileData& fp)
 {
     static_assert(TileData::Loc == TileType::Acc, "Source TileType only support Acc!");
     CheckAcc2gm<TileData, GlobalData, true>(dst, src);
-    if constexpr (AtomicType::AtomicAdd == currentAtomicType) {
-        SetAtomicAdd<typename GlobalData::DType>();
-    }
+    static_assert(currentAtomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirinX90.");
     constexpr QuantMode_t quantMode = GetVectorPreQuantModeGm<typename TileData::DType, typename GlobalData::DType>();
     TStoreAccFp<GlobalData, TileData, FpTileData, quantMode, reluPreMode>(
         dst.data(), src.data(), fp.data(), dst.GetShape(GlobalTensorDim::DIM_0), dst.GetShape(GlobalTensorDim::DIM_1),
@@ -390,9 +373,6 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, FpTileData& fp)
         dst.GetStride(GlobalTensorDim::DIM_1), dst.GetStride(GlobalTensorDim::DIM_2),
         dst.GetStride(GlobalTensorDim::DIM_3), dst.GetStride(GlobalTensorDim::DIM_4), src.GetValidRow(),
         src.GetValidCol());
-    if constexpr (currentAtomicType == AtomicType::AtomicAdd) {
-        SetAtomicNone();
-    }
 }
 } // namespace pto
 #endif

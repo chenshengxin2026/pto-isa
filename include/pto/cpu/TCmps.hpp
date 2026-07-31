@@ -30,7 +30,7 @@ AICORE uint8_t CmpCall(T a, T b, CmpMode cmpMode)
             res = (std::fabs(diff) < 1e-9);
             break;
         case CmpMode::NE:
-            res = (std::fabs(diff) > 1e-9);
+            res = (a != a || b != b) ? 1 : (std::fabs(diff) > 1e-9);
             break;
         case CmpMode::LT:
             res = (a < b);

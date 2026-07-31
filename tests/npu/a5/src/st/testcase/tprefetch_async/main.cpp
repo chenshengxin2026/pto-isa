@@ -14,8 +14,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include "tprefetch_async_kernel.h"
 
-// Functional-correctness only: prefetch a tile, wait on the event, then
-// TLOAD/TSTORE through it and verify the output bytes match the source.
+// Correctness coverage plus a device-side latency comparison between cold and
+// prefetched TLOAD access.
 
 class TPrefetchAsyncTest : public testing::Test {
 protected:
@@ -28,6 +28,33 @@ TEST_F(TPrefetchAsyncTest, case_float_4096_globaltensor) { ASSERT_TRUE((RunPrefe
 TEST_F(TPrefetchAsyncTest, case_int32_4096_globaltensor)
 {
     ASSERT_TRUE((RunPrefetchAsyncCorrectness<int32_t, 4096>(0)));
+}
+
+// Issue 65 Posts to cross the 64-slot flag payload ring boundary, then wait only for the final event.
+TEST_F(TPrefetchAsyncTest, case_float_4096_multi_post_wait_last)
+{
+    ASSERT_TRUE((RunPrefetchAsyncCorrectness<float, 4096>(0, 65U, false)));
+}
+
+// Issue and wait for 16 consecutive int32 prefetch events using the context-owned session.
+TEST_F(TPrefetchAsyncTest, case_int32_4096_multi_post_wait_each)
+{
+    ASSERT_TRUE((RunPrefetchAsyncCorrectness<int32_t, 4096>(0, 16U, true)));
+}
+
+// Issue and wait for 16 prefetch events while reusing an externally built AsyncSession.
+TEST_F(TPrefetchAsyncTest, case_float_4096_shared_external_session)
+{
+    ASSERT_TRUE((RunPrefetchAsyncCorrectness<float, 4096>(0, 16U, true, true)));
+}
+
+// Compare device-side TLOAD latency for cold data against data prefetched into L2.
+TEST_F(TPrefetchAsyncTest, case_float_4096_l2_access_benefit)
+{
+    double coldAverageUs = 0.0;
+    double prefetchedAverageUs = 0.0;
+    ASSERT_TRUE(RunPrefetchAsyncL2Benefit(0, coldAverageUs, prefetchedAverageUs));
+    EXPECT_LT(prefetchedAverageUs, coldAverageUs);
 }
 
 int main(int argc, char** argv)

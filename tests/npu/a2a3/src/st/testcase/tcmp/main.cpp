@@ -34,10 +34,10 @@ std::string GetGoldenDir()
     return fullPath;
 }
 
-template <typename T, int kGRows_, int kGCols_, int kTRows_, int kTCols_, CmpMode cmpMode>
+template <typename T, int kGRows_, int kGCols_, int kTRows_, int kTCols_, CmpMode cmpMode, bool isHalf = false>
 void LaunchTCmp(uint8_t* out, T* src0, T* src1, void* stream);
 
-template <typename T, int kGRows_, int kGCols_, int kTRows_, int kTCols_, CmpMode cmpMode>
+template <typename T, int kGRows_, int kGCols_, int kTRows_, int kTCols_, CmpMode cmpMode, bool isHalf = false>
 void test_tcmp()
 {
     size_t fileSize = kGRows_ * kGCols_ * sizeof(T);
@@ -66,7 +66,7 @@ void test_tcmp()
     aclrtMemcpy(src0Device, fileSize, src0Host, fileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(src1Device, fileSize, src1Host, fileSize, ACL_MEMCPY_HOST_TO_DEVICE);
 
-    LaunchTCmp<T, kGRows_, kGCols_, kTRows_, kTCols_, cmpMode>(dstDevice, src0Device, src1Device, stream);
+    LaunchTCmp<T, kGRows_, kGCols_, kTRows_, kTCols_, cmpMode, isHalf>(dstDevice, src0Device, src1Device, stream);
 
     aclrtSynchronizeStream(stream);
     aclrtMemcpy(dstHost, fileSize, dstDevice, file_size_dst, ACL_MEMCPY_DEVICE_TO_HOST);
@@ -94,10 +94,26 @@ void test_tcmp()
     EXPECT_TRUE(ret);
 }
 
-TEST_F(TCMPTest, case_float_1x64_1x64_1x64) { test_tcmp<float, 1, 64, 1, 64, CmpMode::EQ>(); }
-TEST_F(TCMPTest, case_float_8x64_8x64_8x64) { test_tcmp<float, 8, 64, 8, 64, CmpMode::GT>(); }
-TEST_F(TCMPTest, case_int32_64x64_32x32_64x64) { test_tcmp<int32_t, 64, 64, 32, 32, CmpMode::EQ>(); }
-TEST_F(TCMPTest, case_int32_16x32_16x32_16x32) { test_tcmp<int32_t, 16, 32, 16, 32, CmpMode::EQ>(); }
-TEST_F(TCMPTest, case_float_128x128_64x64_128x128) { test_tcmp<float, 128, 128, 64, 64, CmpMode::LE>(); }
-TEST_F(TCMPTest, case_int32_77x81_32x32_77x81) { test_tcmp<int32_t, 77, 81, 32, 32, CmpMode::EQ>(); }
-TEST_F(TCMPTest, case_int32_32x32_32x32_32x32) { test_tcmp<int32_t, 32, 32, 32, 32, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_eq_float_1x64_1x64_1x64) { test_tcmp<float, 1, 64, 1, 64, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_gt_float_8x64_8x64_8x64) { test_tcmp<float, 8, 64, 8, 64, CmpMode::GT>(); }
+TEST_F(TCMPTest, case_eq_int32_64x64_32x32_64x64) { test_tcmp<int32_t, 64, 64, 32, 32, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_eq_int32_16x32_16x32_16x32) { test_tcmp<int32_t, 16, 32, 16, 32, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_le_float_128x128_64x64_128x128) { test_tcmp<float, 128, 128, 64, 64, CmpMode::LE>(); }
+TEST_F(TCMPTest, case_eq_int32_77x81_32x32_77x81) { test_tcmp<int32_t, 77, 81, 32, 32, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_eq_int32_32x32_32x32_32x32) { test_tcmp<int32_t, 32, 32, 32, 32, CmpMode::EQ>(); }
+TEST_F(TCMPTest, case_ne_float_32x32_32x32_32x32) { test_tcmp<float, 32, 32, 32, 32, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_ne_float_32x32_32x32_32x32_nan) { test_tcmp<float, 32, 32, 32, 32, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_lt_float_2x4096_2x4096_2x4096) { test_tcmp<float, 2, 4096, 2, 4096, CmpMode::LT>(); }
+TEST_F(TCMPTest, case_ne_float_2x4096_2x4096_2x4096) { test_tcmp<float, 2, 4096, 2, 4096, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_ne_float_2x4096_2x4096_2x4096_nan) { test_tcmp<float, 2, 4096, 2, 4096, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_ne_float_1x64_1x64_1x64) { test_tcmp<float, 1, 64, 1, 64, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_ne_float_64x64_32x32_64x64) { test_tcmp<float, 64, 64, 32, 32, CmpMode::NE>(); }
+TEST_F(TCMPTest, case_eq_half_1x64_1x64_1x64) { test_tcmp<aclFloat16, 1, 64, 1, 64, CmpMode::EQ, true>(); }
+TEST_F(TCMPTest, case_ne_half_8x64_8x64_8x64) { test_tcmp<aclFloat16, 8, 64, 8, 64, CmpMode::NE, true>(); }
+TEST_F(TCMPTest, case_lt_half_32x32_32x32_32x32) { test_tcmp<aclFloat16, 32, 32, 32, 32, CmpMode::LT, true>(); }
+TEST_F(TCMPTest, case_gt_half_32x32_32x32_32x32) { test_tcmp<aclFloat16, 32, 32, 32, 32, CmpMode::GT, true>(); }
+TEST_F(TCMPTest, case_ge_half_16x32_16x32_16x32) { test_tcmp<aclFloat16, 16, 32, 16, 32, CmpMode::GE, true>(); }
+TEST_F(TCMPTest, case_le_half_128x128_64x64_128x128) { test_tcmp<aclFloat16, 128, 128, 64, 64, CmpMode::LE, true>(); }
+TEST_F(TCMPTest, case_ne_half_32x32_32x32_32x32_nan) { test_tcmp<aclFloat16, 32, 32, 32, 32, CmpMode::NE, true>(); }
+TEST_F(TCMPTest, case_ne_half_2x4096_2x4096_2x4096) { test_tcmp<aclFloat16, 2, 4096, 2, 4096, CmpMode::NE, true>(); }
+TEST_F(TCMPTest, case_ne_half_128x128_64x64_128x128) { test_tcmp<aclFloat16, 128, 128, 64, 64, CmpMode::NE, true>(); }

@@ -31,12 +31,8 @@ AICORE void CmpCall(
     } else {
         switch (static_cast<CmpMode>(cmpMode)) {
             case CmpMode::EQ:
-                vcmpv_eq(
-                    dst, src0, src1, repeat, dstblockstride, srcblockstride, srcblockstride, dstrepeatstride,
-                    srcrepeatstride, srcrepeatstride);
-                break;
             case CmpMode::NE:
-                vcmpv_ne(
+                vcmpv_eq(
                     dst, src0, src1, repeat, dstblockstride, srcblockstride, srcblockstride, dstrepeatstride,
                     srcrepeatstride, srcrepeatstride);
                 break;
@@ -103,6 +99,16 @@ __tf__ AICORE void TCmp(
                 src1Ptr + i * src1AlignCols + numLoop * srcOffset, mode, numRemainPerLine, 1, 1, 8, 8);
         }
     }
+    if (mode == CmpMode::NE) {
+        pipe_barrier(PIPE_V);
+        set_mask_count();
+        SetVectorCount(validRow * dstAlignCols / sizeof(unsigned short));
+        vnot(
+            (__ubuf__ unsigned short*)dstPtr, (__ubuf__ unsigned short*)dstPtr, 0, 1, 1, BLOCK_MAX_PER_REPEAT,
+            BLOCK_MAX_PER_REPEAT);
+        set_mask_norm();
+        set_vector_mask(-1, -1);
+    }
 }
 
 template <typename TileDataDst, typename TileDataSrc0, typename TileDataSrc1>
@@ -110,6 +116,9 @@ PTO_INTERNAL void TCMP_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileDataSrc1& 
 {
     using T = typename TileDataSrc0::DType;
     static_assert(std::is_same_v<T, typename TileDataSrc1::DType>, "TCMP: src0 and src1 must have same type");
+    static_assert(
+        std::is_same_v<T, int32_t> || std::is_same_v<T, half> || std::is_same_v<T, float>,
+        "TCMP: input data type must be one of int32_t, half, float.");
     static_assert(
         TileDataSrc0::Loc == TileType::Vec && TileDataSrc1::Loc == TileType::Vec,
         "TileType of src tiles must be TileType::Vec.");

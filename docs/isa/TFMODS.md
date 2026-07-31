@@ -48,7 +48,7 @@ PTO_INST RecordEvent TFMODS(TileDataDst &dst, TileDataSrc &src, typename TileDat
 `PrecisionType` has the following values available:
 
 * `FmodSAlgorithm::DEFAULT`: Normal algorithm, faster but with lower precision.
-* `FmodSAlgorithm::HIGH_PRECISION`: High precision algorithm, but slower, only support `float` type.
+* `FmodSAlgorithm::HIGH_PRECISION`: High precision algorithm, but slower, only supports `float` type.
 
 ## Constraints
 

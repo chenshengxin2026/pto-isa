@@ -87,8 +87,8 @@ void test_TFUSEDMULADD()
     aclrtResetDevice(0);
     aclFinalize();
 
-    std::vector<T> golden(fileSizeDst);
-    std::vector<T> devFinal(fileSizeDst);
+    std::vector<T> golden(dstTileH * dstTileW);
+    std::vector<T> devFinal(dstTileH * dstTileW);
     ReadFile(GetGoldenDir() + "/golden.bin", fileSizeDst, golden.data(), fileSizeDst);
     ReadFile(GetGoldenDir() + "/output.bin", fileSizeDst, devFinal.data(), fileSizeDst);
 
@@ -122,4 +122,12 @@ TEST_F(TFUSEDMULADDTest, case_half_64x64_64x64_64x64_64x64)
 TEST_F(TFUSEDMULADDTest, case_half_32x128_32x192_32x256_32x127)
 {
     test_TFUSEDMULADD<aclFloat16, 32, 128, 32, 192, 32, 256, 32, 127>();
+}
+TEST_F(TFUSEDMULADDTest, case_half_2048x16_2048x16_2048x16_2048x16)
+{
+    test_TFUSEDMULADD<aclFloat16, 2048, 16, 2048, 16, 2048, 16, 2048, 16>();
+}
+TEST_F(TFUSEDMULADDTest, case_half_1x32768_1x32768_1x32768_1x32768)
+{
+    test_TFUSEDMULADD<aclFloat16, 1, 32768, 1, 32768, 1, 32768, 1, 32768>();
 }

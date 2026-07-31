@@ -11,8 +11,12 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
-// Single-card host runner for the public TPREFETCH_ASYNC GlobalTensor API
-// correctness test. Defined in tprefetch_async_kernel.cpp.
+// Single-card host runners for public TPREFETCH_ASYNC correctness and L2
+// access-latency tests. Defined in tprefetch_async_kernel.cpp.
 template <typename T, size_t count>
-bool RunPrefetchAsyncCorrectness(int deviceId);
+bool RunPrefetchAsyncCorrectness(
+    int deviceId, uint32_t postCount = 1U, bool waitEachEvent = true, bool useExternalSession = false);
+
+bool RunPrefetchAsyncL2Benefit(int deviceId, double& coldAverageUs, double& prefetchedAverageUs);

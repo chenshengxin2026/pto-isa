@@ -1,5 +1,5 @@
 /**
-Copyright (c) 2025 Huawei Technologies Co., Ltd.
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
 This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 CANN Open Software License Agreement Version 2.0 (the "License").
 Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -7,7 +7,6 @@ THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, E
 INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 See LICENSE in the root of the software repository for the full text of the License.
 */
-
 #include <pto/pto-inst.hpp>
 #ifndef PTO_CPUSTUB_HPP
 #define PTO_CPUSTUB_HPP
@@ -16,20 +15,17 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <cstdlib>
 #include <cstring>
 #include <cassert>
+#include <cstdio>
 #include <algorithm>
-#include <atomic>
+#include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
-#include <memory>
 #include <mutex>
-#include <exception>
-#include <chrono>
 #include <sstream>
-#include <string>
 #include <thread>
 #include <vector>
 #include <type_traits>
-#include <cstdio>
 #include <dlfcn.h>
 #include <string>
 #include "type.hpp"
@@ -64,6 +60,7 @@ inline void pipe_barrier(pipe_t pipe) { (void)pipe; }
 
 #define aclFloat16ToFloat(x) ((float)(x))
 
+#if !defined(__COSTMODEL)
 enum {
     ACL_MEM_MALLOC_HUGE_FIRST = 0,
     ACL_MEMCPY_HOST_TO_DEVICE = 0,
@@ -78,15 +75,75 @@ static inline int aclrtMallocHost(void** p, size_t sz)
     return 0;
 }
 
-#define set_flag(a, b, c)
-#define wait_flag(a, b, c)
+inline int aclrtMalloc(void** p, size_t sz, int) { return aclrtMallocHost(p, sz); }
+
+inline int aclrtMemcpy(void* dst, size_t szDst, const void* src, size_t szSrc, int)
+{
+    std::memcpy(dst, src, std::min(szDst, szSrc));
+    return 0;
+}
+
+inline int aclrtMemset(void* dst, size_t dstSize, int value, size_t count)
+{
+    constexpr int aclSuccess = 0;
+    constexpr int aclErrorParamInvalid = 145000;
+
+    if (count == 0) {
+        return aclSuccess;
+    }
+    if (dst == nullptr || count > dstSize) {
+        return aclErrorParamInvalid;
+    }
+    std::fill_n(reinterpret_cast<uint8_t*>(dst), count, static_cast<uint8_t>(value));
+    return aclSuccess;
+}
+
+inline int aclrtSynchronizeStream(aclrtStream) { return 0; }
+
+inline int aclrtFree(void* p)
+{
+    free(p);
+    return 0;
+}
+
+inline int aclrtFreeHost(void* p)
+{
+    free(p);
+    return 0;
+}
+
+inline int aclrtDestroyStream(aclrtStream) { return 0; }
+inline int aclrtResetDevice(int) { return 0; }
+inline int aclFinalize() { return 0; }
+#endif
+
+inline void set_flag(pipe_t, pipe_t, int) {}
+inline void wait_flag(pipe_t, pipe_t, int) {}
+#if !defined(__COSTMODEL)
+using mem_dsb_t = int;
+inline constexpr int SINGLE_CACHE_LINE = 0;
+inline constexpr int ENTIRE_DATA_CACHE = 0;
+inline constexpr int CACHELINE_OUT = 0;
+inline constexpr mem_dsb_t DSB_DDR = 0;
+inline constexpr mem_dsb_t DSB_ALL = 0;
+inline constexpr mem_dsb_t DSB_UB = 0;
+inline void dcci(const volatile void*, int) {}
+inline void dcci(const volatile void*, int, int) {}
+inline void dsb(mem_dsb_t) {}
+inline uint64_t& cpu_ctrl_register()
+{
+    static thread_local uint64_t ctrl = 0;
+    return ctrl;
+}
+
+inline uint64_t get_ctrl() { return cpu_ctrl_register(); }
+inline void set_ctrl(uint64_t value) { cpu_ctrl_register() = value; }
+inline uint64_t sbitset1(uint64_t value, int bit) { return value | (1ULL << bit); }
+inline uint64_t sbitset0(uint64_t value, int bit) { return value & ~(1ULL << bit); }
+#endif
 #define __cce_get_tile_ptr(x) x
 #define set_mask_norm(...)
 #define set_vector_mask(...)
-inline uint64_t get_ctrl() { return 0; }
-inline void set_ctrl(uint64_t) {}
-inline uint64_t sbitset1(uint64_t value, int) { return value; }
-inline uint64_t sbitset0(uint64_t value, int) { return value; }
 
 inline uint32_t get_block_idx();
 
@@ -120,6 +177,10 @@ struct CommDeviceContext {
 #define EVENT_ID1 1
 #define EVENT_ID2 2
 #define EVENT_ID3 3
+#define EVENT_ID4 4
+#define EVENT_ID5 5
+#define EVENT_ID6 6
+#define EVENT_ID7 7
 
 #define F16_MAX 65504.0f
 
@@ -471,57 +532,6 @@ inline int aclrtCreateStream(aclrtStream* stream)
     return 0;
 }
 
-inline int aclrtMalloc(void** p, size_t sz, int) { return aclrtMallocHost(p, sz); }
-
-inline int aclrtMemcpy(void* dst, size_t sz_dst, const void* src, size_t sz_src, int)
-{
-    std::memcpy(dst, src, std::min(sz_dst, sz_src));
-    return 0;
-}
-
-inline int aclrtMemset(void* dst, size_t dstSize, int value, size_t count)
-{
-    constexpr int ACL_SUCCESS = 0;
-    constexpr int ACL_ERROR_GE_PARAM_INVALID = 145000;
-
-    if (count == 0) {
-        return ACL_SUCCESS;
-    }
-    if (dst == nullptr || count > dstSize) {
-        return ACL_ERROR_GE_PARAM_INVALID;
-    }
-    std::fill_n(reinterpret_cast<uint8_t*>(dst), count, static_cast<uint8_t>(value));
-    return ACL_SUCCESS;
-}
-
-inline int aclrtSynchronizeStream(aclrtStream) { return 0; }
-
-inline int aclrtFree(void* p)
-{
-    free(p);
-    return 0;
-}
-
-inline int aclrtFreeHost(void* p)
-{
-    free(p);
-    return 0;
-}
-
-inline int aclrtDestroyStream(aclrtStream stream)
-{
-    delete pto::cpu_sim::ToStreamState(stream);
-    return 0;
-}
-
-inline int aclrtResetDevice(int) { return 0; }
-
-inline int aclFinalize()
-{
-    pto::cpu_sim::ShutdownRuntime();
-    return 0;
-}
-
 inline uint32_t get_block_idx()
 {
     if (auto hook = pto::cpu_sim::ResolveExecutionContextHook(); hook != nullptr) {
@@ -582,6 +592,7 @@ struct is_event : std::false_type {};
 template <typename... Ts>
 inline constexpr bool all_events_v = (is_event<Ts>::value && ...);
 
+#if defined(__CPU_SIM)
 namespace pto {
 template <SyncCoreType CoreType = SyncCoreType::AIVOnly>
 inline void SYNCALL_IMPL()
@@ -590,30 +601,27 @@ inline void SYNCALL_IMPL()
 }
 
 template <SyncCoreType CoreType = SyncCoreType::AIVOnly>
-inline void SYNCALL_SOFT_IMPL(int32_t* gmWorkspace, int32_t* ubWorkspace, int32_t usedCores)
+inline void SYNCALL_SOFT_IMPL(int32_t* gmWorkspace, int32_t usedCores)
 {
     (void)CoreType;
     (void)gmWorkspace;
-    (void)ubWorkspace;
     (void)usedCores;
 }
 
-inline void SYNCALL_SOFT_AIC_IMPL(int32_t* gmWorkspace, int32_t* l1Workspace, int32_t usedCores)
+inline void SYNCALL_SOFT_AIC_IMPL(int32_t* gmWorkspace, int32_t usedCores)
 {
     (void)gmWorkspace;
-    (void)l1Workspace;
     (void)usedCores;
 }
 
 template <SyncCoreType CoreType = SyncCoreType::Mix>
-inline void SYNCALL_SOFT_MIX_IMPL(int32_t* gmWorkspace, int32_t* ubWorkspace, int32_t* l1Workspace, int32_t usedCores)
+inline void SYNCALL_SOFT_MIX_IMPL(int32_t* gmWorkspace, int32_t usedCores)
 {
     (void)CoreType;
     (void)gmWorkspace;
-    (void)ubWorkspace;
-    (void)l1Workspace;
     (void)usedCores;
 }
 } // namespace pto
+#endif // __CPU_SIM
 
 #endif

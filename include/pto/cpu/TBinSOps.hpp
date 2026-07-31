@@ -123,8 +123,8 @@ PTO_INTERNAL void UnaryTileScalarOpImpl(TileDst& dst, TileSrc& src, typename Til
                 const std::size_t baseSrc = c * TileSrc::Rows;
                 PTO_CPU_VECTORIZE_LOOP
                 for (std::size_t r = 0; r < rows; ++r) {
-                    const std::size_t idxDst = baseDst + c;
-                    const std::size_t idxSrc = baseSrc + c;
+                    const std::size_t idxDst = baseDst + r;
+                    const std::size_t idxSrc = baseSrc + r;
                     ElementOpCal<T, op>::apply(dst.data()[idxDst], src.data()[idxSrc], scalar, extra);
                 }
             });

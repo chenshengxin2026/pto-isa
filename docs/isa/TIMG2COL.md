@@ -22,6 +22,8 @@ PTO_INST RecordEvent TIMG2COL(TileData &dst, ConvTileData &src, uint16_t posM = 
 ## Constraints
 
 - This instruction is target/implementation-specific. See `include/pto/npu/*/TImg2col.hpp` for the supported tile types/layouts and config fields.
+- **Implementation checks (A2A3)**: `TileData::DType` must be one of: `int8_t`, `half`, `bfloat16_t`, `float`.
+- **Implementation checks (A5)**: `TileData::DType` must be one of: `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`, `half`, `bfloat16_t`, `float`.
 
 ## Math Interpretation
 

@@ -48,6 +48,12 @@ PTO_INTERNAL void TMAXS_IMPL(TileDataDst& dst, TileDataSrc& src, typename TileDa
 {
     using T = typename TileDataDst::DType;
     static_assert(
+        std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t> || std::is_same_v<T, float> ||
+            std::is_same_v<T, int16_t> || std::is_same_v<T, uint16_t> || std::is_same_v<T, half> ||
+            std::is_same_v<T, bfloat16_t> || std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>,
+        "TMAXS: Invalid data type (supported: "
+        "int32_t/uint32_t/int16_t/uint16_t/int8_t/uint8_t/half/bfloat16_t/float).");
+    static_assert(
         (TileDataDst::Loc == TileType::Vec) && (TileDataSrc::Loc == TileType::Vec),
         "TileType of dst and src tiles must be TileType::Vec.");
     static_assert(

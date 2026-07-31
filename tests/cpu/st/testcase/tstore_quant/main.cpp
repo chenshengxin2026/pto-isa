@@ -126,7 +126,7 @@ TEST_F(TStoreQuantTest, DN_4)
 
 TEST_F(TStoreQuantTest, DN_5)
 {
-    test_tstore_quant<1, float, aclFloat16, 3, 1, 1, 1, 124, 5, 1, 1, 2, 128, true, false, false>();
+    test_tstore_quant<1, float, aclFloat16, 3, 1, 1, 1, 124, 5, 1, 1, 2, 128, false, false, false>();
 }
 
 TEST_F(TStoreQuantTest, DN_6)

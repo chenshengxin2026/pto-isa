@@ -11,6 +11,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <vector>
 
 #include <pto/pto-inst.hpp>
 #include "pto/comm/async/sdma/sdma_types.hpp"
@@ -694,3 +695,465 @@ bool RunGetAsyncConcurrentRank(
 
 template bool RunGetAsyncConcurrentRank<float, 8192>(int, int, int, int, int, int);
 template bool RunGetAsyncConcurrentRank<int32_t, 8192>(int, int, int, int, int, int);
+
+namespace {
+
+constexpr int kPostStabilityRootRank = 0;
+constexpr uint32_t kPostStabilityElemsPerPost = 1024;
+constexpr uint32_t kPostStabilityTileElems = 256;
+constexpr uint32_t kPostStabilityMaxDeferredEvents = 16;
+constexpr int32_t kPostStabilityConsumeAdd = 100;
+constexpr int32_t kPostStabilitySourceBias = 7;
+constexpr int32_t kPostStabilityRecvPoison = -777777;
+constexpr int32_t kPostStabilityConsumePoison = -888888;
+constexpr size_t kPostStabilityWindowPrefix = 64 * sizeof(int32_t);
+constexpr uint32_t kPostStatusEventValid = 1U << 0;
+constexpr uint32_t kPostStatusWaitPassed = 1U << 1;
+constexpr uint32_t kPostStatusConsumed = 1U << 2;
+constexpr uint32_t kExpectedPostStatus = kPostStatusEventValid | kPostStatusWaitPassed | kPostStatusConsumed;
+
+using PostShape = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+using PostStride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+using PostGlobal = pto::GlobalTensor<int32_t, PostShape, PostStride, pto::Layout::ND>;
+using PostScratchTile = pto::Tile<pto::TileType::Vec, uint8_t, 1, pto::comm::sdma::UB_ALIGN_SIZE>;
+using PostConsumeTile = pto::Tile<pto::TileType::Vec, int32_t, 1, kPostStabilityTileElems>;
+
+AICORE inline void ConsumeTGetPost(
+    __gm__ int32_t* input, __gm__ int32_t* output, uint32_t elemCount = kPostStabilityElemsPerPost)
+{
+    PostShape shape(1, 1, 1, 1, kPostStabilityTileElems);
+    PostStride stride(
+        kPostStabilityTileElems, kPostStabilityTileElems, kPostStabilityTileElems, kPostStabilityTileElems, 1);
+    PostConsumeTile inputTile;
+    PostConsumeTile outputTile;
+    TASSIGN(inputTile, 0x1000);
+    TASSIGN(outputTile, 0x2000);
+    for (uint32_t offset = 0; offset < elemCount; offset += kPostStabilityTileElems) {
+        PostGlobal inputGlobal(input + offset, shape, stride);
+        PostGlobal outputGlobal(output + offset, shape, stride);
+        TLOAD(inputTile, inputGlobal);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        TADDS(outputTile, inputTile, kPostStabilityConsumeAdd);
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        TSTORE(outputGlobal, outputTile);
+        pipe_barrier(PIPE_ALL);
+    }
+}
+
+AICORE inline pto::comm::AsyncEvent PostTGet(
+    __gm__ int32_t* localSend, __gm__ int32_t* localRecv, __gm__ CommDeviceContext* hcclCtx, int targetRank,
+    uint32_t transferIndex, uint32_t elemCount, const pto::comm::AsyncSession& session)
+{
+    PostShape shape(1, 1, 1, 1, elemCount);
+    PostStride stride(elemCount, elemCount, elemCount, elemCount, 1);
+    const size_t offset = static_cast<size_t>(transferIndex) * kPostStabilityElemsPerPost;
+    PostGlobal remoteSendGlobal(CommRemotePtr(hcclCtx, localSend, targetRank) + offset, shape, stride);
+    PostGlobal localRecvGlobal(localRecv + offset, shape, stride);
+    return pto::comm::TGET_ASYNC(localRecvGlobal, remoteSendGlobal, session);
+}
+
+AICORE inline void RecordTGetPost(
+    pto::comm::AsyncEvent& event, const pto::comm::AsyncSession& session, __gm__ int32_t* localRecv,
+    __gm__ int32_t* consumeOutput, __gm__ uint32_t* postStatus, uint32_t transferIndex)
+{
+    uint32_t status = 0;
+    if (event.valid()) {
+        status |= kPostStatusEventValid;
+        if (event.Wait(session)) {
+            status |= kPostStatusWaitPassed;
+            dcci(static_cast<__gm__ void*>(0), ENTIRE_DATA_CACHE);
+            dsb(DSB_DDR);
+            const size_t offset = static_cast<size_t>(transferIndex) * kPostStabilityElemsPerPost;
+            ConsumeTGetPost(localRecv + offset, consumeOutput + offset);
+            status |= kPostStatusConsumed;
+        }
+    }
+    postStatus[transferIndex] = status;
+}
+
+AICORE inline bool BuildTGetPostSession(
+    PostScratchTile& scratchTile, __gm__ uint8_t* sdmaWorkspace, pto::comm::AsyncSession& session, uint32_t queueNum)
+{
+    const uint64_t bytesPerPost = static_cast<uint64_t>(kPostStabilityElemsPerPost) * sizeof(int32_t);
+    pto::comm::sdma::SdmaBaseConfig config{bytesPerPost / queueNum, 0, queueNum};
+    return pto::comm::BuildAsyncSession(scratchTile, sdmaWorkspace, session, 0, config);
+}
+
+__global__ AICORE void TGetImmediatePostWaitKernel(
+    __gm__ int32_t* localSend, __gm__ int32_t* localRecv, __gm__ int32_t* consumeOutput, __gm__ uint32_t* postStatus,
+    __gm__ CommDeviceContext* hcclCtx, __gm__ uint8_t* sdmaWorkspace, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    if (static_cast<int>(hcclCtx->rankId) != kPostStabilityRootRank) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    PostScratchTile scratchTile;
+    TASSIGN(scratchTile, 0x0);
+    pto::comm::AsyncSession session;
+    if (!BuildTGetPostSession(scratchTile, sdmaWorkspace, session, queueNum)) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    const uint32_t postsPerPeer = postCount * rounds;
+    for (uint32_t sequence = 0; sequence < postsPerPeer; ++sequence) {
+        for (int targetRank = 1; targetRank < static_cast<int>(hcclCtx->rankNum); ++targetRank) {
+            const uint32_t transferIndex = static_cast<uint32_t>(targetRank - 1) * postsPerPeer + sequence;
+            pto::comm::AsyncEvent event =
+                PostTGet(localSend, localRecv, hcclCtx, targetRank, transferIndex, kPostStabilityElemsPerPost, session);
+            RecordTGetPost(event, session, localRecv, consumeOutput, postStatus, transferIndex);
+        }
+    }
+    pipe_barrier(PIPE_ALL);
+}
+
+__global__ AICORE void TGetConsecutivePostsWaitEachKernel(
+    __gm__ int32_t* localSend, __gm__ int32_t* localRecv, __gm__ int32_t* consumeOutput, __gm__ uint32_t* postStatus,
+    __gm__ CommDeviceContext* hcclCtx, __gm__ uint8_t* sdmaWorkspace, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    if (static_cast<int>(hcclCtx->rankId) != kPostStabilityRootRank) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    PostScratchTile scratchTile;
+    TASSIGN(scratchTile, 0x0);
+    pto::comm::AsyncSession session;
+    if (!BuildTGetPostSession(scratchTile, sdmaWorkspace, session, queueNum)) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    const uint32_t postsPerPeer = postCount * rounds;
+    pto::comm::AsyncEvent events[kPostStabilityMaxDeferredEvents];
+    for (int targetRank = 1; targetRank < static_cast<int>(hcclCtx->rankNum); ++targetRank) {
+        for (uint32_t sequence = 0; sequence < postCount; ++sequence) {
+            const uint32_t transferIndex = static_cast<uint32_t>(targetRank - 1) * postsPerPeer + sequence;
+            events[transferIndex] =
+                PostTGet(localSend, localRecv, hcclCtx, targetRank, transferIndex, kPostStabilityElemsPerPost, session);
+        }
+    }
+    for (uint32_t sequence = 0; sequence < postCount; ++sequence) {
+        for (int targetRank = 1; targetRank < static_cast<int>(hcclCtx->rankNum); ++targetRank) {
+            const uint32_t transferIndex = static_cast<uint32_t>(targetRank - 1) * postsPerPeer + sequence;
+            RecordTGetPost(events[transferIndex], session, localRecv, consumeOutput, postStatus, transferIndex);
+        }
+    }
+    pipe_barrier(PIPE_ALL);
+}
+
+__global__ AICORE void TGetPostsWaitFinalKernel(
+    __gm__ int32_t* localSend, __gm__ int32_t* localRecv, __gm__ int32_t* consumeOutput, __gm__ uint32_t* postStatus,
+    __gm__ CommDeviceContext* hcclCtx, __gm__ uint8_t* sdmaWorkspace, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    if (static_cast<int>(hcclCtx->rankId) != kPostStabilityRootRank) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    PostScratchTile scratchTile;
+    TASSIGN(scratchTile, 0x0);
+    pto::comm::AsyncSession session;
+    if (!BuildTGetPostSession(scratchTile, sdmaWorkspace, session, queueNum)) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+    constexpr uint32_t kFirstTransferIndex = 0U;
+    constexpr uint32_t kFinalTransferIndex = 1U;
+    constexpr uint32_t kFinalTransferElems = kPostStabilityElemsPerPost / 4U;
+    pto::comm::AsyncEvent firstEvent =
+        PostTGet(localSend, localRecv, hcclCtx, 1, kFirstTransferIndex, kPostStabilityElemsPerPost, session);
+    pto::comm::AsyncEvent finalEvent =
+        PostTGet(localSend, localRecv, hcclCtx, 1, kFinalTransferIndex, kFinalTransferElems, session);
+    uint32_t status = 0;
+    if (firstEvent.valid() && finalEvent.valid()) {
+        status |= kPostStatusEventValid;
+        if (finalEvent.Wait(session)) {
+            status |= kPostStatusWaitPassed;
+            ConsumeTGetPost(
+                localRecv + kFirstTransferIndex * kPostStabilityElemsPerPost,
+                consumeOutput + kFirstTransferIndex * kPostStabilityElemsPerPost);
+            ConsumeTGetPost(
+                localRecv + kFinalTransferIndex * kPostStabilityElemsPerPost,
+                consumeOutput + kFinalTransferIndex * kPostStabilityElemsPerPost, kFinalTransferElems);
+            status |= kPostStatusConsumed;
+        }
+    }
+    postStatus[kFirstTransferIndex] = status;
+    postStatus[kFinalTransferIndex] = status;
+    pipe_barrier(PIPE_ALL);
+}
+
+struct TGetPostLayout {
+    uint32_t postsPerPeer;
+    uint32_t totalTransfers;
+    size_t totalElems;
+    size_t dataBytes;
+    size_t statusBytes;
+};
+
+struct TGetPostDevice {
+    int32_t* send{nullptr};
+    int32_t* recv{nullptr};
+    int32_t* consumed{nullptr};
+    uint32_t* status{nullptr};
+    SdmaWorkspaceManager sdmaManager;
+    bool sdmaInitialized{false};
+};
+
+using TGetPostLauncher = void (*)(
+    int32_t*, int32_t*, int32_t*, uint32_t*, CommDeviceContext*, uint8_t*, uint32_t, uint32_t, uint32_t, aclrtStream);
+
+void LaunchTGetImmediate(
+    int32_t* send, int32_t* recv, int32_t* consumed, uint32_t* status, CommDeviceContext* context, uint8_t* workspace,
+    uint32_t postCount, uint32_t rounds, uint32_t queueNum, aclrtStream stream)
+{
+    TGetImmediatePostWaitKernel<<<1, nullptr, stream>>>(
+        send, recv, consumed, status, context, workspace, postCount, rounds, queueNum);
+}
+
+void LaunchTGetConsecutive(
+    int32_t* send, int32_t* recv, int32_t* consumed, uint32_t* status, CommDeviceContext* context, uint8_t* workspace,
+    uint32_t postCount, uint32_t rounds, uint32_t queueNum, aclrtStream stream)
+{
+    TGetConsecutivePostsWaitEachKernel<<<1, nullptr, stream>>>(
+        send, recv, consumed, status, context, workspace, postCount, rounds, queueNum);
+}
+
+void LaunchTGetFinal(
+    int32_t* send, int32_t* recv, int32_t* consumed, uint32_t* status, CommDeviceContext* context, uint8_t* workspace,
+    uint32_t postCount, uint32_t rounds, uint32_t queueNum, aclrtStream stream)
+{
+    TGetPostsWaitFinalKernel<<<1, nullptr, stream>>>(
+        send, recv, consumed, status, context, workspace, postCount, rounds, queueNum);
+}
+
+bool AllTGetRanksReady(bool localReady, int nRanks)
+{
+    bool allReady = true;
+    const int mpiRank = CommMpiRank();
+    for (int root = 0; root < nRanks; ++root) {
+        uint8_t ready = mpiRank == root && localReady ? 1 : 0;
+        CommMpiBcast(&ready, sizeof(ready), COMM_MPI_CHAR, root);
+        allReady = allReady && ready != 0;
+    }
+    CommMpiBarrier();
+    return allReady;
+}
+
+int32_t TGetSourceValue(int rank, size_t index)
+{
+    return static_cast<int32_t>(rank * 1000000 + index + kPostStabilitySourceBias);
+}
+
+bool ValidateTGetPostStatus(const TGetPostLayout& layout, const std::vector<uint32_t>& status)
+{
+    for (uint32_t transferIndex = 0; transferIndex < layout.totalTransfers; ++transferIndex) {
+        if (status[transferIndex] != kExpectedPostStatus) {
+            std::cerr << "[FAIL] TGET_ASYNC transfer=" << transferIndex << " status=0x" << std::hex
+                      << status[transferIndex] << std::dec << " expected=0x" << std::hex << kExpectedPostStatus
+                      << std::dec << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateTGetPostData(
+    const TGetPostLayout& layout, const std::vector<int32_t>& recv, const std::vector<int32_t>& consumed,
+    bool finalWait)
+{
+    size_t mismatchCount = 0;
+    for (size_t index = 0; index < layout.totalElems; ++index) {
+        const bool checkTransferred =
+            !finalWait || index < kPostStabilityElemsPerPost + kPostStabilityElemsPerPost / 4U;
+        if (checkTransferred) {
+            const uint32_t transferIndex = static_cast<uint32_t>(index / kPostStabilityElemsPerPost);
+            const int sourceRank = static_cast<int>(transferIndex / layout.postsPerPeer + 1);
+            const int32_t expected = TGetSourceValue(sourceRank, index);
+            if (recv[index] != expected || consumed[index] != expected + kPostStabilityConsumeAdd) {
+                ++mismatchCount;
+            }
+        } else if (recv[index] != kPostStabilityRecvPoison || consumed[index] != kPostStabilityConsumePoison) {
+            ++mismatchCount;
+        }
+    }
+    if (mismatchCount != 0) {
+        std::cerr << "[FAIL] TGET_ASYNC mismatches=" << mismatchCount << "/" << layout.totalElems << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool ReadAndValidateTGetPostResults(
+    TestContext& ctx, const TGetPostLayout& layout, const TGetPostDevice& device, std::vector<uint32_t>& status,
+    std::vector<int32_t>& recv, std::vector<int32_t>& consumed, bool finalWait, const char* strategyName,
+    uint32_t queueNum)
+{
+    ctx.aclStatus |=
+        aclrtMemcpy(status.data(), layout.statusBytes, device.status, layout.statusBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    ctx.aclStatus |=
+        aclrtMemcpy(recv.data(), layout.dataBytes, device.recv, layout.dataBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    ctx.aclStatus |=
+        aclrtMemcpy(consumed.data(), layout.dataBytes, device.consumed, layout.dataBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    const bool isOk = ctx.aclStatus == ACL_SUCCESS && ValidateTGetPostStatus(layout, status) &&
+                      ValidateTGetPostData(layout, recv, consumed, finalWait);
+    if (isOk) {
+        std::cout << "[PASS] TGET_ASYNC strategy=" << strategyName << " transfers=" << layout.totalTransfers
+                  << " posts_per_peer=" << layout.postsPerPeer << " queue_num=" << queueNum << std::endl;
+    }
+    return isOk;
+}
+
+bool RunTGetPostStabilityRank(
+    int rankId, int nRanks, int nDevices, int firstDeviceId, const HcclRootInfo* rootInfo, uint32_t postCount,
+    uint32_t rounds, uint32_t queueNum, const char* strategyName, TGetPostLauncher launcher, bool finalWait)
+{
+    TestContext ctx;
+    if (!ctx.Init(rankId, nRanks, nDevices, firstDeviceId, rootInfo)) {
+        return false;
+    }
+    TGetPostLayout layout{
+        postCount * rounds, (postCount * rounds) * static_cast<uint32_t>(nRanks - 1),
+        static_cast<size_t>((postCount * rounds) * static_cast<uint32_t>(nRanks - 1)) * kPostStabilityElemsPerPost, 0,
+        0};
+    layout.dataBytes = layout.totalElems * sizeof(int32_t);
+    layout.statusBytes = static_cast<size_t>(layout.totalTransfers) * sizeof(uint32_t);
+    std::vector<int32_t> source(layout.totalElems);
+    std::vector<int32_t> recv(layout.totalElems, kPostStabilityRecvPoison);
+    std::vector<int32_t> consumed(layout.totalElems, kPostStabilityConsumePoison);
+    std::vector<uint32_t> status(layout.totalTransfers, 0);
+    for (size_t index = 0; index < layout.totalElems; ++index) {
+        source[index] = TGetSourceValue(rankId, index);
+    }
+
+    TGetPostDevice device;
+    const size_t requiredWindowBytes = kPostStabilityWindowPrefix + 2 * layout.dataBytes;
+    bool setupOk = requiredWindowBytes <= ctx.hostCtx.winSize;
+    if (setupOk) {
+        size_t winOffset = 0;
+        const uint64_t localWinBase = ctx.hostCtx.windowsIn[rankId];
+        WindowAlloc(localWinBase, winOffset, kPostStabilityWindowPrefix);
+        device.send = static_cast<int32_t*>(WindowAlloc(localWinBase, winOffset, layout.dataBytes));
+        device.recv = static_cast<int32_t*>(WindowAlloc(localWinBase, winOffset, layout.dataBytes));
+        setupOk =
+            aclrtMalloc(reinterpret_cast<void**>(&device.consumed), layout.dataBytes, ACL_MEM_MALLOC_HUGE_FIRST) ==
+                ACL_SUCCESS &&
+            aclrtMalloc(reinterpret_cast<void**>(&device.status), layout.statusBytes, ACL_MEM_MALLOC_HUGE_FIRST) ==
+                ACL_SUCCESS;
+    }
+    if (setupOk) {
+        setupOk =
+            aclrtMemcpy(device.send, layout.dataBytes, source.data(), layout.dataBytes, ACL_MEMCPY_HOST_TO_DEVICE) ==
+                ACL_SUCCESS &&
+            aclrtMemcpy(device.recv, layout.dataBytes, recv.data(), layout.dataBytes, ACL_MEMCPY_HOST_TO_DEVICE) ==
+                ACL_SUCCESS &&
+            aclrtMemcpy(
+                device.consumed, layout.dataBytes, consumed.data(), layout.dataBytes, ACL_MEMCPY_HOST_TO_DEVICE) ==
+                ACL_SUCCESS &&
+            aclrtMemset(device.status, layout.statusBytes, 0, layout.statusBytes) == ACL_SUCCESS;
+    }
+    if (setupOk) {
+        device.sdmaInitialized = device.sdmaManager.Init();
+        setupOk = device.sdmaInitialized;
+    }
+    if (!AllTGetRanksReady(setupOk, nRanks)) {
+        if (device.consumed != nullptr) {
+            (void)aclrtFree(device.consumed);
+        }
+        if (device.status != nullptr) {
+            (void)aclrtFree(device.status);
+        }
+        if (device.sdmaInitialized) {
+            device.sdmaManager.Finalize();
+        }
+        (void)ctx.Finalize();
+        return false;
+    }
+
+    HcclHostBarrier(ctx.comm, ctx.stream);
+    launcher(
+        device.send, device.recv, device.consumed, device.status, ctx.deviceCtx,
+        static_cast<uint8_t*>(device.sdmaManager.GetWorkspaceAddr()), postCount, rounds, queueNum, ctx.stream);
+    ctx.aclStatus |= aclrtSynchronizeStream(ctx.stream);
+    HcclHostBarrier(ctx.comm, ctx.stream);
+
+    bool isOk = ctx.aclStatus == ACL_SUCCESS;
+    if (rankId == kPostStabilityRootRank) {
+        const bool resultOk = ReadAndValidateTGetPostResults(
+            ctx, layout, device, status, recv, consumed, finalWait, strategyName, queueNum);
+        isOk = isOk && resultOk;
+    }
+    ctx.aclStatus |= aclrtFree(device.consumed);
+    ctx.aclStatus |= aclrtFree(device.status);
+    device.sdmaManager.Finalize();
+    return ctx.Finalize() && isOk && ctx.aclStatus == ACL_SUCCESS;
+}
+
+bool ValidateTGetPostArguments(
+    int nRanks, uint32_t postCount, uint32_t rounds, uint32_t queueNum, bool consecutive, bool finalWait)
+{
+    if (nRanks < 2 || nRanks > 3 || postCount == 0 || rounds == 0 || postCount > UINT32_MAX / rounds || queueNum == 0 ||
+        kPostStabilityElemsPerPost % queueNum != 0) {
+        return false;
+    }
+    const uint32_t postsPerPeer = postCount * rounds;
+    if (postsPerPeer > UINT32_MAX / static_cast<uint32_t>(nRanks - 1)) {
+        return false;
+    }
+    if (consecutive &&
+        (rounds != 1 || postCount > kPostStabilityMaxDeferredEvents / static_cast<uint32_t>(nRanks - 1))) {
+        return false;
+    }
+    return !finalWait || (nRanks == 2 && postCount == 2 && rounds == 1 && queueNum == 4);
+}
+
+bool RunTGetPostStability(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum, const char* strategyName, TGetPostLauncher launcher, bool finalWait)
+{
+    return ForkAndRunWithHcclRootInfo(
+        nRanks, firstRankId, firstDeviceId, [&](int rankId, const HcclRootInfo* rootInfo) {
+            return RunTGetPostStabilityRank(
+                rankId, nRanks, nDevices, firstDeviceId, rootInfo, postCount, rounds, queueNum, strategyName, launcher,
+                finalWait);
+        });
+}
+
+} // namespace
+
+bool IsTGetAsyncPostStabilityDeviceRangeAvailable(int nRanks, int firstDeviceId)
+{
+    return nRanks > 0 && firstDeviceId >= 0 && GetAvailableDeviceCount() >= nRanks + firstDeviceId;
+}
+
+bool RunTGetAsyncImmediatePostWait(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    return ValidateTGetPostArguments(nRanks, postCount, rounds, queueNum, false, false) &&
+           RunTGetPostStability(
+               nRanks, nDevices, firstRankId, firstDeviceId, postCount, rounds, queueNum, "immediate",
+               LaunchTGetImmediate, false);
+}
+
+bool RunTGetAsyncConsecutivePostsWaitEach(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    return ValidateTGetPostArguments(nRanks, postCount, rounds, queueNum, true, false) &&
+           RunTGetPostStability(
+               nRanks, nDevices, firstRankId, firstDeviceId, postCount, rounds, queueNum, "consecutive_wait_each",
+               LaunchTGetConsecutive, false);
+}
+
+bool RunTGetAsyncPostsWaitFinal(
+    int nRanks, int nDevices, int firstRankId, int firstDeviceId, uint32_t postCount, uint32_t rounds,
+    uint32_t queueNum)
+{
+    return ValidateTGetPostArguments(nRanks, postCount, rounds, queueNum, false, true) &&
+           RunTGetPostStability(
+               nRanks, nDevices, firstRankId, firstDeviceId, postCount, rounds, queueNum, "wait_final", LaunchTGetFinal,
+               true);
+}

@@ -8,6 +8,8 @@
 
 带缩放Tile的GEMV变体，支持混合精度/量化矩阵向量计算。
 
+此指令当前仅在 A5 上实现（见 `include/pto/npu/a5/TMatmul.hpp`）。
+
 ## 数学语义
 
 概念上（基础GEMV路径）：
@@ -76,6 +78,7 @@ PTO_INST RecordEvent TGEMV_MX(TileRes &cMatrix, TileLeft &aMatrix, TileLeftScale
 - 使用后端特定的mx合法性检查，用于数据类型、tile位置、分形/布局组合以及缩放格式。
 - 缩放tile兼容性和累加器提升由目标后端的实现定义。
 - 为了可移植性，请根据目标实现约束验证确切的 `(A, B, scaleA, scaleB, C)` 类型元组和tile布局。
+- 在Ascend 950PR/Ascend 950DT上，支持的 `(C, A, B)` 三元组（`C` 始终为 `float`；缩放tile为 `float8_e8m0_t`）：FP8 `(float, float8_e4m3_t, float8_e4m3_t)`、`(float, float8_e4m3_t, float8_e5m2_t)`、`(float, float8_e5m2_t, float8_e4m3_t)`、`(float, float8_e5m2_t, float8_e5m2_t)`；FP4 `(float, float4_e1m2x2_t, float4_e1m2x2_t)`、`(float, float4_e1m2x2_t, float4_e2m1x2_t)`、`(float, float4_e2m1x2_t, float4_e2m1x2_t)`、`(float, float4_e2m1x2_t, float4_e1m2x2_t)`。
 
 ## 示例
 

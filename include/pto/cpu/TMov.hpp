@@ -21,15 +21,19 @@ template <typename DstTileData, typename SrcTileData, STPhase Phase = STPhase::U
 PTO_INTERNAL void TMOV_IMPL(DstTileData& dst, SrcTileData& src)
 {
     (void)Phase;
-    assert(src.GetValidRow() == dst.GetValidRow() && src.GetValidRow() == dst.GetValidRow());
-    for (size_t c = 0; c < src.GetValidCol(); c++) {
-        size_t subTileSrcC = c / SrcTileData::InnerCols;
-        size_t innerSrcC = c % SrcTileData::InnerCols;
-        size_t subTileDstC = c / DstTileData::InnerCols;
-        size_t innerDstC = c % DstTileData::InnerCols;
+    if constexpr (is_conv_tile_v<SrcTileData>) {
+        TEXTRACT(dst, src, 0, 0);
+    } else {
+        assert(src.GetValidRow() == dst.GetValidRow() && src.GetValidRow() == dst.GetValidRow());
+        for (size_t c = 0; c < src.GetValidCol(); c++) {
+            size_t subTileSrcC = c / SrcTileData::InnerCols;
+            size_t innerSrcC = c % SrcTileData::InnerCols;
+            size_t subTileDstC = c / DstTileData::InnerCols;
+            size_t innerDstC = c % DstTileData::InnerCols;
 
-        for (size_t r = 0; r < src.GetValidRow(); r++) {
-            dst.SetElement(r, c, src.GetElement(r, c));
+            for (size_t r = 0; r < src.GetValidRow(); r++) {
+                dst.SetElement(r, c, src.GetElement(r, c));
+            }
         }
     }
 }

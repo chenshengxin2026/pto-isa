@@ -26,20 +26,26 @@ PTO_INTERNAL void Copy_Data(GlobalDstData& dstTensor, GlobalSrcData& srcTensor)
     int64_t shape[] = {
         dstTensor.GetShape(0), dstTensor.GetShape(1), dstTensor.GetShape(2), dstTensor.GetShape(3),
         dstTensor.GetShape(4)};
-    int64_t stride[] = {
+    int64_t dstStride[] = {
         dstTensor.GetStride(0), dstTensor.GetStride(1), dstTensor.GetStride(2), dstTensor.GetStride(3),
         dstTensor.GetStride(4)};
+    int64_t srcStride[] = {
+        srcTensor.GetStride(0), srcTensor.GetStride(1), srcTensor.GetStride(2), srcTensor.GetStride(3),
+        srcTensor.GetStride(4)};
 
     for (size_t i = 0; i < shape[0]; i++) {
         for (size_t j = 0; j < shape[1]; j++) {
             for (size_t k = 0; k < shape[2]; k++) {
                 for (size_t l = 0; l < shape[3]; l++) {
                     for (size_t m = 0; m < shape[4]; m++) {
-                        int index = i * stride[0] + j * stride[1] + k * stride[2] + l * stride[3] + m * stride[4];
+                        const int64_t dstIndex = i * dstStride[0] + j * dstStride[1] + k * dstStride[2] +
+                                                 l * dstStride[3] + m * dstStride[4];
+                        const int64_t srcIndex = i * srcStride[0] + j * srcStride[1] + k * srcStride[2] +
+                                                 l * srcStride[3] + m * srcStride[4];
                         if constexpr (atomicType == AtomicType::AtomicNone) {
-                            dst[index] = src[index];
+                            dst[dstIndex] = src[srcIndex];
                         } else {
-                            dst[index] += src[index];
+                            dst[dstIndex] += src[srcIndex];
                         }
                     }
                 }

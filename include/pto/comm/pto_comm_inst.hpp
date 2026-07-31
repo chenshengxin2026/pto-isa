@@ -11,6 +11,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef PTO_COMM_INST_HPP
 #define PTO_COMM_INST_HPP
 
+#include "pto/common/arch_macro.hpp"
 #include "pto/comm/comm_types.hpp"
 #include "pto/comm/async_common/async_types.hpp"
 #include "pto/comm/pto_comm_instr_impl.hpp"
@@ -347,6 +348,23 @@ PTO_INST AsyncEvent TPUT_ASYNC(
     return ::pto::comm::TPUT_ASYNC_IMPL<engine>(dstGlobalData, srcGlobalData, session);
 }
 
+#ifdef PTO_NPU_ARCH_A5
+/**
+ * @brief Asynchronous remote write with explicit peer (A5 only).
+ *
+ * For URMA: @p peer selects SQ/CQ/MR in UrmaInfo (session need not bind peer).
+ * For SDMA: @p peer is ignored; addressing comes from the GlobalTensor VA.
+ */
+template <DmaEngine engine = DmaEngine::SDMA, typename GlobalDstData, typename GlobalSrcData, typename... WaitEvents>
+PTO_INST AsyncEvent TPUT_ASYNC(
+    GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer,
+    WaitEvents&... events)
+{
+    WaitAllEvents(events...);
+    return ::pto::comm::TPUT_ASYNC_IMPL<engine>(dstGlobalData, srcGlobalData, session, peer);
+}
+#endif
+
 // ============================================================================
 // TGET_ASYNC: Asynchronous remote read (GM-to-GM via DMA engine).
 // Build once with comm::BuildAsyncSession<engine>(), then pass to all calls.
@@ -359,6 +377,23 @@ PTO_INST AsyncEvent TGET_ASYNC(
     WaitAllEvents(events...);
     return ::pto::comm::TGET_ASYNC_IMPL<engine>(dstGlobalData, srcGlobalData, session);
 }
+
+#ifdef PTO_NPU_ARCH_A5
+/**
+ * @brief Asynchronous remote read with explicit peer (A5 only).
+ *
+ * For URMA: @p peer selects SQ/CQ/MR in UrmaInfo (session need not bind peer).
+ * For SDMA: @p peer is ignored; addressing comes from the GlobalTensor VA.
+ */
+template <DmaEngine engine = DmaEngine::SDMA, typename GlobalDstData, typename GlobalSrcData, typename... WaitEvents>
+PTO_INST AsyncEvent TGET_ASYNC(
+    GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer,
+    WaitEvents&... events)
+{
+    WaitAllEvents(events...);
+    return ::pto::comm::TGET_ASYNC_IMPL<engine>(dstGlobalData, srcGlobalData, session, peer);
+}
+#endif
 
 } // namespace comm
 } // namespace pto

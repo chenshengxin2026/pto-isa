@@ -133,6 +133,29 @@ PTO_INTERNAL void TStoreAccNz2nz(
     if constexpr (CompactMode::Normal == TileData::Compact) {
         srcStride = (FRACTAL_NZ_ROW + validRow - 1) / FRACTAL_NZ_ROW * FRACTAL_NZ_ROW;
     }
+    uint32_t dstStride = gShape2 * gShape3 * c0Size >> SHIFT_BLOCK_BYTE;
+
+    constexpr uint8_t unitFlagCtrl = static_cast<uint8_t>(Phase);
+    uint8_t channelSplitEn = 0;
+    if (std::is_same_v<typename TileData::DType, float> && std::is_same_v<typename GlobalData::DType, __gm__ float>) {
+        if (gShape4 == 8) {
+            channelSplitEn = 1;
+        }
+    }
+
+    uint64_t xmReg =
+
+        (static_cast<uint64_t>(nSize & 0xfff) << 4) |          // Xm[15:4] nSize
+        (static_cast<uint64_t>(mSize & 0xffff) << 16) |        // Xm[31:16] mSize
+        (static_cast<uint64_t>(dstStride & 0xffffffff) << 32); // Xm[63:32] destination stride between the start addr
+
+    uint64_t xtReg = srcStride | // Xt[15:0] the source stride between the start addr
+                     (static_cast<uint64_t>(unitFlagCtrl & 0x3) << 32) |      // Xt[33:32] unit flag control bit
+                     (static_cast<uint64_t>(quantizationMode & 0x1f) << 34) | // Xt[38:34] pre-stage quantization mode
+                     ((static_cast<uint64_t>(reluPreMode) & 0x7) << 39) |     //  Xt[41:39] relu pre mode
+                     (static_cast<uint64_t>(channelSplitEn & 0x1) << 42);     // Xt[42] channel split control bit
+
+    copy_matrix_cc_to_gm(dstAddr, srcAddr, xmReg, xtReg);
 }
 
 #include "pto/common/arch/memory/tstore_common.hpp"
@@ -162,36 +185,6 @@ __tf__ AICORE void TStoreAcc(
     } else if constexpr (GlobalData::layout == Layout::NDC1HWC0) {
         TStoreAccNz2NDC1HWC0<GlobalData, TileData, quantizationMode, reluPreMode, Phase>(
             dstAddr, srcAddr, gShape0, gShape1, gShape2, gShape3, gShape4, gStride2, gStride4, validRow, validCol);
-    }
-}
-
-template <typename GlobalData, typename TileData, typename FpTileData,
-          QuantMode_t quantizationMode = QuantMode_t::NoQuant, ReluPreMode reluPreMode = ReluPreMode::NoRelu>
-__tf__ AICORE void TStoreAccFp(typename GlobalData::DType __out__ *dst, typename TileData::TileDType __in__ src,
-                               typename FpTileData::TileDType __in__ fp, int gShape0, int gShape1, int gShape2,
-                               int gShape3, int gShape4, int gStride0, int gStride1, int gStride2, int gStride3,
-                               int gStride4, int validRow, int validCol)
-{
-    __fbuf__ typename FpTileData::DType *fpDstAddr = (__fbuf__ typename FpTileData::DType *)__cce_get_tile_ptr(fp);
-    uint64_t deqTensorAddr = ((uint64_t)fpDstAddr >> static_cast<uint64_t>(7)) << 8;
-    set_fpc(deqTensorAddr);
-    pipe_barrier(PIPE_FIX);
-    if constexpr (GlobalData::layout == Layout::ND) {
-        TStoreAccNz2nd<GlobalData, TileData, quantizationMode, reluPreMode>(
-            dst, __cce_get_tile_ptr(src), gShape0, gShape1, gShape2, gShape3, gShape4, gStride0, gStride1, gStride2,
-            gStride3, gStride4, validRow, validCol);
-    } else if constexpr (GlobalData::layout == Layout::NZ) {
-        TStoreAccNz2nz<GlobalData, TileData, quantizationMode, reluPreMode>(
-            dst, __cce_get_tile_ptr(src), gShape0, gShape1, gShape2, gShape3, gShape4, gStride0, gStride1, gStride2,
-            gStride3, gStride4, validRow, validCol);
-    } else if constexpr (GlobalData::layout == Layout::NC1HWC0) {
-        TStoreAccNz2NC1HWC0<GlobalData, TileData, quantizationMode, reluPreMode>(
-            dst, __cce_get_tile_ptr(src), gShape0, gShape1, gShape2, gShape3, gShape4, gStride1, gStride3, validRow,
-            validCol);
-    } else if constexpr (GlobalData::layout == Layout::NDC1HWC0) {
-        TStoreAccNz2NDC1HWC0<GlobalData, TileData, quantizationMode, reluPreMode>(
-            dst, __cce_get_tile_ptr(src), gShape0, gShape1, gShape2, gShape3, gShape4, gStride2, gStride4, validRow,
-            validCol);
     }
 }
 

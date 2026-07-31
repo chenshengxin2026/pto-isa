@@ -42,6 +42,10 @@ if __name__ == "__main__":
         "TPushPopCVTest.case6_half_split_m_left_right",
         "TPushPopCVTest.case7_float_single_tile_left_right",
         "TPushPopCVTest.case8_half_multi_tile_wrapping_left_right",
+        # Partial-valid TILE_UP_DOWN (key 13): M=5 tile=16, N=128, float32
+        "TPushPopCVTest.case13_float_partial_valid_up_down",
+        # Partial-valid TILE_LEFT_RIGHT_ODD (key 14): M=5, N=127 tileN=128, float32
+        "TPushPopCVTest.case14_float_partial_valid_left_right",
     ]
 
     case_params_list = [
@@ -53,6 +57,8 @@ if __name__ == "__main__":
         (32, 32, 32, np.float16, np.float32),
         (16, 32, 32, np.float32, np.float32),
         (64, 32, 32, np.float16, np.float32),
+        (5, 32, 128, np.float32, np.float32),
+        (5, 32, 127, np.float32, np.float32),
     ]
 
     for i, case_name in enumerate(case_name_list):

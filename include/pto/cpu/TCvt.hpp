@@ -13,9 +13,12 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include <pto/common/constants.hpp>
 #include <pto/common/pto_tile.hpp>
+#include <pto/common/type.hpp>
 #include "pto/cpu/tile_offsets.hpp"
+#include "pto/cpu/MXTypes.hpp"
 #include "pto/common/debug.h"
 #include <cmath>
+#include <cstdint>
 #include <type_traits>
 
 namespace pto {
@@ -45,8 +48,20 @@ inline void PrintFloatBits(float val, const char* name)
 }
 
 template <typename T>
+constexpr bool is_fp4_v = std::is_same_v<T, float4_e2m1x2_t> || std::is_same_v<T, float4_e1m2x2_t>;
+
+template <typename T>
+constexpr bool is_int4_v = std::is_same_v<T, int4b_t>;
+
+template <typename T>
 constexpr bool is_float_like_v = std::is_floating_point_v<T> || std::is_same_v<T, half> ||
                                  std::is_same_v<T, aclFloat16> || std::is_same_v<T, bfloat16_t>;
+
+template <typename T>
+inline T clamp_value(T val, T min_val, T max_val)
+{
+    return std::max(min_val, std::min(max_val, val));
+}
 
 inline double applyRoundingToIntegral(double v, RoundMode mode)
 {
@@ -102,31 +117,98 @@ struct SafeLimits {
     }
 };
 
+template <>
+struct SafeLimits<int4b_t> {
+    static constexpr double lowest() { return -8.0; }
+    static constexpr double max() { return 7.0; }
+};
+
+template <>
+struct SafeLimits<float4_e2m1x2_t> {
+    static constexpr double lowest() { return -6.0; }
+    static constexpr double max() { return 6.0; }
+};
+
+template <>
+struct SafeLimits<float4_e1m2x2_t> {
+    static constexpr double lowest() { return -4.0; }
+    static constexpr double max() { return 3.5; }
+};
+
+template <typename T>
+inline double to_double_value(T val)
+{
+    if constexpr (std::is_same_v<T, int4b_t>) {
+        return static_cast<double>(static_cast<int8_t>(val));
+    } else {
+        return static_cast<double>(val);
+    }
+}
+
+template <typename T>
+inline T from_double_value(double val)
+{
+    if constexpr (std::is_same_v<T, int4b_t>) {
+        int8_t ival = static_cast<int8_t>(clamp_value(val, -8.0, 7.0));
+        return int4b_t(ival);
+    } else {
+        return static_cast<T>(val);
+    }
+}
+
+template <typename D, typename S>
+inline D convert_value(S val, RoundMode mode)
+{
+    if constexpr (is_fp4_v<S> && is_fp4_v<D>) {
+        return D::FromRaw(val.RawData());
+    } else if constexpr (std::is_same_v<S, int4b_t>) {
+        int8_t ival = static_cast<int8_t>(val);
+        if constexpr (std::is_integral_v<D> && !std::is_same_v<D, int4b_t>)
+            return static_cast<D>(ival);
+        else
+            return static_cast<D>(static_cast<double>(ival));
+    } else if constexpr (std::is_same_v<D, int4b_t>) {
+        volatile double dval = static_cast<double>(val);
+        if constexpr (is_float_like_v<S>)
+            dval = applyRoundingToIntegral(dval, mode);
+        dval = clamp_value(dval, -8.0, 7.0);
+        return int4b_t(static_cast<int8_t>(dval));
+    } else if constexpr (
+        (is_fp4_v<S> && is_float_like_v<D>) || (is_float_like_v<S> && is_fp4_v<D>) ||
+        (is_float_like_v<S> && std::is_integral_v<D>)) {
+        const volatile double dval = applyRoundingToIntegral(static_cast<double>(val), mode);
+        if constexpr (std::is_same_v<D, uint8_t>) {
+            return static_cast<D>(static_cast<int64_t>(dval));
+        }
+        return static_cast<D>(dval);
+    } else if constexpr (std::is_integral_v<S> && is_float_like_v<D>) {
+        return static_cast<D>(static_cast<double>(val));
+    } else {
+        return static_cast<D>(val);
+    }
+}
+
 template <typename TileDataD, typename TileDataS, SaturationMode satMode>
-PTO_INTERNAL void TCvt_Impl(
-    typename TileDataD::TileDType dst, typename TileDataS::TileDType src, unsigned validRow, unsigned validCol,
-    RoundMode mode)
+PTO_INTERNAL void TCvt_Impl(TileDataD& dst, TileDataS& src, unsigned validRow, unsigned validCol, RoundMode mode)
 {
     for (int i = 0; i < validRow; ++i) {
         for (int j = 0; j < validCol; ++j) {
-            size_t dstIdx = GetTileElementOffset<TileDataD>(i, j);
-            size_t srcIdx = GetTileElementOffset<TileDataS>(i, j);
             using D = typename TileDataD::DType;
             using S = typename TileDataS::DType;
 
-            S val = src[srcIdx];
+            S val = src.GetElement(i, j);
             if constexpr (satMode == SaturationMode::ON) {
-                S min_limit = static_cast<S>(std::max(SafeLimits<S>::lowest(), SafeLimits<D>::lowest()));
-                S max_limit = static_cast<S>(std::min(SafeLimits<S>::max(), SafeLimits<D>::max()));
-                val = std::clamp(val, min_limit, max_limit);
+                if constexpr (!is_fp4_v<S>) {
+                    double dval = to_double_value(val);
+                    double min_limit = std::max(SafeLimits<S>::lowest(), SafeLimits<D>::lowest());
+                    double max_limit = std::min(SafeLimits<S>::max(), SafeLimits<D>::max());
+                    dval = clamp_value(dval, min_limit, max_limit);
+                    val = from_double_value<S>(dval);
+                }
             }
 
-            if constexpr (is_float_like_v<S> && std::is_integral_v<D>) {
-                const volatile double dv = static_cast<double>(val);
-                dst[dstIdx] = static_cast<D>(applyRoundingToIntegral(dv, mode));
-            } else {
-                dst[dstIdx] = static_cast<D>(val);
-            }
+            D result = convert_value<D, S>(val, mode);
+            dst.SetElement(i, j, result);
         }
     }
 }
@@ -145,9 +227,9 @@ PTO_INTERNAL void TCVT_IMPL(
     uint16_t rows = src.GetValidRow();
     uint16_t cols = src.GetValidCol();
     if (satMode == SaturationMode::ON) {
-        TCvt_Impl<TileDataD, TileDataS, SaturationMode::ON>(dst.data(), src.data(), rows, cols, mode);
+        TCvt_Impl<TileDataD, TileDataS, SaturationMode::ON>(dst, src, rows, cols, mode);
     } else {
-        TCvt_Impl<TileDataD, TileDataS, SaturationMode::OFF>(dst.data(), src.data(), rows, cols, mode);
+        TCvt_Impl<TileDataD, TileDataS, SaturationMode::OFF>(dst, src, rows, cols, mode);
     }
 }
 

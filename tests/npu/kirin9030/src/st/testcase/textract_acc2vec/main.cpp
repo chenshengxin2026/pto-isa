@@ -74,6 +74,7 @@ void tmov_acc2vec_test(uint32_t M, uint32_t K, uint32_t N)
     aclrtMemcpy(src0Device, aFileSize, src0Host, aFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(src1Device, bFileSize, src1Host, bFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(src2Device, cFileSize, src2Host, cFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtMemcpy(dstDevice, cFileSize, src2Host, cFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     if constexpr (funcKey == 1) {
         LaunchTMOVAcc2VecNZ2ND<key>(dstDevice, src0Device, src1Device, src2Device, stream);
     } else if constexpr (funcKey == 4) {
@@ -98,8 +99,8 @@ void tmov_acc2vec_test(uint32_t M, uint32_t K, uint32_t N)
     aclrtResetDevice(0);
     aclFinalize();
 
-    std::vector<CType> golden(cFileSize);
-    std::vector<CType> devFinal(cFileSize);
+    std::vector<CType> golden(cFileSize / sizeof(CType));
+    std::vector<CType> devFinal(cFileSize / sizeof(CType));
     ReadFile(GetGoldenDir() + "/golden.bin", cFileSize, golden.data(), cFileSize);
     ReadFile(GetGoldenDir() + "/output_z.bin", cFileSize, devFinal.data(), cFileSize);
 
@@ -147,6 +148,7 @@ void tmov_acc2vec_fb_quant_test(uint32_t M, uint32_t K, uint32_t N)
     aclrtMemcpy(src1Device, bFileSize, src1Host, bFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(src2Device, FBQuantFileSize, src2Host, FBQuantFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(src3Device, cFileSize, src3Host, cFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtMemcpy(dstDevice, cFileSize, src3Host, cFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
     if constexpr (funcKey == 1) {
         LaunchTMOVAcc2VecFBQuantNZ2ND<key>(dstDevice, src0Device, src1Device, src2Device, src3Device, stream);
     }
@@ -171,8 +173,8 @@ void tmov_acc2vec_fb_quant_test(uint32_t M, uint32_t K, uint32_t N)
     aclrtResetDevice(0);
     aclFinalize();
 
-    std::vector<CType> golden(cFileSize);
-    std::vector<CType> devFinal(cFileSize);
+    std::vector<CType> golden(cFileSize / sizeof(CType));
+    std::vector<CType> devFinal(cFileSize / sizeof(CType));
     ReadFile(GetGoldenDir() + "/golden.bin", cFileSize, golden.data(), cFileSize);
     ReadFile(GetGoldenDir() + "/output_z.bin", cFileSize, devFinal.data(), cFileSize);
 
@@ -183,7 +185,7 @@ void tmov_acc2vec_fb_quant_test(uint32_t M, uint32_t K, uint32_t N)
 
 TEST_F(TMOVTest, case_nz2nd_1)
 {
-    tmov_acc2vec_test<1, uint32_t, uint16_t, uint16_t, 1, 0, 16, false, 64, 128>(60, 127, 120);
+    tmov_acc2vec_test<1, uint16_t, uint16_t, uint16_t, 1, 0, 16, false, 64, 128>(60, 127, 120);
 }
 
 TEST_F(TMOVTest, case_nz2nd_2)
@@ -191,7 +193,7 @@ TEST_F(TMOVTest, case_nz2nd_2)
     tmov_acc2vec_test<1, uint16_t, uint16_t, uint16_t, 2, 5, 0, false, 120, 96>(110, 100, 80);
 }
 
-TEST_F(TMOVTest, case_nz2nd_3) { tmov_acc2vec_test<1, uint32_t, uint16_t, uint16_t, 3, 2, 0, false, 10, 16>(6, 7, 8); }
+TEST_F(TMOVTest, case_nz2nd_3) { tmov_acc2vec_test<1, uint16_t, uint16_t, uint16_t, 3, 2, 0, false, 10, 16>(6, 7, 8); }
 
 TEST_F(TMOVTest, case_nz2nd_4)
 {
@@ -215,22 +217,22 @@ TEST_F(TMOVTest, case_nz2nd_fb_quant_3)
 
 TEST_F(TMOVTest, case_nz2nd_fb_quant_4)
 {
-    tmov_acc2vec_fb_quant_test<1, int8_t, uint32_t, uint32_t, uint64_t, 4, 7, 32, false, 80, 256>(60, 128, 64);
+    tmov_acc2vec_fb_quant_test<1, int8_t, uint16_t, uint16_t, uint64_t, 4, 7, 32, false, 80, 256>(60, 128, 64);
 }
 
 TEST_F(TMOVTest, case_nz2nd_fb_quant_5)
 {
-    tmov_acc2vec_fb_quant_test<1, uint16_t, uint32_t, uint32_t, uint64_t, 5, 0, 64, false, 40, 256>(31, 128, 128);
+    tmov_acc2vec_fb_quant_test<1, int16_t, uint16_t, uint16_t, uint64_t, 5, 0, 64, false, 40, 256>(31, 128, 128);
 }
 
 TEST_F(TMOVTest, case_nz2nd_sc_quant_1)
 {
-    tmov_acc2vec_test<4, uint16_t, uint32_t, uint32_t, 1, 0, 0, false, 128, 96>(128, 48, 96);
+    tmov_acc2vec_test<4, int16_t, uint16_t, uint16_t, 1, 0, 0, false, 128, 96>(128, 48, 96);
 }
 
 TEST_F(TMOVTest, case_nz2nd_sc_quant_2)
 {
-    tmov_acc2vec_test<4, int8_t, uint32_t, uint32_t, 2, 0, 32, false, 128, 128>(60, 128, 64);
+    tmov_acc2vec_test<4, int8_t, uint16_t, uint16_t, 2, 0, 32, false, 128, 128>(60, 128, 64);
 }
 
 TEST_F(TMOVTest, case_nz2nd_sc_quant_3)

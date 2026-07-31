@@ -920,7 +920,7 @@ struct TPipe {
     {}
 };
 
-//---------------------------fixpipe features support---------------------------
+// Fixpipe conversion helpers.
 template <typename TileProd, typename TConfig>
 using FixpipeConsType = FixpipeConsDType_t<TConfig::QuantPre, typename TileProd::DType>;
 
@@ -961,6 +961,8 @@ PTO_INTERNAL void TPush_gm(Pipe& pipe, TileProd& tile, size_t entryBase)
 {
     using DstT = FixpipeConsType<TileProd, TConfig>;
     using TileCons = FixpipeVecTile<TileProd, DstT, TConfig::LayoutMode>;
+    constexpr QuantMode_t QuantPre = TConfig::QuantPre;
+    constexpr ReluPreMode ReluMode = TConfig::ReluMode;
 
     using SrcT = typename TileProd::DType;
     constexpr int rows = TileProd::Rows;
@@ -972,6 +974,17 @@ PTO_INTERNAL void TPush_gm(Pipe& pipe, TileProd& tile, size_t entryBase)
     using GlobalData = GlobalTensor<DstT, Shape<1, 1, 1, rows, cols>, Stride<1, 1, 1, cols, 1>>;
     auto* addr = reinterpret_cast<__gm__ DstT*>(
         reinterpret_cast<std::uintptr_t>(pipe.fifo.GM_SLOT_BUFFER) + entryBase + subOffset);
+    if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT) {
+        const uint32_t consRows = static_cast<uint32_t>(tile.GetValidRow());
+        const uint32_t consCols = static_cast<uint32_t>(tile.GetValidCol());
+        std::vector<uint64_t> scalars(static_cast<std::size_t>(consCols), 0);
+        if constexpr (QuantPre != QuantMode_t::NoQuant) {
+            InitializeQuantScalars<QuantPre>(scalars);
+        }
+        cpu_pipe::CopyTileWindowToLinear<DstT, TileProd, QuantPre, ReluMode>(
+            addr, consRows, consCols, tile, 0, 0, scalars);
+        return;
+    }
     GlobalData globalData(addr);
     TSTORE(globalData, tile);
 }
@@ -984,12 +997,26 @@ PTO_INTERNAL void TPush_c2v(Pipe& pipe, TileProd& tile, size_t entryBase, size_t
     constexpr QuantMode_t QuantPre = TConfig::QuantPre;
     constexpr ReluPreMode ReluMode = TConfig::ReluMode;
 
-    constexpr int consRows =
-        (Split == TileSplitAxis::TILE_UP_DOWN) ? (TileProd::Rows / 2) : static_cast<int>(TileProd::Rows);
-    constexpr int consCols =
-        (Split == TileSplitAxis::TILE_LEFT_RIGHT) ? (TileProd::Cols / 2) : static_cast<int>(TileProd::Cols);
+    const uint32_t consRows = [&tile]() -> uint32_t {
+        if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT) {
+            return static_cast<uint32_t>(tile.GetValidRow());
+        } else if constexpr (Split == TileSplitAxis::TILE_UP_DOWN) {
+            return static_cast<uint32_t>(TileProd::Rows / 2);
+        } else {
+            return static_cast<uint32_t>(TileProd::Rows);
+        }
+    }();
+    const uint32_t consCols = [&tile]() -> uint32_t {
+        if constexpr (Split == TileSplitAxis::TILE_NO_SPLIT) {
+            return static_cast<uint32_t>(tile.GetValidCol());
+        } else if constexpr (Split == TileSplitAxis::TILE_LEFT_RIGHT) {
+            return static_cast<uint32_t>(TileProd::Cols / 2);
+        } else {
+            return static_cast<uint32_t>(TileProd::Cols);
+        }
+    }();
 
-    std::vector<uint64_t> scalars(consCols, 0);
+    std::vector<uint64_t> scalars(static_cast<std::size_t>(consCols), 0);
     if constexpr (QuantPre != QuantMode_t::NoQuant) {
         InitializeQuantScalars<QuantPre>(scalars);
     }

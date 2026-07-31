@@ -58,8 +58,8 @@ PTO_INST RecordEvent TSEL(TileData &dst, MaskTile &selMask, TileData &src0, Tile
     - `dst`, `src0`, and `src1` must be row-major.
     - The selection domain is `dst.GetValidRow()` / `dst.GetValidCol()`.
 - **Implementation checks (A5)**:
-    - `sizeof(TileData::DType)` must be `2` or `4` bytes.
-    - `TileData::DType` must be `int16_t` or `uint16_t` or `int32_t` or `uint32_t` or `half` or `bfloat16_t` or `float`.
+    - `sizeof(TileData::DType)` must be `1`, `2`, or `4` bytes.
+    - `TileData::DType` must be `int8_t` or `uint8_t` or `int16_t` or `uint16_t` or `int32_t` or `uint32_t` or `half` or `bfloat16_t` or `float`.
     - `dst`, `src0`, and `src1` must use the same element type.
     - `dst`, `src0`, and `src1` must be row-major.
     - The selection domain is `dst.GetValidRow()` / `dst.GetValidCol()`.

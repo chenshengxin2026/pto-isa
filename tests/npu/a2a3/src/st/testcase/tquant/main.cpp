@@ -25,10 +25,6 @@ void LaunchTQuantInt8(
     std::conditional_t<quantType == pto::QuantType::INT8_SYM, int8_t, uint8_t>* dst, float* src, float* scale,
     void* stream, float* offset = nullptr);
 
-template <int validRows, int validCols, int mode, pto::QuantType quantType>
-void LaunchTQuantInt8NoTmp(std::conditional_t<quantType == pto::QuantType::INT8_SYM, int8_t, uint8_t> *dst, float *src,
-                           float *scale, void *stream, float *offset = nullptr);
-
 class TQUANTTEST : public testing::Test {
 protected:
     void SetUp() override {}
@@ -44,7 +40,7 @@ std::string GetGoldenDir()
     return fullPath;
 }
 
-template <int validRows, int validCols, int mode, bool noTmp = false>
+template <int validRows, int validCols, int mode>
 void test_tquant_int8_sym()
 {
     size_t srcFileSize = validRows * validCols * sizeof(float);
@@ -72,13 +68,7 @@ void test_tquant_int8_sym()
     ReadFile(GetGoldenDir() + "/inv_scale_fp32.bin", scaleFileSize, scaleHost, scaleFileSize);
     aclrtMemcpy(scaleDevice, scaleFileSize, scaleHost, scaleFileSize, ACL_MEMCPY_HOST_TO_DEVICE);
 
-    if constexpr (noTmp) {
-        LaunchTQuantInt8NoTmp<validRows, validCols, mode, pto::QuantType::INT8_SYM>(dstDevice, srcDevice, scaleDevice,
-                                                                                    stream);
-    } else {
-        LaunchTQuantInt8<validRows, validCols, mode, pto::QuantType::INT8_SYM>(dstDevice, srcDevice, scaleDevice,
-                                                                               stream);
-    }
+    LaunchTQuantInt8<validRows, validCols, mode, pto::QuantType::INT8_SYM>(dstDevice, srcDevice, scaleDevice, stream);
 
     aclError syncRet = aclrtSynchronizeStream(stream);
     ASSERT_EQ(syncRet, ACL_SUCCESS) << "aclrtSynchronizeStream failed (ret=" << syncRet
@@ -105,7 +95,7 @@ void test_tquant_int8_sym()
     EXPECT_TRUE(ResultCmp<int8_t>(golden_s8, dev_s8, 0.0f));
 }
 
-template <int validRows, int validCols, int mode, bool noTmp = false>
+template <int validRows, int validCols, int mode>
 void test_tquant_int8_asym()
 {
     size_t srcSize = validRows * validCols * sizeof(float);
@@ -132,13 +122,7 @@ void test_tquant_int8_asym()
     aclrtMemcpy(srcDev, srcSize, srcHost, srcSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(scaleDev, scaleSize, scaleHost, scaleSize, ACL_MEMCPY_HOST_TO_DEVICE);
     aclrtMemcpy(offDev, offSize, offHost, offSize, ACL_MEMCPY_HOST_TO_DEVICE);
-    if constexpr (noTmp) {
-        LaunchTQuantInt8NoTmp<validRows, validCols, mode, pto::QuantType::INT8_ASYM>(dstDev, srcDev, scaleDev, stream,
-                                                                                     offDev);
-    } else {
-        LaunchTQuantInt8<validRows, validCols, mode, pto::QuantType::INT8_ASYM>(dstDev, srcDev, scaleDev, stream,
-                                                                                offDev);
-    }
+    LaunchTQuantInt8<validRows, validCols, mode, pto::QuantType::INT8_ASYM>(dstDev, srcDev, scaleDev, stream, offDev);
     aclError syncRet = aclrtSynchronizeStream(stream);
     ASSERT_EQ(syncRet, ACL_SUCCESS) << "aclrtSynchronizeStream failed (ret=" << syncRet
                                     << "): " << aclGetRecentErrMsg();

@@ -317,8 +317,16 @@ struct TileTraits<T> {
             return "fp32";
         else if constexpr (std::is_same_v<DType, int32_t>)
             return "int32";
+        else if constexpr (std::is_same_v<DType, uint32_t>)
+            return "uint32";
+        else if constexpr (std::is_same_v<DType, int16_t>)
+            return "int16";
+        else if constexpr (std::is_same_v<DType, uint16_t>)
+            return "uint16";
         else if constexpr (std::is_same_v<DType, int8_t>)
             return "int8";
+        else if constexpr (std::is_same_v<DType, uint8_t>)
+            return "uint8";
         else
             return "fp16";
     }

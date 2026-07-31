@@ -8,24 +8,26 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-#include <cstddef>
-#include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <sys/time.h>
 
-#include <pto/pto-inst.hpp>
-#include <pto/comm/pto_comm_inst.hpp>
+#include "benchmark_common.hpp"
+#include "benchmark_device_baseline.hpp"
 #include "pto/common/pto_tile.hpp"
-#include "pto/comm/async/sdma/sdma_types.hpp"
-#include "common.hpp"
 
 constexpr size_t kTileElems = 1024;
-constexpr size_t kBytesPerKiB = 1024;
 constexpr size_t kBytesPerMiB = 1024 * 1024;
 constexpr size_t kMaxBenchBytes = 4 * kBytesPerMiB;
+using benchmark::CheckAclCall;
+using benchmark::DeviceBaselineConfig;
+using benchmark::DeviceBaselineResources;
+using benchmark::kBytesPerKiB;
 constexpr size_t kBenchBytes[] = {
     4 * kBytesPerKiB, 16 * kBytesPerKiB, 64 * kBytesPerKiB, 256 * kBytesPerKiB, 1 * kBytesPerMiB, 4 * kBytesPerMiB,
+};
+constexpr benchmark::DeviceBaselineEnvNames kTGetEnvNames{
+    "TGET_DEVICE_BASELINE_BYTES",        "TGET_DEVICE_BASELINE_BLOCK_DIVISOR", "TGET_DEVICE_BASELINE_QUEUE_NUM",
+    "TGET_DEVICE_BASELINE_POST_COUNT",   "TGET_DEVICE_BASELINE_OUTER_WARMUP",  "TGET_DEVICE_BASELINE_OUTER_ITERS",
+    "TGET_DEVICE_BASELINE_INNER_WARMUP", "TGET_DEVICE_BASELINE_INNER_ITERS",   "TGET_DEVICE_BASELINE_WAIT_EACH_EVENT",
 };
 
 enum class BenchInstr {
@@ -75,22 +77,6 @@ double NowMs()
     timeval tv{};
     gettimeofday(&tv, nullptr);
     return static_cast<double>(tv.tv_sec) * 1000.0 + static_cast<double>(tv.tv_usec) / 1000.0;
-}
-
-inline AICORE uint64_t get_syscnt()
-{
-    uint64_t syscnt;
-    asm volatile("MOV %0, SYS_CNT\n" : "+l"(syscnt));
-    return syscnt;
-}
-
-bool CheckAclCall(aclError ret, const char* op)
-{
-    if (ret != ACL_SUCCESS) {
-        std::cerr << "[ERROR] " << op << " failed: " << static_cast<int>(ret) << std::endl;
-        return false;
-    }
-    return true;
 }
 
 template <typename T>
@@ -151,9 +137,21 @@ __global__ AICORE void PrepareSendBufferKernel(__gm__ T* src, __gm__ T* shmem, i
 }
 
 template <typename T>
+__global__ AICORE void CopyReceivedBufferKernel(
+    __gm__ T* output, __gm__ T* shmem, int rootRank, int elemCount, __gm__ CommDeviceContext* hcclCtx)
+{
+    if (elemCount > 0 && static_cast<int>(hcclCtx->rankId) == rootRank) {
+        __gm__ uint8_t* shmemBytes = reinterpret_cast<__gm__ uint8_t*>(shmem);
+        __gm__ T* shmemData = reinterpret_cast<__gm__ T*>(shmemBytes + 64 * sizeof(int32_t));
+        __gm__ T* recvShmem = shmemData + (kMaxBenchBytes / sizeof(T));
+        CopyContiguousImpl(output, recvShmem, elemCount);
+    }
+    pipe_barrier(PIPE_ALL);
+}
+
+template <typename T>
 __global__ AICORE void TGetBandwidthKernel(
-    __gm__ T* output, __gm__ T* shmem, int nranks, int rootRank, int peerRank, int elemCount,
-    __gm__ CommDeviceContext* hcclCtx)
+    __gm__ T* shmem, int nranks, int rootRank, int peerRank, int elemCount, __gm__ CommDeviceContext* hcclCtx)
 {
     using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
     using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
@@ -171,8 +169,8 @@ __global__ AICORE void TGetBandwidthKernel(
     __gm__ T* recvShmem = shmemData + (kMaxBenchBytes / sizeof(T));
 
     if (static_cast<int>(hcclCtx->rankId) == rootRank) {
-        ShapeDyn shape(1, 1, 1, 1, elemCount);
-        StrideDyn stride(elemCount, elemCount, elemCount, elemCount, 1);
+        const ShapeDyn shape(1, 1, 1, 1, elemCount);
+        const StrideDyn stride(elemCount, elemCount, elemCount, elemCount, 1);
         TileData stagingTile(1, kTileElems);
         TASSIGN(stagingTile, 0x0);
         stagingTile.ColMaskInternal =
@@ -183,7 +181,6 @@ __global__ AICORE void TGetBandwidthKernel(
         Global remoteSendG(remoteSendShmem, shape, stride);
         pto::comm::TGET(recvG, remoteSendG, stagingTile);
         pipe_barrier(PIPE_ALL);
-        CopyContiguousImpl(output, recvShmem, elemCount);
     }
 
     pipe_barrier(PIPE_ALL);
@@ -224,18 +221,16 @@ __global__ AICORE void ProfileTGetBandwidthKernel(
         for (int i = 0; i < warmupIters; ++i) {
             pto::comm::TGET(recvG, remoteSendG, stagingTile);
             pipe_barrier(PIPE_ALL);
-            CopyContiguousImpl(output, recvShmem, elemCount);
-            pipe_barrier(PIPE_ALL);
         }
 
-        const uint64_t t0 = get_syscnt();
+        const uint64_t t0 = benchmark::GetSyscnt();
         for (int i = 0; i < timedIters; ++i) {
             pto::comm::TGET(recvG, remoteSendG, stagingTile);
             pipe_barrier(PIPE_ALL);
-            CopyContiguousImpl(output, recvShmem, elemCount);
-            pipe_barrier(PIPE_ALL);
         }
-        const uint64_t t1 = get_syscnt();
+        const uint64_t t1 = benchmark::GetSyscnt();
+        CopyContiguousImpl(output, recvShmem, elemCount);
+        pipe_barrier(PIPE_ALL);
         if (profileCycles != nullptr) {
             profileCycles[0] = t1 - t0;
         }
@@ -246,8 +241,8 @@ __global__ AICORE void ProfileTGetBandwidthKernel(
 
 template <typename T>
 __global__ AICORE void TGetAsyncBandwidthKernel(
-    __gm__ T* output, __gm__ T* shmem, int nranks, int rootRank, int peerRank, int elemCount,
-    __gm__ CommDeviceContext* hcclCtx, __gm__ uint8_t* sdmaWorkspace, uint32_t sdmaSyncId)
+    __gm__ T* shmem, int nranks, int rootRank, int peerRank, int elemCount, __gm__ CommDeviceContext* hcclCtx,
+    __gm__ uint8_t* sdmaWorkspace, uint32_t sdmaSyncId)
 {
     using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
     using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
@@ -278,7 +273,6 @@ __global__ AICORE void TGetAsyncBandwidthKernel(
             (void)event.Wait(session);
         }
         pipe_barrier(PIPE_ALL);
-        CopyContiguousImpl(output, recvShmem, elemCount);
     }
 
     pipe_barrier(PIPE_ALL);
@@ -320,19 +314,17 @@ __global__ AICORE void ProfileTGetAsyncBandwidthKernel(
                 pto::comm::AsyncEvent warmupEvent = pto::comm::TGET_ASYNC(recvG, remoteSendG, session);
                 (void)warmupEvent.Wait(session);
                 pipe_barrier(PIPE_ALL);
-                CopyContiguousImpl(output, recvShmem, elemCount);
-                pipe_barrier(PIPE_ALL);
             }
 
-            const uint64_t t0 = get_syscnt();
+            const uint64_t t0 = benchmark::GetSyscnt();
             for (int i = 0; i < timedIters; ++i) {
                 pto::comm::AsyncEvent event = pto::comm::TGET_ASYNC(recvG, remoteSendG, session);
                 (void)event.Wait(session);
                 pipe_barrier(PIPE_ALL);
-                CopyContiguousImpl(output, recvShmem, elemCount);
-                pipe_barrier(PIPE_ALL);
             }
-            const uint64_t t1 = get_syscnt();
+            const uint64_t t1 = benchmark::GetSyscnt();
+            CopyContiguousImpl(output, recvShmem, elemCount);
+            pipe_barrier(PIPE_ALL);
             if (profileCycles != nullptr) {
                 profileCycles[0] = t1 - t0;
             }
@@ -356,19 +348,31 @@ bool LaunchPrepareKernel(TestContext& ctx, T* inputBuf, T* shmem, int elemCount)
 
 template <typename T>
 bool LaunchBandwidthKernel(
-    BenchInstr instr, TestContext& ctx, T* outputBuf, T* shmem, int nranks, int rootRank, int peerRank, int elemCount,
+    BenchInstr instr, TestContext& ctx, T* shmem, int nranks, int rootRank, int peerRank, int elemCount,
     uint8_t* sdmaWorkspace)
 {
     if (instr == BenchInstr::TGet) {
-        TGetBandwidthKernel<T>
-            <<<1, nullptr, ctx.stream>>>(outputBuf, shmem, nranks, rootRank, peerRank, elemCount, ctx.deviceCtx);
+        TGetBandwidthKernel<T><<<1, nullptr, ctx.stream>>>(shmem, nranks, rootRank, peerRank, elemCount, ctx.deviceCtx);
     } else {
-        TGetAsyncBandwidthKernel<T><<<1, nullptr, ctx.stream>>>(
-            outputBuf, shmem, nranks, rootRank, peerRank, elemCount, ctx.deviceCtx, sdmaWorkspace, 0);
+        TGetAsyncBandwidthKernel<T>
+            <<<1, nullptr, ctx.stream>>>(shmem, nranks, rootRank, peerRank, elemCount, ctx.deviceCtx, sdmaWorkspace, 0);
     }
     ctx.aclStatus = aclrtSynchronizeStream(ctx.stream);
     if (ctx.aclStatus != 0) {
         std::cerr << "[ERROR] aclrtSynchronizeStream failed in benchmark kernel: " << ctx.aclStatus << std::endl;
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+bool LaunchCopyReceivedBufferKernel(TestContext& ctx, T* outputBuf, T* shmem, int rootRank, int elemCount)
+{
+    CopyReceivedBufferKernel<T><<<1, nullptr, ctx.stream>>>(outputBuf, shmem, rootRank, elemCount, ctx.deviceCtx);
+    ctx.aclStatus = aclrtSynchronizeStream(ctx.stream);
+    if (ctx.aclStatus != 0) {
+        std::cerr << "[ERROR] aclrtSynchronizeStream failed in CopyReceivedBufferKernel: " << ctx.aclStatus
+                  << std::endl;
         return false;
     }
     return true;
@@ -411,7 +415,7 @@ bool RunSingleBandwidthCase(
 
     for (int i = 0; i < warmupIters; ++i) {
         if (!LaunchBandwidthKernel(
-                instr, ctx, outputBuf, shmem, nRanks, rootRank, peerRank, static_cast<int>(elemCount), sdmaWorkspace)) {
+                instr, ctx, shmem, nRanks, rootRank, peerRank, static_cast<int>(elemCount), sdmaWorkspace)) {
             return false;
         }
     }
@@ -424,12 +428,16 @@ bool RunSingleBandwidthCase(
     const double beginMs = NowMs();
     for (int i = 0; i < timedIters; ++i) {
         if (!LaunchBandwidthKernel(
-                instr, ctx, outputBuf, shmem, nRanks, rootRank, peerRank, static_cast<int>(elemCount), sdmaWorkspace)) {
+                instr, ctx, shmem, nRanks, rootRank, peerRank, static_cast<int>(elemCount), sdmaWorkspace)) {
             return false;
         }
     }
     const double endMs = NowMs();
     HcclHostBarrier(ctx.comm, ctx.stream);
+
+    if (!LaunchCopyReceivedBufferKernel(ctx, outputBuf, shmem, rootRank, static_cast<int>(elemCount))) {
+        return false;
+    }
 
     const double elapsedMs = endMs - beginMs;
     if (ctx.hostCtx.rankId == rootRank) {
@@ -635,5 +643,67 @@ bool RunTGetBandwidthSweep(int n_ranks, int n_devices, int first_rank_id, int fi
         n_ranks, first_rank_id, first_device_id, [&](int rankId, const HcclRootInfo* rootInfo) {
             return RunTGetBandwidthSweepKernel<float>(
                 rankId, n_ranks, n_devices, first_rank_id, first_device_id, rootInfo);
+        });
+}
+
+struct TGetDeviceBaselinePolicy {
+    static constexpr bool kIsTGet = true;
+
+    static int SourceRank(int, int peerRank) { return peerRank; }
+
+    template <typename T>
+    static bool Reset(
+        int rankId, int rootRank, int, const DeviceBaselineConfig& config, DeviceBaselineResources<T>& resources)
+    {
+        bool resetOk = true;
+        if (rankId == rootRank) {
+            resetOk = CheckAclCall(
+                          aclrtMemset(resources.recvShmem, config.totalBytes, 0xFF, config.totalBytes),
+                          "aclrtMemset(device baseline dst)") &&
+                      CheckAclCall(
+                          aclrtMemset(resources.profileBufDev, 2 * sizeof(uint64_t), 0, 2 * sizeof(uint64_t)),
+                          "aclrtMemset(device baseline profile)");
+        }
+        char launchStatus = resetOk ? 1 : 0;
+        CommMpiBcast(&launchStatus, 1, COMM_MPI_CHAR, rootRank);
+        return launchStatus != 0;
+    }
+
+    template <typename T>
+    static bool Complete(
+        int rankId, int rootRank, int peerRank, int patternOuter, bool measured, int outer,
+        const DeviceBaselineConfig& config, DeviceBaselineResources<T>& resources, uint64_t& outerCycles)
+    {
+        bool verifyOk = true;
+        if (rankId == rootRank) {
+            verifyOk = CheckAclCall(
+                           aclrtMemcpy(
+                               resources.verifyHost, config.totalBytes, resources.recvShmem, config.totalBytes,
+                               ACL_MEMCPY_DEVICE_TO_HOST),
+                           "aclrtMemcpy(device baseline verify)") &&
+                       CheckAclCall(
+                           aclrtMemcpy(
+                               resources.profileBufHost, 2 * sizeof(uint64_t), resources.profileBufDev,
+                               2 * sizeof(uint64_t), ACL_MEMCPY_DEVICE_TO_HOST),
+                           "aclrtMemcpy(device baseline profile)");
+            verifyOk = verifyOk && resources.profileBufHost[1] == 1;
+            outerCycles = resources.profileBufHost[0];
+            verifyOk = verifyOk && benchmark::VerifyDeviceBaselinePattern(
+                                       resources.verifyHost, peerRank, patternOuter, measured, outer, config.postCount,
+                                       config.elemCount);
+        }
+        char verifyStatus = verifyOk ? 1 : 0;
+        CommMpiBcast(&verifyStatus, 1, COMM_MPI_CHAR, rootRank);
+        return verifyStatus != 0;
+    }
+};
+
+bool RunTGetDeviceBaseline(int n_ranks, int n_devices, int first_rank_id, int first_device_id)
+{
+    return ForkAndRunWithHcclRootInfo(
+        n_ranks, first_rank_id, first_device_id, [&](int rankId, const HcclRootInfo* rootInfo) {
+            return benchmark::RunDeviceBaselineKernel<float, TGetDeviceBaselinePolicy>(
+                rankId, n_ranks, n_devices, first_rank_id, first_device_id, rootInfo, kTGetEnvNames, "TGET",
+                "TGET_ASYNC");
         });
 }

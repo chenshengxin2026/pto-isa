@@ -11,3 +11,4 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #pragma once
 
 bool RunTGetBandwidthSweep(int n_ranks, int n_devices, int first_rank_id, int first_device_id);
+bool RunTGetDeviceBaseline(int n_ranks, int n_devices, int first_rank_id, int first_device_id);

@@ -51,12 +51,12 @@ PTO_INTERNAL void TROWEXPANDDIV_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileD
     using T = typename TileDataDst::DType;
     static_assert(
         std::is_same_v<T, typename TileDataSrc0::DType> && std::is_same_v<T, typename TileDataSrc1::DType>,
-        "Fix: TROWEXPANDIV src and dst data type is different!");
+        "Fix: TROWEXPANDDIV src and dst data type is different!");
     static_assert(
         std::is_same_v<T, half> || std::is_same_v<T, float16_t> || std::is_same_v<T, float> ||
             std::is_same_v<T, float32_t>,
-        "Fix: TROWEXPANDIV Invalid data type.");
-    static_assert(TileDataDst::isRowMajor, "Fix: TROWEXPANDIV Invalid tile shape.");
+        "Fix: TROWEXPANDDIV Invalid data type.");
+    static_assert(TileDataDst::isRowMajor, "Fix: TROWEXPANDDIV Invalid tile shape.");
     unsigned src0ValidRow = src0.GetValidRow();
     unsigned validRow = dst.GetValidRow();
     unsigned validCol = dst.GetValidCol();
@@ -71,13 +71,13 @@ PTO_INTERNAL void TROWEXPANDDIV_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileD
     }
     PTO_ASSERT(
         (src0eqdst && TileDataSrc0::isRowMajor) || (src1eqdst && TileDataSrc1::isRowMajor),
-        "TROWEXPANDIV: the validShape of src0 or src1 should be equal to those of dst.");
+        "TROWEXPANDDIV: the validShape of src0 or src1 should be equal to those of dst.");
     if (src0eqdst) {
         PTO_ASSERT(
             ((TileDataSrc1::isRowMajor && src1ValidCol == 32 / sizeof(T)) ||
              (!TileDataSrc1::isRowMajor && src1ValidCol == 1)) &&
                 src1ValidRow == validRow,
-            "TROWEXPANDIV: invalid src1 shape.");
+            "TROWEXPANDDIV: invalid src1 shape.");
         TRowExpandBin<RowExpandDivOp<T>, TileDataDst, TileDataSrc0, TileDataSrc1>(
             dst.data(), src0.data(), src1.data(), validRow, validCol);
     } else {
@@ -85,7 +85,7 @@ PTO_INTERNAL void TROWEXPANDDIV_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileD
             ((TileDataSrc0::isRowMajor && src0ValidCol == 32 / sizeof(T)) ||
              (!TileDataSrc0::isRowMajor && src0ValidCol == 1)) &&
                 src0ValidRow == validRow,
-            "TROWEXPANDIV: invalid src0 shape.");
+            "TROWEXPANDDIV: invalid src0 shape.");
         TRowExpandBin<RowExpandDivOp2<T>, TileDataDst, TileDataSrc1, TileDataSrc0>(
             dst.data(), src1.data(), src0.data(), validRow, validCol);
     }
@@ -94,13 +94,13 @@ PTO_INTERNAL void TROWEXPANDDIV_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileD
     constexpr bool src1eqdst = std::is_same_v<TileDataDst, TileDataSrc1>;
     PTO_ASSERT(
         (src0eqdst && TileDataSrc0::isRowMajor) || (src1eqdst && TileDataSrc1::isRowMajor),
-        "TROWEXPANDIV: auto mode only supports same-type tiles.");
+        "TROWEXPANDDIV: auto mode only supports same-type tiles.");
     if constexpr (src0eqdst) {
         PTO_ASSERT(
             ((TileDataSrc1::isRowMajor && src1ValidCol == 32 / sizeof(T)) ||
              (!TileDataSrc1::isRowMajor && src1ValidCol == 1)) &&
                 src1ValidRow == validRow,
-            "TROWEXPANDIV: invalid src1 shape.");
+            "TROWEXPANDDIV: invalid src1 shape.");
         TRowExpandBin<RowExpandDivOp<T>, TileDataDst, TileDataSrc0, TileDataSrc1>(
             dst.data(), src0.data(), src1.data(), validRow, validCol);
     } else {
@@ -108,7 +108,7 @@ PTO_INTERNAL void TROWEXPANDDIV_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileD
             ((TileDataSrc0::isRowMajor && src0ValidCol == 32 / sizeof(T)) ||
              (!TileDataSrc0::isRowMajor && src0ValidCol == 1)) &&
                 src0ValidRow == validRow,
-            "TROWEXPANDIV: invalid src0 shape.");
+            "TROWEXPANDDIV: invalid src0 shape.");
         TRowExpandBin<RowExpandDivOp2<T>, TileDataDst, TileDataSrc1, TileDataSrc0>(
             dst.data(), src1.data(), src0.data(), validRow, validCol);
     }

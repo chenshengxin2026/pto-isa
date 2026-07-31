@@ -67,7 +67,7 @@ __global__ AICORE void runTPushPopMatmulAddNoSplit(
     // TILE_NO_SPLIT: slot size equals the full consumer tile; only AIV0 signals
     // free, so DefaultSplit must be TILE_NO_SPLIT to avoid a two-core deadlock
     // in the TPipe destructor.
-    using MatPipe = TPipe<FLAG_ID, Direction::DIR_C2V, sizeof(OutT) * CASE_TILE_M * TILE_N, FIFO_DEPTH>;
+    using MatPipe = TPipe<FLAG_ID, Direction::DIR_C2V, sizeof(OutT) * CASE_TILE_M * TILE_N, FIFO_DEPTH, 2, true>;
     MatPipe mPipe((__gm__ void*)(uint64_t)0x0, (uint32_t)0x0, (uint32_t)0x0);
 
     constexpr uint32_t blockAlign = C0_SIZE_BYTE / sizeof(InT);

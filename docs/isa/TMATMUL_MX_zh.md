@@ -92,6 +92,9 @@ PTO_INST RecordEvent TMATMUL_MX(TileRes &cMatrix, TileLeft &aMatrix, TileLeftSca
 - **实现检查 (Ascend 950PR/Ascend 950DT)**:
     - `m/k/n` 取自 `aMatrix.GetValidRow()`、`aMatrix.GetValidCol()`、`bMatrix.GetValidCol()`。
     - 静态合法性检查通过 `CheckMadMxValid<...>()`（类型、形状、分形和缩放tile合法性）。
+    - 支持的 `(C, A, B)` 三元组（`C` 始终为 `float`；缩放tile为 `float8_e8m0_t`）：
+        - FP8：`(float, float8_e4m3_t, float8_e4m3_t)`、`(float, float8_e4m3_t, float8_e5m2_t)`、`(float, float8_e5m2_t, float8_e4m3_t)`、`(float, float8_e5m2_t, float8_e5m2_t)`。
+        - FP4：`(float, float4_e1m2x2_t, float4_e1m2x2_t)`、`(float, float4_e1m2x2_t, float4_e2m1x2_t)`、`(float, float4_e2m1x2_t, float4_e2m1x2_t)`、`(float, float4_e2m1x2_t, float4_e1m2x2_t)`。
 - **偏置形式**:
     - `TileBias::DType` 必须是 `float` 且 `TileBias::Loc == TileType::Bias`，`TileBias::Rows == 1`（Ascend 950PR/Ascend 950DT通过 `static_assert` 检查）。
 

@@ -33,11 +33,23 @@ usage() {
   echo "Usage:"
   echo ""
   echo "    -h, --help  Print usage"
-  echo "    --pkg Build run package"
+  echo "    --pkg Build package (type controlled by --pkg-type, default run)"
+  echo "    --pkg-type=<TYPE>  Specify package type (TYPE option: run/rpm/deb/all), Default: run"
   echo "    --run_all run all st on sim"
   echo "    --run_simple run some st on board"
   echo "    --cpu_bf16 Enable BF16 CPU-SIM STs with a C++23 std::bfloat16_t toolchain"
   echo ""
+}
+
+# check value of pkg-type option
+# usage: check_pkg_type pkg-type
+check_pkg_type() {
+  arg_value="$1"
+  if [ "X$arg_value" != "Xrun" ] && [ "X$arg_value" != "Xrpm" ] && [ "X$arg_value" != "Xdeb" ] && [ "X$arg_value" != "Xall" ]; then
+    echo "Invalid value $arg_value for option --$2"
+    usage
+    exit 1
+  fi
 }
 
 print_success() {
@@ -75,8 +87,9 @@ checkopts() {
   PLATFORM_MODE=""
   INST_NAME=""
   AUTO_MODE=FALSE
+  PACKAGE_TYPE="run"
 
-  parsed_args=$(getopt -a -o j:hvuO: -l help,verbose,cov,make_clean,noexec,pkg,run_all,a3,a5,sim,npu,comm,cpu,cpu_bf16,auto_mode,run_simple,build,cann_3rd_lib_path: -- "$@") || {
+  parsed_args=$(getopt -a -o j:hvuO: -l help,verbose,cov,make_clean,noexec,pkg,pkg-type:,run_all,a3,a5,sim,npu,comm,cpu,cpu_bf16,auto_mode,run_simple,build,cann_3rd_lib_path: -- "$@") || {
   usage
   exit 1
   }
@@ -100,6 +113,11 @@ checkopts() {
       --pkg)
         ENABLE_PACKAGE=TRUE
         shift
+        ;;
+      --pkg-type)
+        check_pkg_type "$2" pkg-type
+        PACKAGE_TYPE="$2"
+        shift 2
         ;;
       --a3)
         ENABLE_A3=TRUE
@@ -268,7 +286,7 @@ build_package() {
   mkdir $BUILD_PATH
   mkdir $BUILD_OUT_PATH
   cd $BUILD_PATH
-  cmake ${CMAKE_ARGS} ..
+  cmake ${CMAKE_ARGS} -D PACKAGE_TYPE=${PACKAGE_TYPE} ..
   make package
   echo "---------------package end------------------"
 }

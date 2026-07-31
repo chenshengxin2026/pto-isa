@@ -168,36 +168,23 @@ void LaunchTTRANSConv(T* out, T* src, void* stream)
 
 // NCHW -> NC1HWC0
 template void LaunchTTRANSConv<int32_t, 0, 1, 1, 1, 8, 8, 1, 1, 1, 8, 1, 8>(int32_t* out, int32_t* src, void* stream);
-template void LaunchTTRANSConv<float, 0, 5, 4, 4, 16, 16, 1, 1, 5, 57, 4, 16>(float* out, float* src, void* stream);
 template void LaunchTTRANSConv<aclFloat16, 0, 1, 2, 2, 16, 16, 1, 1, 1, 30, 2, 16>(
     aclFloat16* out, aclFloat16* src, void* stream);
-template void LaunchTTRANSConv<int16_t, 0, 7, 4, 6, 16, 16, 1, 1, 7, 53, 6, 16>(
-    int16_t* out, int16_t* src, void* stream);
 template void LaunchTTRANSConv<int8_t, 0, 3, 2, 2, 64, 32, 1, 1, 3, 64, 2, 64>(int8_t* out, int8_t* src, void* stream);
 template void LaunchTTRANSConv<int8_t, 0, 1, 2, 2, 128, 32, 1, 1, 1, 63, 2, 128>(
     int8_t* out, int8_t* src, void* stream);
 template void LaunchTTRANSConv<int8_t, 0, 5, 2, 2, 16, 32, 1, 1, 5, 58, 2, 16>(int8_t* out, int8_t* src, void* stream);
-template void LaunchTTRANSConv<uint8_t, 0, 9, 3, 6, 16, 32, 1, 1, 9, 87, 6, 16>(
-    uint8_t* out, uint8_t* src, void* stream);
 
-template void LaunchTTRANSConv<float, 0, 1, 8, 6, 48, 4, 1, 1, 1, 32, 6, 48>(float* out, float* src, void* stream);
 template void LaunchTTRANSConv<uint16_t, 0, 1, 7, 2, 16, 4, 1, 1, 1, 26, 2, 16>(
     uint16_t* out, uint16_t* src, void* stream);
 template void LaunchTTRANSConv<int8_t, 0, 5, 5, 2, 16, 4, 1, 1, 5, 18, 2, 16>(int8_t* out, int8_t* src, void* stream);
 
 // NC1HWC0 -> C1HWN1N0C0
 template void LaunchTTRANSConv<float, 1, 2, 2, 16, 2, 2, 4, 3, 2, 2, 16, 4>(float* out, float* src, void* stream);
-template void LaunchTTRANSConv<int32_t, 1, 2, 3, 10, 3, 16, 8, 37, 2, 3, 10, 8>(
-    int32_t* out, int32_t* src, void* stream);
 template void LaunchTTRANSConv<aclFloat16, 1, 2, 1, 8, 1, 16, 16, 7, 2, 1, 8, 16>(
     aclFloat16* out, aclFloat16* src, void* stream);
 template void LaunchTTRANSConv<aclFloat16, 1, 2, 1, 8, 1, 16, 4, 7, 2, 1, 8, 4>(
     aclFloat16* out, aclFloat16* src, void* stream);
-template void LaunchTTRANSConv<uint16_t, 1, 3, 2, 7, 3, 16, 16, 45, 3, 2, 7, 16>(
-    uint16_t* out, uint16_t* src, void* stream);
-template void LaunchTTRANSConv<int8_t, 1, 5, 1, 6, 2, 16, 32, 25, 5, 1, 6, 32>(int8_t* out, int8_t* src, void* stream);
-template void LaunchTTRANSConv<uint8_t, 1, 2, 7, 7, 1, 16, 32, 11, 2, 7, 7, 32>(
-    uint8_t* out, uint8_t* src, void* stream);
 
 // GNCHW -> GNC1HWC0
 template <
@@ -353,8 +340,6 @@ void LaunchTTRANSGroupConv(T* out, T* src, void* stream)
 // GNCHW -> GNC1HWC0
 template void LaunchTTRANSGroupConv<int32_t, 0, 4, 1, 1, 1, 8, 8, 1, 1, 4, 1, 8, 1, 8>(
     int32_t* out, int32_t* src, void* stream);
-template void LaunchTTRANSGroupConv<float, 0, 2, 5, 2, 4, 16, 16, 1, 1, 2, 5, 30, 4, 16>(
-    float* out, float* src, void* stream);
 template void LaunchTTRANSGroupConv<aclFloat16, 0, 1, 1, 2, 2, 16, 16, 1, 1, 1, 1, 30, 2, 16>(
     aclFloat16* out, aclFloat16* src, void* stream);
 template void LaunchTTRANSGroupConv<float, 0, 2, 1, 8, 6, 12, 4, 1, 1, 2, 1, 32, 6, 12>(
@@ -367,7 +352,3 @@ template void LaunchTTRANSGroupConv<float, 1, 2, 2, 2, 16, 2, 2, 4, 2, 3, 2, 2, 
     float* out, float* src, void* stream);
 template void LaunchTTRANSGroupConv<float, 1, 2, 2, 2, 16, 2, 2, 4, 2, 4, 2, 2, 16, 4>(
     float* out, float* src, void* stream);
-template void LaunchTTRANSGroupConv<aclFloat16, 1, 1, 2, 1, 8, 1, 16, 16, 1, 7, 2, 1, 8, 16>(
-    aclFloat16* out, aclFloat16* src, void* stream);
-template void LaunchTTRANSGroupConv<aclFloat16, 1, 4, 2, 1, 8, 1, 16, 4, 4, 7, 2, 1, 8, 4>(
-    aclFloat16* out, aclFloat16* src, void* stream);

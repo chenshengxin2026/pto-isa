@@ -132,7 +132,7 @@ PTO_INST RecordEvent TINSERT(DstTileData &dst, SrcTileData &src,
     - `float` Acc → `int8_t`
     - `int32_t` Acc → `int8_t`, `uint8_t`, `half`, `int16_t`
 - **Vector-quant** (`TINSERT_FP`) supported dtype pairs:
-    - `float` Acc → `int8_t`, `uint8_t`
+    - `float` Acc → `int8_t`
     - `int32_t` Acc → `int8_t`, `uint8_t`, `half`, `int16_t`
 - Vector-quant requires an `FpTileData` scaling operand (`TileType::Scaling`).
 

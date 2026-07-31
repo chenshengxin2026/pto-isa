@@ -7,7 +7,6 @@ THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, E
 INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 See LICENSE in the root of the software repository for the full text of the License.
 */
-
 #ifndef PTO_MOCKER_TRACE_HPP
 #define PTO_MOCKER_TRACE_HPP
 
@@ -20,6 +19,11 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3101 || __NPU_ARCH__ == 3510)
+#include "pto/costmodel/a5/cce_costmodel/vf_info.hpp"
+#include "pto/costmodel/a5/cce_costmodel/vf_cost.hpp"
+#endif
 
 #include <pto/costmodel/arch_config.hpp>
 
@@ -45,6 +49,9 @@ struct PtoInstrRecord {
     std::string name;
     std::vector<CceCallRecord> cce_calls;
     uint64_t total_cycles = 0;
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3101 || __NPU_ARCH__ == 3510)
+    std::vector<vf::VfInfo> vf_infos;
+#endif
 };
 
 struct TraceState {
@@ -157,7 +164,6 @@ inline void FlushAllPendingTails()
 
 // Flush all pipes EXCEPT VECTOR. Used at PTO-instruction boundaries so the vector pipe queue
 // persists across consecutive vec instructions (only the first op of a stream pays the startup
-// latency — see EstimateLinearCycles). Non-vector pipes keep their per-instruction tail flush.
 inline void FlushAllPendingTailsExceptVector()
 {
     for (std::size_t i = 0; i < kPipeKeyCount; ++i) {
@@ -201,7 +207,13 @@ inline void EndPtoInstr()
     auto& stack = g_trace_state.active_pto_stack;
     if (!stack.empty()) {
         if (stack.size() == 1) {
-            FlushAllPendingTails();
+            FlushAllPendingTailsExceptVector();
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3101 || __NPU_ARCH__ == 3510)
+            auto& pto = g_trace_state.executed_pto[stack.back()];
+            if (!pto.vf_infos.empty()) {
+                pto.total_cycles += vf::PredictVfCycles(pto.vf_infos);
+            }
+#endif
         }
         stack.pop_back();
     }
@@ -252,10 +264,21 @@ class PtoInstrScope {
 public:
     explicit PtoInstrScope(std::string_view name) { BeginPtoInstr(name); }
 
-    ~PtoInstrScope() { EndPtoInstr(); }
+    ~PtoInstrScope() { Finish(); }
+
+    void Finish()
+    {
+        if (!finished_) {
+            EndPtoInstr();
+            finished_ = true;
+        }
+    }
 
     PtoInstrScope(const PtoInstrScope&) = delete;
     PtoInstrScope& operator=(const PtoInstrScope&) = delete;
+
+private:
+    bool finished_ = false;
 };
 
 } // namespace pto::mocker

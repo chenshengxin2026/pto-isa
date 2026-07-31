@@ -53,8 +53,8 @@ PTO_INST RecordEvent TRECIP(TileDataDst &dst, TileDataSrc &src, WaitEvents &... 
 ## 约束
 
 - **实现检查 (NPU)**:
-    - `TileData::DType` 必须是以下之一：`float` 或 `half`。
-    - Tile位置必须是向量（`TileData::Loc == TileType::Vec`);
+    - `TileData::DType` 必须是以下之一：`float`、`half`、`int32_t`、`int16_t`（实现委托给 `TDIVS(dst, 1, src)`，也放行整型 `1/x`）。
+    - Tile位置必须是向量（`TileData::Loc == TileType::Vec`）;
     - 静态有效边界：`TileData::ValidRow <= TileData::Rows` 且 `TileData::ValidCol <= TileData::Cols`。
     - 运行时：`src.GetValidRow() == dst.GetValidRow()` 且 `src.GetValidCol() == dst.GetValidCol()`。
     - Tile布局必须是行主序（`TileData::isRowMajor`）。

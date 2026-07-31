@@ -96,3 +96,35 @@ template void launchTCVT<int8_t, aclFloat16, 32, 32, 32, 32, pto::SaturationMode
     int8_t* dst, aclFloat16* src, void* stream);
 template void launchTCVT<uint8_t, aclFloat16, 64, 64, 64, 64, pto::SaturationMode::ON>(
     uint8_t* dst, aclFloat16* src, void* stream);
+template void launchTCVT<uint16_t, float, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    uint16_t* dst, float* src, void* stream);
+template void launchTCVT<float, uint16_t, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float* dst, uint16_t* src, void* stream);
+template void launchTCVT<uint16_t, int32_t, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    uint16_t* dst, int32_t* src, void* stream);
+template void launchTCVT<int32_t, uint16_t, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    int32_t* dst, uint16_t* src, void* stream);
+template void launchTCVT<int4b_t, float, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    int4b_t* dst, float* src, void* stream);
+template void launchTCVT<float, int4b_t, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float* dst, int4b_t* src, void* stream);
+template void launchTCVT<int4b_t, float, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    int4b_t* dst, float* src, void* stream);
+template void launchTCVT<float, int4b_t, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    float* dst, int4b_t* src, void* stream);
+template void launchTCVT<float4_e2m1x2_t, float, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float4_e2m1x2_t* dst, float* src, void* stream);
+template void launchTCVT<float, float4_e2m1x2_t, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float* dst, float4_e2m1x2_t* src, void* stream);
+template void launchTCVT<float4_e2m1x2_t, float, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    float4_e2m1x2_t* dst, float* src, void* stream);
+template void launchTCVT<float, float4_e2m1x2_t, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    float* dst, float4_e2m1x2_t* src, void* stream);
+template void launchTCVT<float4_e1m2x2_t, float, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float4_e1m2x2_t* dst, float* src, void* stream);
+template void launchTCVT<float, float4_e1m2x2_t, 64, 64, 64, 64, pto::SaturationMode::OFF>(
+    float* dst, float4_e1m2x2_t* src, void* stream);
+template void launchTCVT<float4_e1m2x2_t, float, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    float4_e1m2x2_t* dst, float* src, void* stream);
+template void launchTCVT<float, float4_e1m2x2_t, 64, 64, 64, 64, pto::SaturationMode::ON>(
+    float* dst, float4_e1m2x2_t* src, void* stream);

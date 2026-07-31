@@ -61,7 +61,7 @@ PTO_INST RecordEvent TROWARGMAX(TileDataOutVal &dstVal, TileDataOutIdx &dstIdx, 
 
 ### General constraints / checks
 
-- Supported source element types: `half`, `float`.
+- Supported source element types: `half`, `float`, `int32_t`, `int16_t` (A2A3). On A5 any 2-/4-byte source is accepted (`half`, `bfloat16_t`, `int16_t`, `uint16_t`, `float`, `int32_t`, `uint32_t`).
 - `src` must use standard ND layout: row-major and non-fractal (`BLayout::RowMajor`, `SLayout::NoneBox`).
 - When output index only:
     - `dst` and `src` must be `TileType::Vec`.

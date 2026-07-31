@@ -66,7 +66,7 @@ PTO_INTERNAL bool TGetAsyncCheckTensorCompatibility()
 
 template <typename GlobalDstData, typename GlobalSrcData>
 PTO_INTERNAL AsyncEvent
-TGET_ASYNC_SDMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const sdma::SdmaExecContext& execCtx)
+TGET_ASYNC_SDMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
 {
     (void)TGetAsyncCheckTensorCompatibility<GlobalDstData, GlobalSrcData>();
 
@@ -89,7 +89,7 @@ TGET_ASYNC_SDMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData,
 
     using T = typename GlobalSrcData::RawDType;
     const uint64_t eventHandle =
-        sdma::__sdma_get_async(dstGlobalData.data(), srcGlobalData.data(), srcElems * sizeof(T), execCtx);
+        sdma::__sdma_get_async(dstGlobalData.data(), srcGlobalData.data(), srcElems * sizeof(T), session);
     return AsyncEvent(eventHandle, DmaEngine::SDMA);
 }
 

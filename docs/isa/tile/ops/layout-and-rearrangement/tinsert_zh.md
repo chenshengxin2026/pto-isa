@@ -132,7 +132,7 @@ PTO_INST RecordEvent TINSERT(DstTileData &dst, SrcTileData &src,
     - `float` Acc → `int8_t`
     - `int32_t` Acc → `int8_t`、`uint8_t`、`half`、`int16_t`
 - **向量量化**（`TINSERT_FP`）支持的dtype对：
-    - `float` Acc → `int8_t`、`uint8_t`
+    - `float` Acc → `int8_t`
     - `int32_t` Acc → `int8_t`、`uint8_t`、`half`、`int16_t`
 - 向量量化要求提供 `FpTileData` 缩放操作数（`TileType::Scaling`）。
 

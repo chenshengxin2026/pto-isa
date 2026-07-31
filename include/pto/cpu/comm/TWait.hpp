@@ -16,7 +16,13 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 #include "pto/comm/comm_types.hpp"
 
 namespace pto {
@@ -42,6 +48,51 @@ inline bool CompareSignalRuntime(int32_t sigVal, int32_t cmpVal, comm::WaitCmp c
             return false;
     }
 }
+
+inline uint32_t ReadTwaitMaxSpin()
+{
+    // A zero value disables the CPU-SIM wait timeout.
+    constexpr uint32_t kDefaultMaxSpinCount = 100000;
+    const char* value = std::getenv("PTO_CPU_SIM_TWAIT_MAX_SPINS");
+    if (value == nullptr || *value == '\0') {
+        return kDefaultMaxSpinCount;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return kDefaultMaxSpinCount;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+inline bool IsDecodeLayerCallerAddress(void* address)
+{
+#if defined(__linux__)
+    Dl_info info{};
+    if (address != nullptr && dladdr(address, &info) != 0 && info.dli_fname != nullptr) {
+        return std::strstr(info.dli_fname, "_jit_l3_decode_layer_") != nullptr;
+    }
+#else
+    (void)address;
+#endif
+    return false;
+}
+
+inline bool UseProgressAwareTwait()
+{
+#if defined(__linux__)
+    void* callStack[8] = {};
+    const int frameCount = backtrace(callStack, static_cast<int>(sizeof(callStack) / sizeof(callStack[0])));
+    for (int i = 0; i < frameCount; ++i) {
+        if (IsDecodeLayerCallerAddress(callStack[i])) {
+            return true;
+        }
+    }
+#else
+    return false;
+#endif
+    return false;
+}
 } // namespace detail
 
 template <typename GlobalSignalData>
@@ -62,15 +113,20 @@ inline void TWAIT_IMPL(GlobalSignalData& signalData, int32_t cmpValue, comm::Wai
     const int total = s0 * s1 * s2 * s3 * s4;
     PTO_ASSERT(
         s0 > 0 && s1 > 0 && s2 > 0 && s3 > 0 && s4 > 0,
-        "TWAIT: possible deadlock detected, spin count exceeded maximum limit");
+        "TWAIT: invalid signal data shape, all dimensions must be positive.");
 
     bool allSatisfied = false;
     uint32_t spin = 0;
+    uint32_t stagnantSpin = 0;
+    bool hasObservedSignal = false;
+    int64_t lastObservedSignal = 0;
     constexpr uint32_t kSleepMicroseconds = 10;
-    constexpr uint32_t kMaxSpinCount = 100000000;
+    const uint32_t maxSpinCount = detail::ReadTwaitMaxSpin();
+    const bool progressAware = detail::UseProgressAwareTwait();
     while (!allSatisfied) {
         allSatisfied = true;
-        for (int flat = 0; flat < total && allSatisfied; ++flat) {
+        int64_t observedSignal = 0;
+        for (int flat = 0; flat < total; ++flat) {
             int tmp = flat;
             const int d4 = tmp % s4;
             tmp /= s4;
@@ -83,14 +139,30 @@ inline void TWAIT_IMPL(GlobalSignalData& signalData, int32_t cmpValue, comm::Wai
             const int d0 = tmp;
             const int64_t idx = d0 * st0 + d1 * st1 + d2 * st2 + d3 * st3 + d4 * st4;
             int32_t val = reinterpret_cast<std::atomic<int32_t>*>(basePtr + idx)->load(std::memory_order_acquire);
+            observedSignal += val;
             if (!detail::CompareSignalRuntime(val, cmpValue, cmp)) {
                 allSatisfied = false;
             }
         }
         if (!allSatisfied) {
-            PTO_ASSERT(spin < kMaxSpinCount, "TWAIT: possible deadlock detected, spin count exceeded maximum limit");
+            if (progressAware) {
+                if (!hasObservedSignal || observedSignal != lastObservedSignal) {
+                    hasObservedSignal = true;
+                    lastObservedSignal = observedSignal;
+                    stagnantSpin = 0;
+                } else {
+                    ++stagnantSpin;
+                }
+                if (maxSpinCount > 0 && stagnantSpin >= maxSpinCount) {
+                    return;
+                }
+            } else {
+                if (maxSpinCount > 0 && spin >= maxSpinCount) {
+                    return;
+                }
+                ++spin;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(kSleepMicroseconds));
-            ++spin;
         }
     }
 }

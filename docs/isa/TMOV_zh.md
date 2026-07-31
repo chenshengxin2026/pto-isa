@@ -157,7 +157,7 @@ PTO_INST RecordEvent TMOV(DstTileData &dst, SrcTileData &src, TmpTileData &tmp, 
     - 源行数必须为 `1`
     - `SrcTileData::Cols * sizeof(SrcType)` 必须64字节对齐
 - 对于 `TileType::Mat -> TileType::Scaling`：
-    - 目标dtype须等于源dtype且为 `uint64_t`
+    - 目标dtype须等于源dtype且为 `uint64_t` 或 `int64_t`
     - 源行数必须为 `1`
     - `SrcTileData::Cols * sizeof(SrcType)` 必须128字节对齐
 - 对于 `TileType::Acc -> TileType::Mat`：
@@ -165,6 +165,7 @@ PTO_INST RecordEvent TMOV(DstTileData &dst, SrcTileData &src, TmpTileData &tmp, 
     - 纯/relu形式使用由 `GetCastPreQuantMode<SrcDType, DstDType>()` 推导的类型转换前量化模式
     - 标量量化形式使用 `GetScalarPreQuantMode<SrcDType, DstDType>()`
     - 向量量化形式要求 `FpTileData` 操作数 `FpTileData::Loc == TileType::Scaling`，使用 `GetVectorPreQuantMode<SrcDType, DstDType>()`
+    - 不支持channel split
 
 ### Ascend 950PR/Ascend 950DT实现检查
 

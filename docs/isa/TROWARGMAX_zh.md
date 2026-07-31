@@ -23,6 +23,7 @@ $$ \mathrm{dstval}_{i,0} = \max_{0 \le j < C} \mathrm{src}_{i,j} $$
 ```text
 %dst = trowargmax %src : !pto.tile<...> -> !pto.tile<...>
 ```
+
 Lowering may introduce internal scratch tiles; the C++ intrinsic requires an explicit `tmp` operand.
 
 ### IR Level 1（SSA）
@@ -39,7 +40,7 @@ pto.trowargmax ins(%src, %tmp : !pto.tile_buf<...>, !pto.tile_buf<...>) outs(%ds
 
 ## C++内建接口
 
-声明于 `include/pto/common/pto_instr.hpp`:
+声明于 `include/pto/common/pto_instr.hpp`：
 > 公共包含头为 `<pto/pto-inst.hpp>`，内部声明位于 `pto/common/pto_instr.hpp`。
 
 仅输出索引：
@@ -62,7 +63,7 @@ PTO_INST RecordEvent TROWARGMAX(TileDataOutVal &dstVal, TileDataOutIdx &dstIdx, 
 
 ### 通用约束或检查
 
-- 支持的源元素类型：`half`、`float`。
+- 支持的源元素类型：`half`、`float`、`int32_t`、`int16_t`（A2A3）。A5 接受任意 2/4 字节源（`half`、`bfloat16_t`、`int16_t`、`uint16_t`、`float`、`int32_t`、`uint32_t`）。
 - `src` 必须使用标准ND布局：行主且非分形（`BLayout::RowMajor`、`SLayout::NoneBox`）。
 - 仅输出索引时：
     - `dst` 和 `src` 必须为 `TileType::Vec`。
@@ -127,7 +128,6 @@ stride = max(stage1_size, stage2_end) + 2
 ```
 
 - `+ 2` 用于存放每行tmp区域末尾的最终值+索引结果。
-
 
 ## 示例
 

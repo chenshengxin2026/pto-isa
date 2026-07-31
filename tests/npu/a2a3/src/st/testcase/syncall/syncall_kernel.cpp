@@ -15,7 +15,6 @@ using namespace pto;
 
 PTO_SYNCALL_AIV_KERNEL_META(RunSyncAll_mix_aiv);
 
-constexpr int32_t kBlockCount = 48;
 constexpr int32_t kInt32PerCacheLine = 8;
 constexpr uint64_t kFlagUbAddr = 0x0;
 constexpr uint64_t kReadUbAddr = 0x1000;
@@ -45,7 +44,7 @@ extern "C" __global__ AICORE void RunSyncAll_mix_aiv(
     pipe_barrier(PIPE_ALL);
 
     int32_t allVisible = 1;
-    for (int32_t i = 0; i < kBlockCount; ++i) {
+    for (int32_t i = 0; i < totalBlocks; ++i) {
         if (readUb[i * kInt32PerCacheLine] != i + 1) {
             allVisible = 0;
         }

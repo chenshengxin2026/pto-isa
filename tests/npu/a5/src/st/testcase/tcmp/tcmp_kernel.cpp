@@ -96,3 +96,5 @@ template void LaunchTCmp<aclFloat16, 32, 32, 16, 32, CmpMode::EQ, true>(
     uint8_t* out, aclFloat16* src0, aclFloat16* src1, void* stream);
 template void LaunchTCmp<aclFloat16, 77, 80, 32, 32, CmpMode::LE, true>(
     uint8_t* out, aclFloat16* src0, aclFloat16* src1, void* stream);
+template void LaunchTCmp<float, 32, 32, 32, 32, CmpMode::NE, false>(
+    uint8_t* out, float* src0, float* src1, void* stream);

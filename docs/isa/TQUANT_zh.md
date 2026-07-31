@@ -110,6 +110,7 @@ PTO_INST RecordEvent TQUANT(TileDataOut &dst, TileDataSrc &src, TileDataPara &sc
 ### MXFP4（e2m1）
 
 同MXFP8，但：
+
 | Tile | dtype | 字节数 |
 |------|-------|--------|
 | `dst` | `float4_e2m1x2_t`（每字节打包2个e2m1） | $M \cdot N / 2$ |
@@ -157,9 +158,11 @@ DN数据的FP8 mantissa与ND共享相同的物理地址（`(r,c)` 元素完全�
 
 | 格式 | 可接受输入dtype | 说明 |
 |------|-----------------|------|
-| MXFP8 | FP32、BF16、FP16 | FP32：原地FP8输出（4:1）。BF16/FP16：源零填充至 `StaticCols`；类型转换前先上转为FP32（无直接b16→e4m3）。 |
-| MXFP4（e2m1） | **仅FP16、BF16**（不支持FP32） | 输出 `float4_e2m1x2_t`（打包）。 |
+| MXFP8（仅 A5） | FP32、BF16、FP16 | FP32：原地FP8输出（4:1）。BF16/FP16：源零填充至 `StaticCols`；类型转换前先上转为FP32（无直接b16→e4m3）。 |
+| MXFP4（e2m1）（仅 A5） | **仅FP16、BF16**（不支持FP32） | 输出 `float4_e2m1x2_t`（打包）。 |
 | INT8（sym/asym） | **仅FP32** | SYM→`int8_t`，ASYM→`uint8_t`。Atlas A2/A3 训练系列产品/Atlas A2/A3 推理系列产品需 `tmp` = src尺寸。 |
+
+> 微缩（MXFP8/MXFP4）**仅在 A5 上支持**；A2/A3 仅支持 **INT8** 路径（FP32 输入）。
 
 ## 数学语义
 

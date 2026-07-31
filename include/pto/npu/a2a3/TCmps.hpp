@@ -25,9 +25,6 @@ AICORE void vcmp_dispatch(
     uint16_t b_src, uint16_t r_dst, uint16_t r_src)
 {
     switch (mode) {
-        case CmpMode::NE:
-            vcmpvs_ne(dst, src0, scalar, rep, b_dst, b_src, r_dst, r_src);
-            break;
         case CmpMode::LT:
             vcmpvs_lt(dst, src0, scalar, rep, b_dst, b_src, r_dst, r_src);
             break;
@@ -41,6 +38,7 @@ AICORE void vcmp_dispatch(
             vcmpvs_le(dst, src0, scalar, rep, b_dst, b_src, r_dst, r_src);
             break;
         case CmpMode::EQ:
+        case CmpMode::NE:
         default:
             vcmpvs_eq(dst, src0, scalar, rep, b_dst, b_src, r_dst, r_src);
             break;
@@ -98,6 +96,16 @@ AICORE void TCmps(
                 dst + i * dstAlignCols + nLoop * dstOffset, src0 + i * srcAlignCols + nLoop * srcOffset, src1Value,
                 mode, remainPerLine, 1, 1, 8, 8);
         }
+    }
+    if (mode == CmpMode::NE) {
+        pipe_barrier(PIPE_V);
+        set_mask_count();
+        SetVectorCount(validRow * dstAlignCols / sizeof(unsigned short));
+        vnot(
+            (__ubuf__ unsigned short*)dst, (__ubuf__ unsigned short*)dst, 0, 1, 1, BLOCK_MAX_PER_REPEAT,
+            BLOCK_MAX_PER_REPEAT);
+        set_mask_norm();
+        set_vector_mask(-1, -1);
     }
 }
 

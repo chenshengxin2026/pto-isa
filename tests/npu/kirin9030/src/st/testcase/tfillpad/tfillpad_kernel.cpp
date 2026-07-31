@@ -53,9 +53,9 @@ AICORE void runTFILLPAD(__gm__ T* out, __gm__ T* src)
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
     if constexpr (expand) {
-        TFILLPAD_EXPAND(dstTile, srcTile);
+        TFILLPAD<TFillPadMode::Expand>(dstTile, srcTile);
     } else if (inplace) {
-        TFILLPAD_INPLACE(dstTile, srcTile);
+        TFILLPAD<TFillPadMode::InPlace>(dstTile, srcTile);
     } else {
         TFILLPAD(dstTile, srcTile);
     }

@@ -20,23 +20,21 @@ constexpr int32_t kInt32PerCacheLine = 8;
 constexpr uint64_t kMixFlagUbAddr = 0x0;
 constexpr uint64_t kMixReadUbAddr = 0x1000;
 constexpr uint64_t kMixOutUbAddr = 0x2000;
-constexpr uint64_t kMixSoftUbAddr = 0x3000;
 constexpr uint64_t kMixFlagL1Addr = 0x0;
 constexpr uint64_t kMixReadL1Addr = 0x1000;
 constexpr uint64_t kMixOutL1Addr = 0x2000;
-constexpr uint64_t kMixSoftL1Addr = 0x3000;
 
-PTO_INTERNAL int32_t GetMixLogicalIdx()
+// aicBlocks is the physical cube count, decided at runtime (910B1=24, 910B4=20).
+// - Cube core: logical idx == cube block index.
+// - Vector core: idx == aicBlocks + local vector index. The local index formula works
+//   both for mix-paired launches (subblockdim == ratio) and standalone vector launches
+//   (subblockdim == 1), which is why the same expression covers hard and soft paths.
+PTO_INTERNAL int32_t GetMixLogicalIdx(int32_t aicBlocks)
 {
 #if defined(__DAV_VEC__)
-    constexpr int32_t aicBlocks =
-#if defined(__MIX_CORE_AIC_BLOCKS__)
-        __MIX_CORE_AIC_BLOCKS__;
-#else
-        24;
-#endif
     return static_cast<int32_t>(aicBlocks + get_block_idx() * get_subblockdim() + get_subblockid());
 #else
+    (void)aicBlocks;
     return static_cast<int32_t>(get_block_idx());
 #endif
 }
@@ -125,33 +123,21 @@ PTO_INTERNAL void RunMixSyncAllBody(
 {
     set_ffts_base_addr(reinterpret_cast<uint64_t>(fftsAddr));
 
-    const int32_t idx = GetMixLogicalIdx();
+    const int32_t idx = GetMixLogicalIdx(aicBlocks);
     StoreMixInt32Line(flags + idx * kInt32PerCacheLine, idx + 1, kMixFlagUbAddr, kMixFlagL1Addr);
 
     if constexpr (UseSoft) {
         GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(syncWorkspace);
-        Tile<TileType::Vec, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncUbTile;
-        Tile<TileType::Mat, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncL1Tile;
-#ifndef __PTO_AUTO__
-        syncUbTile.data() = reinterpret_cast<__ubuf__ int32_t*>(kMixSoftUbAddr);
-        syncL1Tile.data() = reinterpret_cast<__cbuf__ int32_t*>(kMixSoftL1Addr);
-#endif
-        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, syncUbTile, syncL1Tile, TotalParticipants);
+        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, totalParticipants);
     } else {
         SYNCALL<SyncCoreType::Mix>();
     }
 
-    const int32_t allFirstVisible = CheckMixFlags(flags, TotalParticipants, kMixReadUbAddr, kMixReadL1Addr, 1);
+    const int32_t allFirstVisible = CheckMixFlags(flags, totalParticipants, kMixReadUbAddr, kMixReadL1Addr, 1);
 
     if constexpr (UseSoft) {
         GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(syncWorkspace);
-        Tile<TileType::Vec, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncUbTile;
-        Tile<TileType::Mat, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncL1Tile;
-#ifndef __PTO_AUTO__
-        syncUbTile.data() = reinterpret_cast<__ubuf__ int32_t*>(kMixSoftUbAddr);
-        syncL1Tile.data() = reinterpret_cast<__cbuf__ int32_t*>(kMixSoftL1Addr);
-#endif
-        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, syncUbTile, syncL1Tile, TotalParticipants);
+        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, totalParticipants);
     } else {
         SYNCALL<SyncCoreType::Mix>();
     }
@@ -160,18 +146,12 @@ PTO_INTERNAL void RunMixSyncAllBody(
 
     if constexpr (UseSoft) {
         GlobalTensor<int32_t, pto::Shape<>, pto::Stride<>> gmWs(syncWorkspace);
-        Tile<TileType::Vec, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncUbTile;
-        Tile<TileType::Mat, int32_t, 1, SYNCALL_SOFT_SLOT_INT32> syncL1Tile;
-#ifndef __PTO_AUTO__
-        syncUbTile.data() = reinterpret_cast<__ubuf__ int32_t*>(kMixSoftUbAddr);
-        syncL1Tile.data() = reinterpret_cast<__cbuf__ int32_t*>(kMixSoftL1Addr);
-#endif
-        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, syncUbTile, syncL1Tile, TotalParticipants);
+        SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>(gmWs, totalParticipants);
     } else {
         SYNCALL<SyncCoreType::Mix>();
     }
 
-    const int32_t allSecondVisible = CheckMixFlags(flags, TotalParticipants, kMixReadUbAddr, kMixReadL1Addr, 2);
+    const int32_t allSecondVisible = CheckMixFlags(flags, totalParticipants, kMixReadUbAddr, kMixReadL1Addr, 2);
     StoreMixInt32Line(out + idx * kInt32PerCacheLine, allFirstVisible & allSecondVisible, kMixOutUbAddr, kMixOutL1Addr);
 }
 

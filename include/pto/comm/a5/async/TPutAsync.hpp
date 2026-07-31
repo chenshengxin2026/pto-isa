@@ -30,8 +30,8 @@ namespace detail {
 // ============================================================================
 
 template <typename GlobalDstData, typename GlobalSrcData>
-PTO_INTERNAL AsyncEvent TPUT_ASYNC_MTE_FALLBACK(
-    GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const sdma::SdmaExecContext& execCtx)
+PTO_INTERNAL AsyncEvent
+TPUT_ASYNC_MTE_FALLBACK(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
 {
     (void)TPutAsyncCheckTensorCompatibility<GlobalDstData, GlobalSrcData>();
 
@@ -58,8 +58,8 @@ PTO_INTERNAL AsyncEvent TPUT_ASYNC_MTE_FALLBACK(
         return AsyncEvent(0, DmaEngine::SDMA);
     }
 
-    __ubuf__ uint8_t* ubBuf = execCtx.tmpBuf.addr;
-    const uint32_t ubSize = execCtx.tmpBuf.size;
+    __ubuf__ uint8_t* ubBuf = session.tmpBufAddr;
+    const uint32_t ubSize = session.tmpBufSize;
     PTO_ASSERT(ubBuf != nullptr && ubSize > 0, "TPUT_ASYNC MTE fallback: tmpBuf is invalid");
 
     __gm__ uint8_t* srcPtr = reinterpret_cast<__gm__ uint8_t*>(srcGlobalData.data());
@@ -73,14 +73,14 @@ PTO_INTERNAL AsyncEvent TPUT_ASYNC_MTE_FALLBACK(
         copy_gm_to_ubuf_align_v2(
             reinterpret_cast<__ubuf__ uint8_t*>(ubBuf), reinterpret_cast<__gm__ uint8_t*>(srcPtr + offset), 0, 1,
             chunkBytes, 0, 0, false, 0, chunkBytes, chunkBytes);
-        set_flag(PIPE_MTE2, PIPE_MTE3, execCtx.syncId);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, execCtx.syncId);
+        set_flag(PIPE_MTE2, PIPE_MTE3, session.syncId);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, session.syncId);
 
         copy_ubuf_to_gm_align_v2(
             reinterpret_cast<__gm__ uint8_t*>(dstPtr + offset), reinterpret_cast<__ubuf__ uint8_t*>(ubBuf), 0, 1,
             chunkBytes, 0, chunkBytes, chunkBytes);
-        set_flag(PIPE_MTE3, PIPE_MTE2, execCtx.syncId);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, execCtx.syncId);
+        set_flag(PIPE_MTE3, PIPE_MTE2, session.syncId);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, session.syncId);
 
         offset += chunkBytes;
     }
@@ -90,8 +90,8 @@ PTO_INTERNAL AsyncEvent TPUT_ASYNC_MTE_FALLBACK(
 
 #ifdef PTO_URMA_SUPPORTED
 template <typename GlobalDstData, typename GlobalSrcData>
-PTO_INTERNAL AsyncEvent
-TPUT_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const urma::UrmaExecContext& execCtx)
+PTO_INTERNAL AsyncEvent TPUT_ASYNC_URMA_IMPL(
+    GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer)
 {
     (void)TPutAsyncCheckTensorCompatibility<GlobalDstData, GlobalSrcData>();
 
@@ -116,8 +116,15 @@ TPUT_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData,
 
     const uint64_t eventHandle = urma::__urma_put_async(
         reinterpret_cast<__gm__ uint8_t*>(dstGlobalData.data()),
-        reinterpret_cast<__gm__ uint8_t*>(srcGlobalData.data()), transferSize, execCtx);
+        reinterpret_cast<__gm__ uint8_t*>(srcGlobalData.data()), transferSize, session, peer);
     return AsyncEvent(eventHandle, DmaEngine::URMA);
+}
+
+template <typename GlobalDstData, typename GlobalSrcData>
+PTO_INTERNAL AsyncEvent
+TPUT_ASYNC_URMA_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
+{
+    return TPUT_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session, session.destRankId);
 }
 #endif
 
@@ -133,10 +140,30 @@ PTO_INTERNAL AsyncEvent
 TPUT_ASYNC_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session)
 {
     if constexpr (engine == DmaEngine::SDMA) {
-        return detail::TPUT_ASYNC_MTE_FALLBACK(dstGlobalData, srcGlobalData, session.sdmaSession.execCtx);
+        return detail::TPUT_ASYNC_MTE_FALLBACK(dstGlobalData, srcGlobalData, session);
     } else if constexpr (engine == DmaEngine::URMA) {
 #ifdef PTO_URMA_SUPPORTED
-        return detail::TPUT_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session.urmaSession.execCtx);
+        return detail::TPUT_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session);
+#else
+        static_assert(engine != DmaEngine::URMA, "TPUT_ASYNC: URMA engine requires NPU_ARCH 3510");
+        return AsyncEvent(0, engine);
+#endif
+    } else {
+        PTO_ASSERT(false, "TPUT_ASYNC: unsupported engine");
+        return AsyncEvent(0, engine);
+    }
+}
+
+// peer overload: URMA uses peer for SQ/CQ/MemInfo; SDMA ignores peer.
+template <DmaEngine engine = DmaEngine::SDMA, typename GlobalDstData, typename GlobalSrcData>
+PTO_INTERNAL AsyncEvent
+TPUT_ASYNC_IMPL(GlobalDstData& dstGlobalData, GlobalSrcData& srcGlobalData, const AsyncSession& session, uint32_t peer)
+{
+    if constexpr (engine == DmaEngine::SDMA) {
+        return detail::TPUT_ASYNC_MTE_FALLBACK(dstGlobalData, srcGlobalData, session);
+    } else if constexpr (engine == DmaEngine::URMA) {
+#ifdef PTO_URMA_SUPPORTED
+        return detail::TPUT_ASYNC_URMA_IMPL(dstGlobalData, srcGlobalData, session, peer);
 #else
         static_assert(engine != DmaEngine::URMA, "TPUT_ASYNC: URMA engine requires NPU_ARCH 3510");
         return AsyncEvent(0, engine);

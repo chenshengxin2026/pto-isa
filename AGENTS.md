@@ -19,8 +19,13 @@ python3 tests/script/build_st.py -r npu -v a3 -t all
 # One-click build and run scripts
 ./build.sh --run_all --a3 --sim    # Full ST tests on simulator
 ./build.sh --run_simple --a5 --npu # Simplified ST tests on hardware
-./build.sh --pkg                    # Build package
+./build.sh --pkg                    # Build package (default: makeself .run)
+./build.sh --pkg --pkg-type=rpm     # Build RPM package
+./build.sh --pkg --pkg-type=deb     # Build DEB package
 ```
+
+RPM/DEB packages install to `/usr/local/Ascend/cann-<version>` (e.g.
+`/usr/local/Ascend/cann-9.1.0`). Building RPM requires `rpmbuild` on PATH.
 
 ### Running Single Tests
 ```bash

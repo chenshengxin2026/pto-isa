@@ -42,7 +42,9 @@ void TPushPopMatmulAddTestFunc(uint32_t M, uint32_t K, uint32_t N)
     size_t bFileSize = K * N * sizeof(InT);
     size_t biasFileSize = M * N * sizeof(OutT);
     size_t cFileSize = M * N * sizeof(OutT);
-    size_t fifoFileSize = 2 * 16 * 32 * sizeof(OutT);
+    // Slot holds one Acc tile [CASE_TILE_M, CASE_TILE_N]; CASE_TILE_M=16, N may be odd (pad to 16).
+    uint32_t fifoN = (N + 15u) / 16u * 16u;
+    size_t fifoFileSize = 2 * 16 * fifoN * sizeof(OutT);
 
     aclInit(nullptr);
     aclrtSetDevice(0);
@@ -127,4 +129,13 @@ TEST_F(TPushPopCVTest, case7_float_single_tile_left_right) { TPushPopMatmulAddTe
 TEST_F(TPushPopCVTest, case8_half_multi_tile_wrapping_left_right)
 {
     TPushPopMatmulAddTestFunc<aclFloat16, float, 8>(64, 32, 32);
+}
+
+// Partial-valid TILE_UP_DOWN: Acc tile [16,128]/valid [5,128]; vec0 valid [3,128], vec1 valid [2,128]
+TEST_F(TPushPopCVTest, case13_float_partial_valid_up_down) { TPushPopMatmulAddTestFunc<float, float, 13>(5, 32, 128); }
+
+// Partial-valid TILE_LEFT_RIGHT_ODD: Acc [16,128]/valid [5,127]; vec0 valid [5,64], vec1 valid [5,63]
+TEST_F(TPushPopCVTest, case14_float_partial_valid_left_right)
+{
+    TPushPopMatmulAddTestFunc<float, float, 14>(5, 32, 127);
 }

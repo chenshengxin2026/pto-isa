@@ -31,7 +31,6 @@ PTO_INTERNAL void TStoreInstrL12Gm(
 
     for (uint16_t i = 0; i < nBurst; i++) {
         for (size_t j = 0; j < lenBurst * elemNum; j++) {
-            // Write from buffer (src) to GM (dst)
             SetProperDataPart(dst, dstStride * i + j, src[srcStride * i + j]);
         }
     }
@@ -46,7 +45,7 @@ PTO_INTERNAL void TStore5HD(
     uint16_t nBurst = srcH;
     uint16_t lenBurst = srcW;
 
-    // In TStore, the "Gap" is how much we skip in GM to place the next row
+    // GM gap is encoded in 32-byte blocks between stored rows.
     uint16_t gmGap = ((gStrideH - srcW * c0ElemCount) * sizeof(typename TileData::DType)) >> SHIFT_BLOCK_BYTE;
     uint16_t l1Gap = 0;
 
@@ -77,10 +76,60 @@ PTO_INTERNAL void TStore6HD(
     }
 }
 
-template <typename GlobalData, typename TileData, QuantMode_t quantMode, bool applyRelu>
+template <
+    typename GlobalData, typename TileData, QuantMode_t quantMode, bool applyRelu,
+    AtomicType atomicType = AtomicType::AtomicNone>
+__tf__ PTO_INLINE void TStoreAcc(GlobalData& dst, TileData& src, const std::vector<uint64_t>& scalars)
+{
+    const size_t validRow = src.GetValidRow();
+    const size_t validCol = src.GetValidCol();
+
+    const size_t shape_0 = dst.GetShape(GlobalTensorDim::DIM_0);
+    const size_t shape_1 = dst.GetShape(GlobalTensorDim::DIM_1);
+    const size_t shape_2 = dst.GetShape(GlobalTensorDim::DIM_2);
+    const size_t shape_3 = dst.GetShape(GlobalTensorDim::DIM_3);
+    const size_t shape_4 = dst.GetShape(GlobalTensorDim::DIM_4);
+
+    const size_t stride_0 = dst.GetStride(GlobalTensorDim::DIM_0);
+    const size_t stride_1 = dst.GetStride(GlobalTensorDim::DIM_1);
+    const size_t stride_2 = dst.GetStride(GlobalTensorDim::DIM_2);
+    const size_t stride_3 = dst.GetStride(GlobalTensorDim::DIM_3);
+    const size_t stride_4 = dst.GetStride(GlobalTensorDim::DIM_4);
+
+    uint64_t scalar = 0;
+    for (int s0 = 0; s0 < shape_0; ++s0) {
+        for (int s2 = 0; s2 < shape_2; ++s2) {
+            for (int s3 = 0; s3 < shape_3; ++s3) {
+                size_t row = s0 * shape_2 * shape_3 + s2 * shape_3 + s3;
+                for (int s1 = 0; s1 < shape_1; ++s1) {
+                    for (int s4 = 0; s4 < shape_4; ++s4) {
+                        typename TileData::DType val;
+                        size_t col = s1 * shape_4 + s4;
+                        if (row < validRow && col < validCol) {
+                            if constexpr (quantMode != QuantMode_t::NoQuant) {
+                                scalar = scalars[TileData::isRowMajor ? col : row];
+                            }
+                            val = src.GetElement(row, col);
+                        }
+                        const auto converted = ConvertStoreValue<
+                            typename GlobalData::DType, typename TileData::DType, quantMode, applyRelu>(val, scalar);
+                        if constexpr (atomicType == AtomicType::AtomicAdd) {
+                            dst.AddToElement(s0, s1, s2, s3, s4, converted);
+                        } else {
+                            dst.SetElement(s0, s1, s2, s3, s4, converted);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <
+    typename GlobalData, typename TileData, QuantMode_t quantMode, bool applyRelu,
+    AtomicType atomicType = AtomicType::AtomicNone>
 __tf__ PTO_INLINE void StorePlainGT(GlobalData& dst, TileData& src, const std::vector<uint64_t>& scalars)
 {
-    uint64_t scalar = 0;
     for (int64_t i = 0; i < dst.GetShape(GlobalTensorDim::DIM_0); i++) {
         const int64_t tileHighRankOffset0 = i * dst.GetShape(GlobalTensorDim::DIM_1);
         for (int64_t j = 0; j < dst.GetShape(GlobalTensorDim::DIM_1); j++) {
@@ -105,15 +154,19 @@ __tf__ PTO_INLINE void StorePlainGT(GlobalData& dst, TileData& src, const std::v
                                 val = src.GetElement(r, tileHighRankOffset2 + c);
                             }
 
+                            uint64_t scalar = 0;
                             if constexpr (quantMode != QuantMode_t::NoQuant) {
                                 scalar = scalars[TileData::isRowMajor ? c : r];
                             }
 
-                            dst.SetElement(
-                                i, j, k, r, c,
-                                ConvertStoreValue<
-                                    typename GlobalData::DType, typename TileData::DType, quantMode, applyRelu>(
-                                    val, scalar));
+                            const auto converted = ConvertStoreValue<
+                                typename GlobalData::DType, typename TileData::DType, quantMode, applyRelu>(
+                                val, scalar);
+                            if constexpr (atomicType == AtomicType::AtomicAdd) {
+                                dst.AddToElement(i, j, k, r, c, converted);
+                            } else {
+                                dst.SetElement(i, j, k, r, c, converted);
+                            }
                         }
                     });
             }
@@ -121,7 +174,9 @@ __tf__ PTO_INLINE void StorePlainGT(GlobalData& dst, TileData& src, const std::v
     }
 }
 
-template <typename GlobalData, typename TileData, QuantMode_t quantMode, bool applyRelu>
+template <
+    typename GlobalData, typename TileData, QuantMode_t quantMode, bool applyRelu,
+    AtomicType atomicType = AtomicType::AtomicNone>
 __tf__ PTO_INLINE void TStore(GlobalData& dst, TileData& src, const std::vector<uint64_t>& scalars)
 {
     if constexpr (GlobalData::layout == pto::Layout::NZ) {
@@ -146,28 +201,33 @@ __tf__ PTO_INLINE void TStore(GlobalData& dst, TileData& src, const std::vector<
             dst.GetStride(GlobalTensorDim::DIM_0), dst.GetStride(GlobalTensorDim::DIM_1),
             dst.GetStride(GlobalTensorDim::DIM_2), dst.GetStride(GlobalTensorDim::DIM_3),
             dst.GetStride(GlobalTensorDim::DIM_4), [&](size_t r, size_t c, size_t tile_idx, size_t gd_idx) {
-                StoreElement<D, S, TileData, quantMode, applyRelu>(
+                StoreElement<D, S, TileData, quantMode, applyRelu, atomicType>(
                     dst.data(), gd_idx, src.data()[tile_idx], r, c, scalars);
             });
+    } else if (TileData::Loc == TileType::Acc) {
+        TStoreAcc<GlobalData, TileData, quantMode, applyRelu, atomicType>(dst, src, scalars);
     } else {
-        StorePlainGT<GlobalData, TileData, quantMode, applyRelu>(dst, src, scalars);
+        StorePlainGT<GlobalData, TileData, quantMode, applyRelu, atomicType>(dst, src, scalars);
     }
 }
 
-template <typename TileData, typename GlobalData, QuantMode_t quantMode, bool applyRelu>
+template <
+    typename TileData, typename GlobalData, QuantMode_t quantMode, bool applyRelu,
+    AtomicType atomicType = AtomicType::AtomicNone>
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, const std::vector<uint64_t>& scalars = {})
 {
     static_assert(
         GlobalData::layout == pto::Layout::ND || GlobalData::layout == pto::Layout::DN ||
-            GlobalData::layout == pto::Layout::NZ || GlobalData::layout == pto::Layout::NDC1HWC0,
-        "Only ND, DN, NZ and NDC1HWC0 GLobal Tensors are currently supported");
+            GlobalData::layout == pto::Layout::NZ || GlobalData::layout == pto::Layout::NDC1HWC0 ||
+            GlobalData::layout == pto::Layout::NC1HWC0,
+        "Only ND, DN, NZ, NC1HWC0 and NDC1HWC0 GLobal Tensors are currently supported");
     if constexpr (GlobalData::layout == pto::Layout::NDC1HWC0 && is_conv_tile_v<TileData>) {
         TStore6HD<TileData, GlobalData>(
             dst.data(), src.data(), dst.GetShape(0), dst.GetShape(1), dst.GetShape(2), dst.GetShape(3), dst.GetShape(4),
             dst.GetStride(0), dst.GetStride(1), dst.GetStride(2), dst.GetStride(3), dst.GetStride(4), src.GetShape(0),
             src.GetShape(1), src.GetShape(2), src.GetShape(3), src.GetShape(4));
     } else {
-        TStore<GlobalData, TileData, quantMode, applyRelu>(dst, src, scalars);
+        TStore<GlobalData, TileData, quantMode, applyRelu, atomicType>(dst, src, scalars);
     }
 }
 
@@ -175,7 +235,7 @@ template <typename TileData, typename GlobalData, AtomicType atomicType, STPhase
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
 {
     (void)Phase;
-    TSTORE_IMPL<TileData, GlobalData, QuantMode_t::NoQuant, false>(dst, src);
+    TSTORE_IMPL<TileData, GlobalData, QuantMode_t::NoQuant, false, atomicType>(dst, src);
 }
 
 template <
@@ -185,7 +245,7 @@ __aicore__ void TSTORE_IMPL(GlobalData& dst, TileData& src)
 {
     (void)Phase;
     constexpr bool useRelu = reluPreMode == ReluPreMode::NormalRelu;
-    TSTORE_IMPL<TileData, GlobalData, QuantMode_t::NoQuant, useRelu>(dst, src);
+    TSTORE_IMPL<TileData, GlobalData, QuantMode_t::NoQuant, useRelu, atomicType>(dst, src);
 }
 
 template <
@@ -203,7 +263,7 @@ __aicore__ void TSTORE_IMPL(GlobalData& dst, TileData& src, uint64_t preQuantSca
         vector_size = src.GetValidRow();
     }
     std::vector<uint64_t> scalars(vector_size, preQuantScalar);
-    TSTORE_IMPL<TileData, GlobalData, quantPre, useRelu>(dst, src, scalars);
+    TSTORE_IMPL<TileData, GlobalData, quantPre, useRelu, atomicType>(dst, src, scalars);
 }
 
 template <
@@ -212,7 +272,7 @@ template <
 __aicore__ void TSTORE_IMPL(GlobalData& dst, TileData& src, FpTileData& fp)
 {
     (void)Phase;
-    constexpr QuantMode_t quantPre = GetScalarPreQuantMode<typename TileData::DType, typename GlobalData::DType>();
+    constexpr QuantMode_t quantPre = GetVectorPreQuantMode<typename TileData::DType, typename GlobalData::DType>();
     constexpr bool useRelu = reluPreMode == ReluPreMode::NormalRelu;
 
     std::vector<uint64_t> scalars(fp.GetValidCol(), 0);
@@ -220,7 +280,7 @@ __aicore__ void TSTORE_IMPL(GlobalData& dst, TileData& src, FpTileData& fp)
         const size_t quantTileIdx = GetTileElementOffset<FpTileData>(0, i);
         scalars[i] = fp.data()[quantTileIdx];
     }
-    TSTORE_IMPL<TileData, GlobalData, quantPre, useRelu>(dst, src, scalars);
+    TSTORE_IMPL<TileData, GlobalData, quantPre, useRelu, atomicType>(dst, src, scalars);
 }
 } // namespace pto
 #endif

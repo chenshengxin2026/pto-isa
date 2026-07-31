@@ -15,6 +15,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <pto/common/type.hpp>
 #include <pto/common/constants.hpp>
 #include "pto/common/debug.h"
+#if defined(__CPU_SIM)
+#include <pto/cpu/atomic.hpp>
+#include <pto/cpu/memory.hpp>
+#endif
 #if defined(__CPU_SIM) || defined(__COSTMODEL)
 #include <iomanip>
 #include <vector>
@@ -600,6 +604,7 @@ struct GlobalTensor {
         const auto offset = i0 * GetStride(GlobalTensorDim::DIM_0) + i1 * GetStride(GlobalTensorDim::DIM_1) +
                             i2 * GetStride(GlobalTensorDim::DIM_2) + i3 * GetStride(GlobalTensorDim::DIM_3) +
                             i4 * GetStride(GlobalTensorDim::DIM_4);
+        std::lock_guard<std::mutex> lock(cpu::AtomicAddMutex());
         if constexpr (IsTwinType<DType>()) {
             const auto val = GetProperDataPart(data(), offset);
             SetProperDataPart(data(), offset, val + summand);
@@ -932,6 +937,71 @@ struct TileShape2D<T, rows, cols, Layout::MX_B_NN>
     PTO_INTERNAL TileShape2D() : Parent() {}
     PTO_INTERNAL TileShape2D(int64_t dynamicRows, int64_t dynamicCols)
         : Parent(1, dynamicCols / MX_ROW_LEN, dynamicRows / MX_COL_LEN, MX_ROW_LEN, MX_COL_LEN)
+    {}
+    using Parent::Parent;
+};
+
+template <typename T, int64_t rows, int64_t cols>
+struct BaseShape2D<T, rows, cols, Layout::HIF4_A_ZZ>
+    : public Stride<
+          GetBaseShape2DStride0<T, rows, cols>(), (cols == DYNAMIC) ? DYNAMIC : cols * HIF4_ROW_LEN, HIF4_BLOCK_SIZE,
+          HIF4_COL_LEN, 1> {
+    using Parent = Stride<
+        GetBaseShape2DStride0<T, rows, cols>(), (cols == DYNAMIC) ? DYNAMIC : cols * HIF4_ROW_LEN, HIF4_BLOCK_SIZE,
+        HIF4_COL_LEN, 1>;
+
+    PTO_INTERNAL BaseShape2D() : Parent() {}
+
+    PTO_INTERNAL BaseShape2D(int64_t dynamicRows, int64_t dynamicCols)
+        : Parent(dynamicCols * dynamicRows, dynamicCols * HIF4_ROW_LEN, HIF4_BLOCK_SIZE, HIF4_COL_LEN, 1)
+    {}
+    using Parent::Parent;
+};
+
+template <typename T, int64_t rows, int64_t cols>
+struct TileShape2D<T, rows, cols, Layout::HIF4_A_ZZ>
+    : public Shape<
+          1, rows == DYNAMIC ? DYNAMIC : rows / HIF4_ROW_LEN, cols == DYNAMIC ? DYNAMIC : cols, HIF4_ROW_LEN,
+          HIF4_COL_LEN> {
+    using Parent = Shape<
+        1, rows == DYNAMIC ? DYNAMIC : rows / HIF4_ROW_LEN, cols == DYNAMIC ? DYNAMIC : cols, HIF4_ROW_LEN,
+        HIF4_COL_LEN>;
+    PTO_INTERNAL TileShape2D() : Parent() {}
+    PTO_INTERNAL TileShape2D(int64_t dynamicRows, int64_t dynamicCols)
+        : Parent(1, dynamicRows / HIF4_ROW_LEN, dynamicCols, HIF4_ROW_LEN, HIF4_COL_LEN)
+    {}
+    using Parent::Parent;
+};
+
+template <typename T, int64_t rows, int64_t cols>
+struct BaseShape2D<T, rows, cols, Layout::HIF4_B_NN>
+    : public Stride<
+          GetBaseShape2DStride0<T, rows, cols>(), (rows == DYNAMIC) ? DYNAMIC : rows * HIF4_ROW_LEN, HIF4_BLOCK_SIZE,
+          HIF4_COL_LEN, 1> {
+    using Parent = Stride<
+        GetBaseShape2DStride0<T, rows, cols>(), (rows == DYNAMIC) ? DYNAMIC : rows * HIF4_ROW_LEN, HIF4_BLOCK_SIZE,
+        HIF4_COL_LEN, 1>;
+
+    PTO_INTERNAL BaseShape2D() : Parent() {}
+
+    PTO_INTERNAL BaseShape2D(int64_t dynamicRows, int64_t dynamicCols)
+        : Parent(dynamicCols * dynamicRows, dynamicRows * HIF4_ROW_LEN, HIF4_BLOCK_SIZE, HIF4_COL_LEN, 1)
+    {}
+    using Parent::Parent;
+};
+
+template <typename T, int64_t rows, int64_t cols>
+struct TileShape2D<T, rows, cols, Layout::HIF4_B_NN>
+    : public Shape<
+          1, cols == DYNAMIC ? DYNAMIC : cols / HIF4_ROW_LEN, rows == DYNAMIC ? DYNAMIC : rows, HIF4_ROW_LEN,
+          HIF4_COL_LEN> {
+    using Parent = Shape<
+        1, cols == DYNAMIC ? DYNAMIC : cols / HIF4_ROW_LEN, rows == DYNAMIC ? DYNAMIC : rows, HIF4_ROW_LEN,
+        HIF4_COL_LEN>;
+
+    PTO_INTERNAL TileShape2D() : Parent() {}
+    PTO_INTERNAL TileShape2D(int64_t dynamicRows, int64_t dynamicCols)
+        : Parent(1, dynamicCols / HIF4_ROW_LEN, dynamicRows, HIF4_ROW_LEN, HIF4_COL_LEN)
     {}
     using Parent::Parent;
 };
@@ -1284,14 +1354,15 @@ public:
 #endif
 #ifdef __CPU_SIM
     PTO_INTERNAL std::uintptr_t GetAssignedAddress() const { return assignedAddress_; }
+    PTO_INTERNAL bool HasAssignedAddress() const { return hasAssignedAddress_; }
 #endif
-
 private:
 #ifdef __CPU_SIM
     AICORE void assignData(TileDType data, std::uintptr_t assignedAddress = 0)
     {
         data_ = data;
         assignedAddress_ = assignedAddress;
+        hasAssignedAddress_ = true;
     }
 #else
     AICORE void assignData(TileDType data) { data_ = data; }
@@ -1299,6 +1370,7 @@ private:
     TileDType data_;
 #ifdef __CPU_SIM
     std::uintptr_t assignedAddress_ = 0;
+    bool hasAssignedAddress_ = false;
 #endif
     uint8_t padList_[4] = {0};
     uint16_t fmapH_ = 0;
@@ -1569,7 +1641,7 @@ public:
     PTO_INTERNAL void SetValidShape(unsigned rowMask, unsigned colMask)
     {
         static_assert(ValidCol == DYNAMIC && ValidRow == DYNAMIC, "Only Dynamic Valid Shape Support Set Value.");
-        PTO_ASSERT(rowMask <= Rows && colMask <= Cols, "colMask must less than Cols.");
+        PTO_ASSERT(rowMask <= Rows && colMask <= Cols, "rowMask and colMask must not exceed Rows and Cols.");
         RowMaskInternal = rowMask;
         ColMaskInternal = colMask;
     }
@@ -1627,6 +1699,7 @@ public:
     void AddToElement(int64_t r, int64_t c, const DType& summand)
     {
         const auto offset = GetTileElementOffset<std::remove_reference_t<decltype(*this)>>(r, c);
+        std::lock_guard<std::mutex> lock(cpu::AtomicAddMutex());
         if constexpr (IsTwinType<DType>()) {
             const auto val = GetProperDataPart(data(), offset);
             SetProperDataPart(data(), offset, val + summand);
@@ -1636,6 +1709,7 @@ public:
     }
 
     PTO_INTERNAL std::uintptr_t GetAssignedAddress() const { return assignedAddress_; }
+    PTO_INTERNAL bool HasAssignedAddress() const { return hasAssignedAddress_; }
 #endif
 private:
 #ifdef __CPU_SIM
@@ -1643,11 +1717,12 @@ private:
     {
         data_ = data;
         assignedAddress_ = assignedAddress;
+        hasAssignedAddress_ = true;
     }
 #else
     AICORE void assignData(TileDType data) { data_ = data; }
 #endif
-    bool isKAligned_; // K-Alignedment for A3
+    bool isKAligned_; // K alignment flag for A3.
 
 #if defined(__CPU_SIM) || defined(__COSTMODEL)
     mutable std::vector<DType> internalBuffer;
@@ -1657,6 +1732,7 @@ private:
 #endif
 #ifdef __CPU_SIM
     std::uintptr_t assignedAddress_ = 0;
+    bool hasAssignedAddress_ = false;
 #endif
 };
 
@@ -1778,7 +1854,7 @@ constexpr bool is_tile_data_v = is_tile<T>::value;
 template <typename T>
 constexpr bool is_boxed_data_v = is_boxed_tile<T>;
 
-// Get the memory offset of a tile element from logical coordinates
+// Maps logical tile coordinates to the backing storage offset.
 template <typename TileT>
 PTO_INTERNAL size_t GetTileOffset(int row, int col)
 {
@@ -1786,13 +1862,10 @@ PTO_INTERNAL size_t GetTileOffset(int row, int col)
     if constexpr (!TileT::isBoxedLayout) {
         return row * TileT::RowStride + col * TileT::ColStride;
     } else {
-        // Compute block coordinates
         int BlockRow = row / TileT::InnerRows;
         int BlockCol = col / TileT::InnerCols;
-        // Compute intra-block offset
         int InnerRow = row % TileT::InnerRows;
         int InnerCol = col % TileT::InnerCols;
-        // Compute block numbers
         static constexpr int BlockNumRow = TileT::Rows / TileT::InnerRows;
         static constexpr int BlockNumCol = TileT::Cols / TileT::InnerCols;
         if constexpr (is_Nz_layout<TileT>::value) {
@@ -1802,7 +1875,6 @@ PTO_INTERNAL size_t GetTileOffset(int row, int col)
         } else if constexpr (is_Zz_layout<TileT>::value) {
             return (BlockNumCol * BlockRow + BlockCol) * TileT::InnerNumel + InnerRow * TileT::InnerCols + InnerCol;
         } else {
-            // This branch should not be instantiated.
             static_assert(
                 sizeof(TileT) == 0, "Unsupported layout in Tile, fractal tiles should be "
                                     "Nz or Zn layout.");

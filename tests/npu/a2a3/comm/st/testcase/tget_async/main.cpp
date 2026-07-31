@@ -8,12 +8,58 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <gtest/gtest.h>
 
 #include "tget_async_kernel.h"
 #include "../comm_mpi.h"
+
+namespace {
+
+int FirstDeviceId()
+{
+    const char* value = std::getenv("PTO_COMM_ST_FIRST_DEVICE_ID");
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+    errno = 0;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    return errno == 0 && end != value && *end == '\0' && parsed >= 0 ? static_cast<int>(parsed) : 0;
+}
+
+class TGetAsyncPostStability2Ranks : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        constexpr int kRanks = 2;
+        if (CommMpiSize() != kRanks) {
+            GTEST_SKIP() << "Requires exactly 2 MPI ranks";
+        }
+        if (!IsTGetAsyncPostStabilityDeviceRangeAvailable(kRanks, FirstDeviceId())) {
+            GTEST_SKIP() << "Requested device range is unavailable";
+        }
+    }
+};
+
+class TGetAsyncPostStability3Ranks : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        constexpr int kRanks = 3;
+        if (CommMpiSize() != kRanks) {
+            GTEST_SKIP() << "Requires exactly 3 MPI ranks";
+        }
+        if (!IsTGetAsyncPostStabilityDeviceRangeAvailable(kRanks, FirstDeviceId())) {
+            GTEST_SKIP() << "Requested device range is unavailable";
+        }
+    }
+};
+
+} // namespace
 
 // ============================================================================
 // 1D Vector Tile Tests
@@ -67,6 +113,36 @@ TEST(TGetAsync, ConcurrentRank_FloatIter16Reuse_8Ranks)
 TEST(TGetAsync, ConcurrentRank_FloatIter16Fresh_8Ranks)
 {
     ASSERT_TRUE((RunGetAsyncConcurrentRank<float, 8192>(8, 8, 0, 0, 16, 1)));
+}
+
+// Issue four Q1 Posts between two ranks, waiting for and consuming each result immediately.
+TEST_F(TGetAsyncPostStability2Ranks, Immediate_P4_Q1)
+{
+    ASSERT_TRUE(RunTGetAsyncImmediatePostWait(2, 2, 0, FirstDeviceId(), 4, 1, 1));
+}
+
+// Issue 16 Q4 Posts before waiting for each saved event and validating every result.
+TEST_F(TGetAsyncPostStability2Ranks, Deferred_P16_Q4)
+{
+    ASSERT_TRUE(RunTGetAsyncConsecutivePostsWaitEach(2, 2, 0, FirstDeviceId(), 16, 1, 4));
+}
+
+// Run 512 immediate-wait Q4 Posts to exercise repeated reuse of the 64-slot flag payload ring.
+TEST_F(TGetAsyncPostStability2Ranks, Immediate_512Posts_Q4)
+{
+    ASSERT_TRUE(RunTGetAsyncImmediatePostWait(2, 2, 0, FirstDeviceId(), 8, 64, 4));
+}
+
+// Use separate destinations for a Q4 Post and a smaller Q1 Post; waiting only for the latter must complete both.
+TEST_F(TGetAsyncPostStability2Ranks, UsedQueueCount_Q4ThenQ1_LastWaitOnly)
+{
+    ASSERT_TRUE(RunTGetAsyncPostsWaitFinal(2, 2, 0, FirstDeviceId(), 2, 1, 4));
+}
+
+// Issue eight deferred Q4 Posts from the root to each of two peers and validate every result.
+TEST_F(TGetAsyncPostStability3Ranks, Deferred_P8_Q4_3Ranks)
+{
+    ASSERT_TRUE(RunTGetAsyncConsecutivePostsWaitEach(3, 3, 0, FirstDeviceId(), 8, 1, 4));
 }
 
 int main(int argc, char** argv)

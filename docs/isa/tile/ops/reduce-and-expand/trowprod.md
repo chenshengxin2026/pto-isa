@@ -61,6 +61,10 @@ PTO_INST RecordEvent TROWPROD(TileDataOut &dst, TileDataIn &src, TileDataTmp &tm
     - `src.GetValidRow() == dst.GetValidRow()`
 - The intrinsic signature requires an explicit `tmp` operand.
 
+### A2A3 implementation checks
+
+- Supported element types: `half`, `float`, `int32_t`, `int16_t`.
+
 ### A5 implementation checks
 
 - Supported element types: `half`, `float`, `int32_t`, `int16_t`.

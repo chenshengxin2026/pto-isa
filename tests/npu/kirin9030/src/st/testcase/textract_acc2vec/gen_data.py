@@ -37,23 +37,16 @@ def saturation(value, min_val, max_val, target_type):
 def extract_quant_params(quant_gm):
     """
     Extract the parameters M1, offset, and sign from the quant_gm of type uint64.
-    Args:
-        quant_g: An integer of type uint64
-    Return:
-        m1: A floating-point number in custom format (1,8,10)
-        offset: A 9-bit integer
-        sign: A 1-bit boolean value (0 or 1)
     """
     quant_gm = int(quant_gm)
     m1_bits = (quant_gm >> 13) & 0x7FFFF
     offset = (quant_gm >> 37) & 0x1FF
     sign = (quant_gm >> 46) & 0x1
 
-    # Parse M1 into a floating-point number in (1,8,10) format.
     sign_bit = (m1_bits >> 18) & 0x1
     exponent = (m1_bits >> 10) & 0xFF
     mantissa = m1_bits & 0x3FF
-    exponent_bias = 127  # Assuming the exponent bias is 127, which aligns with float32.
+    exponent_bias = 127
     m1 = (-1) ** sign_bit * (1 + mantissa / 1024) * (2 ** (exponent - exponent_bias))
 
     return m1, offset, sign
@@ -61,7 +54,7 @@ def extract_quant_params(quant_gm):
 
 def qf2b8_pre(data, quant_gm):
     """
-    float32 -> int8
+    float16 -> int8
     int32 ->int8
     """
     m1, offset, sign = extract_quant_params(quant_gm)
@@ -72,20 +65,26 @@ def qf2b8_pre(data, quant_gm):
         return saturation(tmp1, 0, 255, np.uint8)
 
 
+def qf2b16_pre(data, quant_gm):
+    """
+    float16 -> int16
+    int32 ->int16
+    """
+    m1, offset, sign = extract_quant_params(quant_gm)
+    tmp1 = saturation(data.astype(np.float32) * m1, -65536, 65535, np.int32) + offset
+    if sign:
+        return saturation(tmp1, -32768, 32767, np.int16)
+    else:
+        return saturation(tmp1, 0, 65535, np.uint16)
+
+
 def qf2f16_pre(data, quant_gm):
     """
-    float32 -> float16
+    float16 -> float16
+    int32 -> float16
     """
     m1, offset, sign = extract_quant_params(quant_gm)
     return saturation(data.astype(np.float32) * m1, np.finfo(np.float16).min, np.finfo(np.float16).max, np.float16)
-
-
-def qf2bf16_pre(data, quant_gm):
-    """
-    float32 -> bfloat16
-    """
-    m1, offset, sign = extract_quant_params(quant_gm)
-    return saturation(data.astype(np.float32) * m1, 0x0080, 0x7F80, bfloat16)
 
 
 def get_vector_quant(golden, m, n, dst_type, quant_type):
@@ -93,7 +92,7 @@ def get_vector_quant(golden, m, n, dst_type, quant_type):
     temp_quant_tensor_api = copy.deepcopy(temp_quant_tensor).astype(np.uint64)
     for i, _ in enumerate(temp_quant_tensor_api):
         temp_quant_tensor_api[i] = struct.unpack("!I", struct.pack("!f", temp_quant_tensor[i]))[0]
-        if dst_type == np.int8:
+        if dst_type in (np.int8, np.int16):
             temp_quant_tensor_api[i] = temp_quant_tensor_api[i] | np.uint64(0x400000000000)
     quant_tensor = np.frombuffer(temp_quant_tensor_api, np.uint64)
     quant_tensor = quant_tensor.astype(quant_type)
@@ -103,10 +102,10 @@ def get_vector_quant(golden, m, n, dst_type, quant_type):
         for j in range(n):
             if dst_type == np.int8:
                 quant_golden[i, j] = qf2b8_pre(golden[i, j], quant_tensor[j])
+            elif dst_type == np.int16:
+                quant_golden[i, j] = qf2b16_pre(golden[i, j], quant_tensor[j])
             elif dst_type == np.float16:
                 quant_golden[i, j] = qf2f16_pre(golden[i, j], quant_tensor[j])
-            elif dst_type == bfloat16:
-                quant_golden[i, j] = qf2bf16_pre(golden[i, j], quant_tensor[j])
             else:
                 quant_golden[i, j] = golden[i, j] * quant_tensor[j]
     return quant_golden
@@ -143,13 +142,18 @@ def gen_golden_data(case_name, param):
             golden = saturation(golden, -128, 127, np.int8)
         elif dst_type == np.uint8:
             golden = saturation(golden, 0, 255, np.uint8)
+        elif dst_type == np.int16:
+            golden = saturation(golden, -32768, 32767, np.int16)
+        elif dst_type == np.uint16:
+            golden = saturation(golden, 0, 65535, np.uint16)
 
     if param.is_relu:
         golden = np.maximum(golden, 0)
+
     dst_data = np.zeros((param.dst_row, param.dst_col), dtype=dst_type)
     dst_data.astype(dst_type).tofile("./dst.bin")
     if param.dst_col != 0 and param.dst_row != 0:
-        dst_data[: (m - param.index_rows), :(n - param.index_cols)] = golden[param.index_rows:, param.index_cols:]
+        dst_data[:(m - param.index_rows), :(n - param.index_cols)] = golden[param.index_rows:, param.index_cols:]
         dst_data.astype(dst_type).tofile("./golden.bin")
     else:
         golden.astype(dst_type).tofile("./golden.bin")
@@ -185,6 +189,8 @@ class TMovParams:
         self.ctype = np.float32
         if atype == np.int8:
             self.ctype = np.int32
+        elif atype == np.float16:
+            self.ctype = np.float16
         self.dst_type = dst_type
         self.m = m
         self.k = k
@@ -228,283 +234,56 @@ if __name__ == "__main__":
 
     case_params_list = [
         TMovParams(
-            np.float16,
-            np.float16,
-            np.float32,
-            60,
-            127,
-            120,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            False,
-            True,
-            None,
-            1,
-            0,
-            16,
-            False,
-            64,
-            128,
+            np.float16, np.float16, np.float16, 60, 127, 120, 0, 0, 0, "ND", 512, False, False, True, None, 1,
+            0, 16, False, 64, 128,
         ),
         TMovParams(
-            np.float16,
-            np.float16,
-            np.float16,
-            110,
-            100,
-            80,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            False,
-            True,
-            None,
-            1,
-            5,
-            0,
-            False,
-            120,
-            96,
+            np.float16, np.float16, np.float16, 110, 100, 80, 0, 0, 0, "ND", 512, False, False, True, None, 1,
+            5, 0, False, 120, 96,
         ),
         TMovParams(
-            np.float16,
-            np.float16,
-            np.float32,
-            6,
-            7,
-            8,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            False,
-            True,
-            None,
-            1,
-            2,
-            0,
-            False,
-            10,
-            16,
+            np.float16, np.float16, np.float16, 6, 7, 8, 0, 0, 0, "ND", 512, False, False, True, None, 1,
+            2, 0, False, 10, 16,
         ),
         TMovParams(
-            np.float16,
-            np.float16,
-            bfloat16,
-            111,
-            47,
-            96,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            False,
-            True,
-            None,
-            1,
-            3,
-            32,
-            False,
-            150,
-            160,
+            np.float16, np.float16, np.float16, 111, 47, 96, 0, 0, 0, "ND", 512, False, False, True, None, 1,
+            3, 32, False, 150, 160,
         ),
         TMovParams(
-            np.int8,
-            np.int8,
-            np.int8,
-            30,
-            48,
-            64,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            True,
-            False,
-            False,
-            np.uint64,
-            1,
-            0,
-            32,
-            False,
-            40,
-            96,
+            np.int8, np.int8, np.int8, 30, 48, 64, 0, 0, 0, "ND", 512, True, False, False, np.uint64, 1,
+            0, 32, False, 40, 96,
         ),
         TMovParams(
-            np.int8,
-            np.int8,
-            np.float16,
-            60,
-            128,
-            32,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            True,
-            False,
-            False,
-            np.uint64,
-            1,
-            5,
-            0,
-            False,
-            70,
-            96,
+            np.int8, np.int8, np.float16, 60, 128, 32, 0, 0, 0, "ND", 512, True, False, False, np.uint64, 1,
+            5, 0, False, 70, 96,
         ),
         TMovParams(
-            np.int8,
-            np.int8,
-            bfloat16,
-            128,
-            64,
-            96,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            True,
-            False,
-            False,
-            np.uint64,
-            1,
-            0,
-            0,
-            False,
-            128,
-            96,
+            np.int8, np.int8, np.float16, 128, 64, 96, 0, 0, 0, "ND", 512, True, False, False, np.uint64, 1,
+            0, 0, False, 128, 96,
         ),
         TMovParams(
-            np.float32,
-            np.float32,
-            np.int8,
-            60,
-            128,
-            64,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            True,
-            False,
-            True,
-            np.uint64,
-            1,
-            7,
-            32,
-            False,
-            80,
-            256,
+            np.float16, np.float16, np.int8, 60, 128, 64, 0, 0, 0, "ND", 512, True, False, True, np.uint64, 1,
+            7, 32, False, 80, 256,
         ),
         TMovParams(
-            np.float32,
-            np.float32,
-            np.float16,
-            31,
-            128,
-            128,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            True,
-            False,
-            True,
-            np.uint64,
-            1,
-            0,
-            64,
-            False,
-            40,
-            256,
+            np.float16, np.float16, np.int16, 31, 128, 128, 0, 0, 0, "ND", 512, True, False, True, np.uint64, 1,
+            0, 64, False, 40, 256,
         ),
         TMovParams(
-            np.float32,
-            np.float32,
-            np.float16,
-            128,
-            48,
-            96,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            True,
-            True,
-            None,
-            2,
-            0,
-            0,
-            False,
-            128,
-            96,
+            np.float16, np.float16, np.int16, 128, 48, 96, 0, 0, 0, "ND", 512, False, True, True, None, 2,
+            0, 0, False, 128, 96,
         ),
         TMovParams(
-            np.float32,
-            np.float32,
-            np.int8,
-            60,
-            128,
-            64,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            True,
-            True,
-            None,
-            5,
-            0,
-            32,
-            False,
-            128,
-            128,
+            np.float16, np.float16, np.int8, 60, 128, 64, 0, 0, 0, "ND", 512, False, True, True, None, 5,
+            0, 32, False, 128, 128,
         ),
         TMovParams(
-            np.int8,
-            np.int8,
-            np.float16,
-            30,
-            48,
-            64,
-            0,
-            0,
-            0,
-            "ND",
-            512,
-            False,
-            True,
-            False,
-            None,
-            3,
-            5,
-            32,
-            False,
-            40,
-            128,
+            np.int8, np.int8, np.float16, 30, 48, 64, 0, 0, 0, "ND", 512, False, True, False, None, 3,
+            5, 32, False, 40, 128,
         ),
         TMovParams(
-            np.int8, np.int8, np.int8, 60, 128, 32, 0, 0, 0, "ND", 512, False, True, False, None, 1, 3, 0, False, 64, 64
+            np.int8, np.int8, np.int8, 60, 128, 32, 0, 0, 0, "ND", 512, False, True, False, None, 1,
+            3, 0, False, 64, 64,
         ),
     ]
 

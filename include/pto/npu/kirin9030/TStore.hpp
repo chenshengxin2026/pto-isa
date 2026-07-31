@@ -215,6 +215,7 @@ PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
     static_assert(
         TileData::Loc == pto::TileType::Vec || TileData::Loc == pto::TileType::Acc,
         "Source TileType only support Vec/Acc!");
+    static_assert(atomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirin9030.");
     if constexpr (TileData::Loc == pto::TileType::Acc) {
         using L0cT = typename TileData::DType;
         using DstT = typename GlobalData::RawDType;
@@ -241,6 +242,7 @@ template <
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src)
 {
     static_assert(TileData::Loc == pto::TileType::Acc, "Source TileType only support Acc!");
+    static_assert(atomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirin9030.");
     using L0cT = typename TileData::DType;
     using DstT = typename GlobalData::RawDType;
     CheckStaticAcc<TileData, GlobalData, false>();
@@ -262,6 +264,7 @@ template <
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, uint64_t preQuantScalar)
 {
     static_assert(TileData::Loc == pto::TileType::Acc, "Source TileType only support Acc!");
+    static_assert(atomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirin9030.");
 
     using L0cT = typename TileData::DType;
     using DstT = typename GlobalData::RawDType;
@@ -285,6 +288,7 @@ template <
 PTO_INTERNAL void TSTORE_IMPL(GlobalData& dst, TileData& src, FpTileData& fp)
 {
     static_assert(TileData::Loc == pto::TileType::Acc, "Source TileType only support Acc!");
+    static_assert(atomicType == AtomicType::AtomicNone, "Fix: AtomicAdd is not supported on kirin9030.");
     using DstT = typename GlobalData::RawDType;
     using L0cT = typename TileData::DType;
     CheckStaticAcc<TileData, GlobalData, true>();

@@ -9,6 +9,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 */
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "tget_bandwidth_kernel.h"
 #include "comm_mpi.h"
@@ -16,7 +18,15 @@ See LICENSE in the root of the software repository for the full text of the Lice
 int main(int argc, char** argv)
 {
     CommMpiInit(&argc, &argv);
-    bool ok = RunTGetBandwidthSweep(2, 2, 0, 0);
+    const char* mode = std::getenv("TGET_BENCH_MODE");
+    bool ok = false;
+    if (mode != nullptr && std::strcmp(mode, "device_baseline") == 0) {
+        const char* firstDeviceValue = std::getenv("TGET_DEVICE_BASELINE_FIRST_DEVICE_ID");
+        const int firstDeviceId = firstDeviceValue == nullptr ? 0 : std::atoi(firstDeviceValue);
+        ok = RunTGetDeviceBaseline(2, 2, 0, firstDeviceId);
+    } else {
+        ok = RunTGetBandwidthSweep(2, 2, 0, 0);
+    }
     CommMpiFinalize();
     if (ok) {
         printf("test success\n");

@@ -141,6 +141,9 @@ inline uint64_t FallbackCycles(const std::string& opcode, int rows, int cols)
 
 inline uint64_t EstimateInstrCycles(const std::string& opcode, int rows, int cols, const std::string& dtype)
 {
+    if (opcode == "TDIVS" && (dtype == "int16" || dtype == "int32")) {
+        return 4;
+    }
     uint64_t cycles = EstimateLightweightCycles(opcode, rows, cols, dtype);
     return cycles > 0 ? cycles : FallbackCycles(opcode, rows, cols);
 }

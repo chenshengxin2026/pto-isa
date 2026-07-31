@@ -1,0 +1,339 @@
+name: PR-pipeline_pto-isa
+
+concurrency:
+  max: 15
+  exceed-action: QUEUE
+  enable: true
+  preemption:
+    enable: true
+    events: [mr_id]
+
+on:
+  workflow_dispatch:
+  pull_request_comment:
+    types: [created]
+    branches: [ '*' ]
+    comments: [ '^(?:\/)?compile*' ]
+  pr_comment:
+    types: [ created ]
+    keyword: '^(?:\/)?compile*'
+
+env:
+  org_name: "cann"
+  repo_name: "pto-isa"
+  MERGE_ID: ${{atomgit.event.pull_request.number}}
+  TARGET_BRANCH: ${{atomgit.base_ref}}
+  SOURCE_BRANCH: ${{atomgit.head_ref}}
+  obs_path: "${{ vars.OBS_PATH }}/${{ env.MERGE_ID }}"
+  obs_smoke_path: "${{ env.obs_path }}/presmoke/2"
+
+stages:
+  stage1:
+    name: PreBuild
+    select: selected_by_default
+    jobs:
+      JOB_image:
+        name: Test_image
+        steps:
+          - name: revise_image
+            identifier: revise_image
+            uses: cann/.gitcode/actions/revise-img@master
+            with:
+              repo_name: 'pto-isa'
+              target_branch: ${{ env.TARGET_BRANCH }}
+              repo_url: ${{ vars.CI_PATH }}
+          -
+            name: show_output
+            run: |
+              echo "Compile_Ascend_X86: ${{ steps.revise_image.outputs.Compile_Ascend_X86 }}"
+              echo ${org_name}
+        if: "${{ default() }}"
+        runs-on: ["dedicate-hosted", "x64", "small"]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu20.04.05_x86:k8s_v1.1006
+      JOB_pr:
+        name: Test_get-pr
+        steps:
+          -
+            name: Checkout
+            identifier: process_checkout
+            uses: checkout
+            with:
+              ref: ${{ atomgit.event.pull_request.merge_commit_sha }}
+              token: ${{ secrets.GIT_TOKEN }}
+          -
+            name: get_pr
+            identifier: get_pr
+            uses: cann/.gitcode/actions/get-pr@master
+            with:
+              workspace: ${{ steps.process_checkout.outputs.path }}
+              target_branch: ${{ env.TARGET_BRANCH }}
+              owner: ${{ env.org_name }}
+              repo: ${{ env.repo_name }}
+              pr_number: ${{ atomgit.event.pull_request.number }}
+              git_token: ${{ secrets.GIT_TOKEN }}
+          -
+            name: upload
+            uses: obs-upload
+            with:
+              endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+              bucket: "ascend-ci"
+              access-key: ${{ secrets.AK }}
+              secret-key: ${{ secrets.SK }}
+              artifact-path: |
+                ${{ steps.process_checkout.outputs.path }}/pr_filelist.txt
+                ${{ steps.process_checkout.outputs.path }}/pr_filelist_mod.txt
+                ${{ steps.process_checkout.outputs.path }}/pr_filelist_precommit.txt
+                ${{ steps.process_checkout.outputs.path }}/update_file_detail.txt
+              object-prefix: ${{ env.obs_path }}/
+        if: "${{ default() }}"
+        runs-on:
+        - default
+      JOB_shell:
+        name: Test_get-shell
+        steps:
+          -
+            name: Checkout
+            identifier: process_checkout
+            uses: checkout
+            with:
+              ref: master
+              token: ${{ secrets.GIT_TOKEN }}
+          -
+            name: upload
+            uses: obs-upload
+            with:
+              endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+              bucket: "ascend-ci"
+              access-key: ${{ secrets.AK }}
+              secret-key: ${{ secrets.SK }}
+              artifact-path: |
+                ${{ steps.process_checkout.outputs.path }}/.gitcode/scripts/*
+              object-prefix: ${{ env.obs_path }}/
+        if: "${{ default() }}"
+        runs-on:
+        - default
+    pre:
+    - type: auto
+    fail-fast: true
+  stage2:
+    name: Compile
+    select: selected_by_default
+    jobs:
+      Compile_Ascend_X86:
+        name: Compile_Ascend_X86
+        uses: .gitcode/workflows/compile_action.yml
+        with:
+          task_name: 'Compile_Ascend_X86'
+          package_name: 'cann-pto-isa_linux-x86_64.run'
+          arch: 'x64'
+          spec: 'large'
+          image_version: ${{ jobs.JOB_image.outputs.Compile_Ascend_X86 }}
+      Compile_Ascend_ARM:
+        name: Compile_Ascend_ARM
+        uses: .gitcode/workflows/compile_action.yml
+        with:
+          task_name: 'Compile_Ascend_ARM'
+          package_name: 'cann-pto-isa_linux-aarch64.run'
+          arch: 'arm64'
+          spec: 'xlarge'
+          image_version: ${{ jobs.JOB_image.outputs.Compile_Ascend_ARM }}
+      Compile_Ascend_X86_A5:
+        name: Compile_Ascend_X86_A5
+        uses: .gitcode/workflows/compile_action.yml
+        with:
+          task_name: 'Compile_Ascend_X86_A5'
+          package_name: 'cann-pto-isa_linux-x86_64-A5.run'
+          arch: 'x64'
+          spec: 'large'
+          ge_st_rt2: 'A5'
+          image_version: ${{ jobs.JOB_image.outputs.Compile_Ascend_X86_A5_ubuntu24 }}
+      Compile_Ascend_ARM_A5:
+        name: Compile_Ascend_ARM_A5
+        uses: .gitcode/workflows/compile_action.yml
+        with:
+          task_name: 'Compile_Ascend_ARM_A5'
+          package_name: 'cann-pto-isa_linux-aarch64-A5.run'
+          arch: 'arm64'
+          spec: 'xlarge'
+          ge_st_rt2: 'A5'
+          image_version: ${{ jobs.JOB_image.outputs.Compile_Ascend_ARM_A5 }}
+      JOB_codecheck:
+        name: CodeCheck
+        uses: .gitcode/workflows/codecheck_action.yml
+        with:
+          precommit_image_version: ${{ jobs.JOB_image.outputs.precommit }}
+          codecheck_image_version: ${{ jobs.JOB_image.outputs.codecheck }}
+      JOB_staticcheck_markdown:
+        name: CodeCheck_staticcheck_markdown
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'markdown'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
+      JOB_staticcheck_codespell_check:
+        name: CodeCheck_staticcheck_codespell
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'codespell_check'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
+      JOB_staticcheck_tag_closed_check:
+        name: CodeCheck_staticcheck_tag_closed
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'tag_closed_check'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
+      JOB_staticcheck_resource_existence_check:
+        name: CodeCheck_staticcheck_resource_existence
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'resource_existence_check'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
+      JOB_staticcheck_link_validity_check:
+        name: CodeCheck_staticcheck_link_validity
+        uses: .gitcode/workflows/staticcheck_action.yml
+        with:
+          check_type: 'link_validity_check'
+          image_version: ${{ jobs.JOB_image.outputs.staticcheck }}
+    pre:
+    - type: auto
+  stage3:
+    name: UT
+    select: selected_by_default
+    jobs:
+      UT_Test:
+        name: UT_Test
+        select: selected_by_default
+        needs: []
+        uses: .gitcode/workflows/llt_action.yml
+        with:
+          ut_type: ''
+          task_name: 'UT_Test'
+          image_version: ${{ jobs.JOB_image.outputs.UT_Test }}
+      UT_Test_automode_A3:
+        name: UT_Test_automode_A3
+        select: selected_by_default
+        needs: []
+        uses: .gitcode/workflows/llt_action.yml
+        with:
+          ut_type: ''
+          task_name: 'UT_Test_automode_A3'
+          ge_st_rt2: 'A3'
+          image_version: ${{ jobs.JOB_image.outputs.UT_Test_A3 }}
+      UT_Test_automode_A5:
+        name: UT_Test_automode_A5
+        select: selected_by_default
+        needs: []
+        uses: .gitcode/workflows/llt_action.yml
+        with:
+          ut_type: ''
+          task_name: 'UT_Test_automode_A5'
+          ge_st_rt2: 'A5'
+          image_version: ${{ jobs.JOB_image.outputs.UT_Test_A5 }}
+    pre:
+    - type: auto
+  stage5:
+    name: PreSmoke
+    jobs:
+      PreSmoke_A2:
+        name: PreSmoke_A2
+        steps:
+          -
+            name: Checkout
+            identifier: process_checkout
+            uses: checkout
+            with:
+              ref: ${{ atomgit.event.pull_request.merge_commit_sha }}
+              token: ${{secrets.GIT_TOKEN}}
+              path: "./runner"
+          -
+            name: Checkout gitcode
+            identifier: process_checkout_gitcode
+            uses: checkout
+            with:
+              repository: "https://gitcode.com/cann/.gitcode.git"
+              ref: master
+              path: "./runner/ci"
+          -
+            name: download pr files
+            uses: obs-download
+            with:
+              endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+              bucket: "ascend-ci"
+              access-key: ${{ secrets.AK }}
+              secret-key: ${{ secrets.SK }}
+              key: |
+                ${{ env.obs_path }}/pr_filelist.txt
+                ${{ env.obs_path }}/pr_filelist_mod.txt
+                ${{ env.obs_path }}/update_file_detail.txt
+                ${{ env.obs_path }}/pre_smoke.sh
+              path: ${{ steps.process_checkout.outputs.path }}
+          -
+            name: tar businesscode
+            run: |
+              cd ${{ steps.process_checkout.outputs.path }}
+              tar -zcf ../smoke_data.tar.gz .
+              mv ../smoke_data.tar.gz ./
+          -
+            name: upload
+            identifier: process_upload
+            uses: obs-upload
+            with:
+              endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+              bucket: "ascend-ci"
+              access-key: ${{secrets.AK}}
+              secret-key: ${{secrets.SK}}
+              artifact-path: |
+                ${{ steps.process_checkout.outputs.path }}/smoke_data.tar.gz
+              object-prefix: ${{ env.obs_smoke_path }}/
+          -
+            name: smoke executor
+            timeout-minutes: 30
+            uses: manifest-management-plugin
+            with:
+              action: DEPLOY
+              repo: ${{ steps.process_checkout.outputs.path }}
+              file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+              manifest_image: swr.cn-south-1.myhuaweicloud.com/pre_smoke/${{ jobs.JOB_image.outputs.PreSmoke_npupool }}
+              custom_shell_script: |-
+                set -e
+                # set env
+                export repo_name=${{env.repo_name}}
+                export pr_id=${{ env.MERGE_ID }}
+                export obs_smoke_path=${{ env.obs_smoke_path }}
+                export AK=${{secrets.AK}}
+                export SK=${{secrets.SK}}
+                mkdir -p /home/taskspace && cd /home/taskspace
+                wget -nv ${{ steps.process_upload.outputs.primary-url }}
+                tar -zxf $(basename "${{ steps.process_upload.outputs.primary-url }}")
+                bash /home/taskspace/pre_smoke.sh
+          -
+            name: smoke resource clean
+            uses: manifest-management-plugin
+            if: ${{ always() }}
+            with:
+              action: CRUSH
+              repo: ${{ steps.process_checkout.outputs.path }}
+              file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+        if: env.TARGET_BRANCH == 'master'
+        runs-on: ['self-hosted','arch=arm','smoke=204']
+    pre:
+    - type: auto
+    fail-fast: true
+post:
+  jobs:
+    job_post:
+      name: Test_finish
+      steps:
+        -
+          name: query_pipeline
+          uses: cann/.gitcode/actions/query-pipeline@master
+          with:
+            owner: ${{ env.org_name }}
+            repo: ${{ env.repo_name }}
+            run_id: ${{atomgit.workflow_run_id}}
+            token: ${{ secrets.GIT_TOKEN }}
+            pr_number: ${{ env.MERGE_ID }}
+            apply_label: ${{ vars.APPLY_LABEL }}
+      runs-on: [dedicate-hosted, x64, small]
+      container:
+        image: swr.cn-north-4.myhuaweicloud.com/ci_cann/${{ jobs.JOB_image.outputs.codecheck }}

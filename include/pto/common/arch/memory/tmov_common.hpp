@@ -10,7 +10,9 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #ifndef TMOV_COMMON_MEMORY
 #define TMOV_COMMON_MEMORY
+#include <pto/common/arch_cce_intrinsic.hpp>
 #include <pto/common/utils.hpp>
+#include "pto/common/arch/memory/textract_common.hpp"
 
 template <typename DstTileData, typename SrcTileData, QuantMode_t QuantPre, ReluPreMode reluMode>
 __tf__ AICORE void TMovCcToCb(typename DstTileData::TileDType __out__ dst, typename SrcTileData::TileDType __in__ src,
@@ -22,31 +24,31 @@ __tf__ AICORE void TMovCcToCb(typename DstTileData::TileDType __out__ dst, typen
     __cc__ SrcType *srcAddr = (__cc__ SrcType *)__cce_get_tile_ptr(src);
     __cbuf__ DstType *dstAddr = (__cbuf__ DstType *)__cce_get_tile_ptr(dst);
 
-    constexpr uint32_t dstStride_dst_D = DstTileData::Rows;
+    constexpr uint32_t dstStrideDstD = DstTileData::Rows;
     constexpr uint16_t srcStride = SrcTileData::Rows;
     validCol = CeilDivision(validCol, c0Size) * c0Size;
-    copy_matrix_cc_to_cbuf(dstAddr, srcAddr, 0, validCol, SrcTileData::Rows, dstStride_dst_D, srcStride, 0, QuantPre,
-                           reluMode, false, false);
+    pto_copy_matrix_cc_to_cbuf(dstAddr, srcAddr, 0, validCol, SrcTileData::Rows, dstStrideDstD, srcStride, 0, QuantPre,
+                               static_cast<uint8_t>(reluMode), false, false);
 }
 
 template <typename DstTileData, typename SrcTileData>
 PTO_INTERNAL void TMovToLeft(DstTileData& dst, SrcTileData& src)
 {
     if constexpr (SrcTileData::Rows == 1 && SrcTileData::isRowMajor) {
-        TExtractToAVector<DstTileData, SrcTileData>(dst.data(), src.data(), 0, 0, dst.GetValidCol());
+        pto::TExtractToAVector<DstTileData, SrcTileData>(dst.data(), src.data(), 0, 0, dst.GetValidCol());
     } else if constexpr (DstTileData::SFractal == SrcTileData::SFractal) {
         if constexpr (DstTileData::Compact == pto::CompactMode::Normal) {
             pto::TExtractToACompact<DstTileData, SrcTileData, false>(
                 dst.data(), src.data(), 0, 0, dst.GetValidRow(), dst.GetValidCol(), dst.GetKAligned());
         } else {
-            TExtractToA<DstTileData, SrcTileData, false>(dst.data(), src.data(), 0, 0);
+            pto::TExtractToA<DstTileData, SrcTileData, false>(dst.data(), src.data(), 0, 0);
         }
     } else {
         if constexpr (DstTileData::Compact == pto::CompactMode::Normal || sizeof(typename SrcTileData::DType) == 1) {
             pto::TExtractToACompact<DstTileData, SrcTileData, true>(
                 dst.data(), src.data(), 0, 0, dst.GetValidRow(), dst.GetValidCol(), dst.GetKAligned());
         } else {
-            TExtractToA<DstTileData, SrcTileData, true>(dst.data(), src.data(), 0, 0);
+            pto::TExtractToA<DstTileData, SrcTileData, true>(dst.data(), src.data(), 0, 0);
         }
     }
 }
@@ -59,14 +61,14 @@ PTO_INTERNAL void TMovToRight(DstTileData& dst, SrcTileData& src)
             pto::TExtractToBCompact<DstTileData, SrcTileData, false>(
                 dst.data(), src.data(), 0, 0, dst.GetValidRow(), dst.GetValidCol());
         } else {
-            TExtractToB<DstTileData, SrcTileData, false>(dst.data(), src.data(), 0, 0);
+            pto::TExtractToB<DstTileData, SrcTileData, false>(dst.data(), src.data(), 0, 0);
         }
     } else {
         if constexpr (DstTileData::Compact == pto::CompactMode::Normal || sizeof(typename SrcTileData::DType) == 1) {
             pto::TExtractToBCompact<DstTileData, SrcTileData, true>(
                 dst.data(), src.data(), 0, 0, dst.GetValidRow(), dst.GetValidCol());
         } else {
-            TExtractToB<DstTileData, SrcTileData, true>(dst.data(), src.data(), 0, 0);
+            pto::TExtractToB<DstTileData, SrcTileData, true>(dst.data(), src.data(), 0, 0);
         }
     }
 }

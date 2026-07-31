@@ -52,7 +52,7 @@ PTO_INST RecordEvent TRECIP(TileDataDst &dst, TileDataSrc &src, WaitEvents &... 
 ## Constraints
 
 - **Implementation checks (NPU)**:
-    - `TileData::DType` must be one of: `float` or `half`;
+    - `TileData::DType` must be one of: `float`, `half`, `int32_t`, `int16_t` (the implementation delegates to `TDIVS(dst, 1, src)`, which also admits integer `1/x`);
     - Tile location must be vector (`TileData::Loc == TileType::Vec`);
     - Static valid bounds: `TileData::ValidRow <= TileData::Rows` and `TileData::ValidCol <= TileData::Cols`;
     - Runtime: `src.GetValidRow() == dst.GetValidRow()` and `src.GetValidCol() == dst.GetValidCol()`;

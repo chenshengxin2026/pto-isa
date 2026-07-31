@@ -87,10 +87,20 @@ public:
         FreeDeviceAddr(urmaInfoDevice_);
         FreeDeviceAddr(eidDevice_);
         channelHandles_.clear();
+        peerBaseAddrs_.clear();
         initialized_ = false;
     }
 
     void* GetWorkspaceAddr() const { return urmaInfoDevice_; }
+
+    // Per-peer symmetric MR base address (self = symmetricAddr_). Valid after Init().
+    uint64_t PeerBaseAddr(uint32_t peer) const
+    {
+        if (peer >= peerBaseAddrs_.size()) {
+            return 0;
+        }
+        return peerBaseAddrs_[peer];
+    }
 
 private:
     bool RegisterMemory()
@@ -174,6 +184,10 @@ private:
 
         if (!ExtractPerPeerInfo(wqList, cqList, memList, eidTable, localTokenId)) {
             return false;
+        }
+        peerBaseAddrs_.resize(rankCount_);
+        for (uint32_t peer = 0; peer < rankCount_; ++peer) {
+            peerBaseAddrs_[peer] = memList[peer].addr;
         }
         if (!AllocAndCopyEidTable(eidTable, memList)) {
             return false;
@@ -413,6 +427,7 @@ private:
 
     void* urmaInfoDevice_{nullptr};
     void* eidDevice_{nullptr};
+    std::vector<uint64_t> peerBaseAddrs_;
 
     bool initialized_{false};
 };

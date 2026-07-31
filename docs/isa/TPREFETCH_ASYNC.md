@@ -28,27 +28,25 @@ PTO_INST comm::AsyncEvent TPREFETCH_ASYNC(GlobalData &src, PrefetchAsyncContext 
 } // namespace pto
 ```
 
-`PrefetchAsyncContext` contains the SDMA workspace pointer prepared host-side via `SdmaWorkspaceManager::Init`:
+`PrefetchAsyncContext` contains the SDMA workspace pointer prepared host-side via `SdmaWorkspaceManager::Init`.
+It owns an internal session unless constructed to reuse an external session.
+Use the returned `comm::AsyncEvent` with `ctx.GetSession()` to wait for completion when a dependent consumer must
+observe the prefetch.
 
-```cpp
-pto::PrefetchAsyncContext ctx(workspace);
-auto evt = pto::TPREFETCH_ASYNC(srcGlobal, ctx);
-evt.Wait(ctx.session);
-```
-
-The instruction builds and stores an SDMA session inside `PrefetchAsyncContext` with default parameters (`channelGroupIdx = get_block_idx()`, `syncId = 0`, `queue_num = 1`). Use the returned `comm::AsyncEvent` with `ctx.session` to wait for completion when a dependent consumer must observe the prefetch.
+When `TPREFETCH_ASYNC` shares a channel group with `TGET_ASYNC` or `TPUT_ASYNC`, reuse their session.
+Waiting for the returned prefetch event also completes every earlier SDMA operation in that shared session.
 
 ### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `src` | `GlobalData&` | Source GlobalTensor region to prefetch into L2 |
-| `ctx` | `PrefetchAsyncContext&` | Compute-side prefetch context containing the SDMA workspace base and internally built `comm::AsyncSession` |
+| `ctx` | `PrefetchAsyncContext&` | Compute-side context containing the workspace and either an internal or shared external session |
 | `events...` | `WaitEvents&...` | Optional wait events for synchronization |
 
 ### Return Value
 
-`comm::AsyncEvent` - handle for asynchronous completion tracking. Call `evt.Wait(ctx.session)` before a dependent `TLOAD` when the consumer must observe prefetched data.
+`comm::AsyncEvent` - handle for asynchronous completion tracking. Call `evt.Wait(ctx.GetSession())` before a dependent `TLOAD` when the consumer must observe prefetched data.
 
 ## Constraints
 
@@ -56,6 +54,9 @@ The instruction builds and stores an SDMA session inside `PrefetchAsyncContext` 
 - For the GlobalTensor overload, the tensor must be flat contiguous (packed 1D layout).
 - The SDMA workspace must be initialized by host code before the kernel launch and passed into the kernel.
 - `PrefetchAsyncContext` owns a 256-byte UB scratch tile and an `AsyncSession` used while constructing and waiting on SDMA metadata.
+- When sharing a channel group with `TGET_ASYNC` or `TPUT_ASYNC`, reuse their session.
+- An external session must remain alive while the context and related events are in use.
+- Concurrent independent contexts must use separate workspaces or be serialized.
 - SDMA CMO operates at cache-line granularity; non-aligned prefetch ranges are rounded by hardware.
 - On CPU simulation backend, this instruction is a no-op (returns an empty `AsyncEvent`).
 
@@ -87,11 +88,23 @@ __global__ AICORE void my_kernel(__gm__ half *src, __gm__ half *dst,
 
     PrefetchAsyncContext ctx(workspace);
     auto evt = TPREFETCH_ASYNC(srcGlobal, ctx);
-    evt.Wait(ctx.session);
+    evt.Wait(ctx.GetSession());
 
     using TileData = Tile<TileType::Vec, half, 128, 128, BLayout::RowMajor>;
     TileData tile;
     TASSIGN(tile, 0x100);
     TLOAD(tile, srcGlobal);
 }
+```
+
+### Shared External Session
+
+Given an externally built `sharedSession` for the selected channel group:
+
+```cpp
+PrefetchAsyncContext ctx(workspace, &sharedSession);
+auto getEvt = TGET_ASYNC(dstGlobal, srcGlobal, sharedSession);
+auto prefetchEvt = TPREFETCH_ASYNC(prefetchGlobal, ctx);
+auto putEvt = TPUT_ASYNC(remoteGlobal, localGlobal, sharedSession);
+(void)putEvt.Wait(ctx.GetSession());
 ```

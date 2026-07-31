@@ -15,9 +15,15 @@ project(pto-isa)
 init_cann_project()
 add_cann_target_options()
 
+# Package type: run / rpm / deb. Default "run" keeps backward-compatible makeself run package.
+# Forwarded to set_cann_cpack_config(PACKAGE_TYPE ...) in cmake/package.cmake.
+if(NOT DEFINED PACKAGE_TYPE)
+    set(PACKAGE_TYPE "run" CACHE STRING "Package type: run/rpm/deb")
+endif()
+
 include(cmake/package.cmake)
 include(cmake/func.cmake)
 include(version.cmake)
-check_cann_pkg_build_deps("pto-isa")
+check_cann_pkg_build_deps("pto_isa")
 add_cann_version_info_targets()
 pack_built_in()

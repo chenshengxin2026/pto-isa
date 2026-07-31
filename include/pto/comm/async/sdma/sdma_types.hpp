@@ -53,7 +53,7 @@ using sdma_config_t = SdmaConfig;
 // ============================================================================
 struct WorkspaceLayout {
     __gm__ uint8_t* send_workspace; // Per channel-group flag SQE staging (64B x queue_num)
-    __gm__ uint8_t* recv_workspace; // Per channel-group completion records
+    __gm__ uint8_t* recv_workspace; // Per channel-group Post Done Records
 };
 using workspace_layout_t = WorkspaceLayout;
 

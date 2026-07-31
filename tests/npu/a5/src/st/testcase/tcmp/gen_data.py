@@ -31,6 +31,10 @@ def gen_golden_data_tcmp(param):
         input1 = np.random.uniform(-10, 10, size=[row, col]).astype(dtype)
         input2 = np.random.uniform(-10, 10, size=[row, col]).astype(dtype)
 
+    if getattr(param, "is_nan", False):
+        input1[:] = np.nan
+        input2[:] = np.nan
+
     if param.mode == "EQ":
         if param.dtype == bfloat16:
             input1_f32 = input1.astype(np.float32)
@@ -67,13 +71,14 @@ def gen_golden_data_tcmp(param):
 
 
 class TcmpParams:
-    def __init__(self, dtype, row, col, valid_row, valid_col, cmp_mode):
+    def __init__(self, dtype, row, col, valid_row, valid_col, cmp_mode, is_nan=False):
         self.dtype = dtype
         self.row = row
         self.col = col
         self.valid_row = valid_row
         self.valid_col = valid_col
         self.mode = cmp_mode
+        self.is_nan = is_nan
 
 def generate_case_name(param):
     dtype_str = {
@@ -83,7 +88,8 @@ def generate_case_name(param):
         np.int16: 'int16',
         bfloat16: 'bfloat16'
     }[param.dtype]
-    return f"TCMPTest.case_{dtype_str}_{param.row}x{param.col}_{param.valid_row}x{param.valid_col}"
+    nan_suffix = "_nan" if getattr(param, "is_nan", False) else ""
+    return f"TCMPTest.case_{dtype_str}_{param.row}x{param.col}_{param.valid_row}x{param.valid_col}{nan_suffix}"
 
 if __name__ == "__main__":
     # Get the absolute path of the script
@@ -108,6 +114,7 @@ if __name__ == "__main__":
         TcmpParams(np.int16, 77, 80, 32, 32, "LE"),
         TcmpParams(bfloat16, 32, 32, 16, 32, "EQ"),
         TcmpParams(bfloat16, 77, 80, 32, 32, "LE"),
+        TcmpParams(np.float32, 32, 32, 32, 32, "NE", is_nan=True),
     ]
 
     for i, param in enumerate(case_params_list):

@@ -138,7 +138,7 @@ void runTFILLPAD(T* out, T* src, int gShape0, int gShape1, int gShape2, int gRow
         TASSIGN(vecTile, (uint64_t)ubaddr0);
 
         TLOAD(vecTile, srcGlobal);
-        TFILLPAD_EXPAND(vecTileP, vecTile);
+        TFILLPAD<TFillPadMode::Expand>(vecTileP, vecTile);
     } else {
         using TileData =
             Tile<TileType::Vec, T, kTRows_, kTCols_, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, LoadPadVal_>;
@@ -148,7 +148,7 @@ void runTFILLPAD(T* out, T* src, int gShape0, int gShape1, int gShape2, int gRow
 
         TLOAD(vecTile, srcGlobal);
         if constexpr (inplace)
-            TFILLPAD_INPLACE(vecTileP, vecTile);
+            TFILLPAD<TFillPadMode::InPlace>(vecTileP, vecTile);
         else
             TFILLPAD(vecTileP, vecTile);
     }

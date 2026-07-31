@@ -29,8 +29,7 @@ PTO_INTERNAL bool BuildAsyncSession(
 {
     session.engine = engine;
     if constexpr (engine == DmaEngine::SDMA) {
-        session.valid =
-            sdma::BuildSdmaSession(scratchTile, workspace, session.sdmaSession, syncId, baseConfig, channelGroupIdx);
+        session.valid = sdma::BuildSdmaSession(scratchTile, workspace, session, syncId, baseConfig, channelGroupIdx);
         return session.valid;
     } else {
         static_assert(
@@ -42,11 +41,26 @@ PTO_INTERNAL bool BuildAsyncSession(
 
 #ifdef PTO_URMA_SUPPORTED
 template <DmaEngine engine>
+PTO_INTERNAL bool BuildAsyncSession(__gm__ uint8_t* workspace, AsyncSession& session)
+{
+    static_assert(engine == DmaEngine::URMA, "This overload is for URMA only");
+    session = AsyncSession{};
+    session.engine = engine;
+    session.contextGm = workspace;
+    session.qpIdx = 0;
+    session.destRankId = 0;
+    session.valid = (workspace != nullptr);
+    return session.valid;
+}
+
+template <DmaEngine engine>
 PTO_INTERNAL bool BuildAsyncSession(__gm__ uint8_t* workspace, uint32_t destRankId, AsyncSession& session)
 {
     static_assert(engine == DmaEngine::URMA, "This overload is for URMA only");
-    session.engine = engine;
-    session.valid = urma::BuildUrmaSession(workspace, destRankId, session.urmaSession);
+    if (!BuildAsyncSession<engine>(workspace, session)) {
+        return false;
+    }
+    session.destRankId = destRankId;
     return session.valid;
 }
 #endif
@@ -62,10 +76,10 @@ PTO_INTERNAL bool AsyncEvent::Wait(const AsyncSession& session) const
     }
     switch (session.engine) {
         case DmaEngine::SDMA:
-            return sdma::detail::SdmaWaitEvent(handle, session.sdmaSession);
+            return sdma::detail::SdmaWaitEvent(handle, session);
 #ifdef PTO_URMA_SUPPORTED
         case DmaEngine::URMA:
-            return urma::detail::UrmaWaitEvent(handle, session.urmaSession.eventCtx);
+            return urma::detail::UrmaWaitEvent(handle, session);
 #endif
         default:
             return false;
@@ -79,10 +93,10 @@ PTO_INTERNAL bool AsyncEvent::Test(const AsyncSession& session) const
     }
     switch (session.engine) {
         case DmaEngine::SDMA:
-            return sdma::detail::SdmaTestEvent(handle, session.sdmaSession);
+            return sdma::detail::SdmaTestEvent(handle, session);
 #ifdef PTO_URMA_SUPPORTED
         case DmaEngine::URMA:
-            return urma::detail::UrmaTestEvent(handle, session.urmaSession.eventCtx);
+            return urma::detail::UrmaTestEvent(handle, session);
 #endif
         default:
             return false;

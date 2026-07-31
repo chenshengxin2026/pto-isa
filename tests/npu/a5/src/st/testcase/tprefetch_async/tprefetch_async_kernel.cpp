@@ -8,52 +8,36 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// Single-card ST for the public TPREFETCH_ASYNC GlobalTensor API: prefetch a
-// tile, wait on the event, then TLOAD/TSTORE through it and verify the
-// destination bytes match the source.
-
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 
 #include <pto/pto-inst.hpp>
-// pto_tile.hpp provides pto::Shape / Stride / DYNAMIC / GlobalTensor / Layout.
-// pto-inst.hpp pulls it transitively only under __CPU_SIM / __CCE_AICORE__ /
-// __COSTMODEL, so the host compilation pass for this dual-pass CCE TU still
-// needs the explicit include to resolve the global-scope `using` aliases below.
 #include "pto/common/pto_tile.hpp"
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
-
 #include "tprefetch_async_kernel.h"
 
-using SdmaWorkspaceManager = pto::comm::sdma::SdmaWorkspaceManager;
+#define PTO_TPREFETCH_ASYNC_L2_BENEFIT_ST
 
-// ============================================================================
-// Kernel-wide type aliases - fully-dynamic 5-D Shape/Stride is the canonical
-// shape for prefetch GlobalTensors so the same kernel handles every elem count.
-// ============================================================================
+using SdmaWorkspaceManager = pto::comm::sdma::SdmaWorkspaceManager;
 using KernelShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
 using KernelStrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+
 template <typename T>
 using KernelGlobal = pto::GlobalTensor<T, KernelShapeDyn, KernelStrideDyn, pto::Layout::ND>;
 
-// Range guard for elem_count against the compile-time `count` template
-// parameter. On failure, emits the closing pipe_barrier and returns false so
-// the kernel can early-return in one line instead of four.
 template <size_t count>
-PTO_INTERNAL bool BoundsOkOrFinalize(int elem_count)
+PTO_INTERNAL bool BoundsOkOrFinalize(int elemCount)
 {
-    if (elem_count <= 0 || elem_count > static_cast<int>(count)) {
+    if (elemCount <= 0 || elemCount > static_cast<int>(count)) {
         pipe_barrier(PIPE_ALL);
         return false;
     }
     return true;
 }
 
-// TLOAD/TSTORE copy loop used to validate the prefetched bytes after the
-// async event has completed.
 template <typename T, size_t count>
-PTO_INTERNAL void CopyViaTile(__gm__ T* src, __gm__ T* dst, int elem_count)
+PTO_INTERNAL void CopyViaTile(__gm__ T* src, __gm__ T* dst, int elemCount)
 {
     constexpr int kTileCols = (count <= 256) ? static_cast<int>(count) : 256;
     static_assert(count % kTileCols == 0, "count must be a multiple of kTileCols for fixed-size Tile");
@@ -64,7 +48,7 @@ PTO_INTERNAL void CopyViaTile(__gm__ T* src, __gm__ T* dst, int elem_count)
     TileData tile;
     TASSIGN(tile, 0x0);
 
-    for (int offset = 0; offset < elem_count; offset += kTileCols) {
+    for (int offset = 0; offset < elemCount; offset += kTileCols) {
         pto::GlobalTensor<T, ChunkShape, ChunkStride, pto::Layout::ND> srcChunk(src + offset);
         pto::GlobalTensor<T, ChunkShape, ChunkStride, pto::Layout::ND> dstChunk(dst + offset);
 
@@ -77,32 +61,109 @@ PTO_INTERNAL void CopyViaTile(__gm__ T* src, __gm__ T* dst, int elem_count)
     }
 }
 
-// ============================================================================
-// Correctness kernel - public GlobalTensor API.
-// ============================================================================
 template <typename T, size_t count>
 __global__ AICORE void TPrefetchAsyncCorrectnessKernel(
-    __gm__ T* src, __gm__ T* dst, int elem_count, __gm__ uint8_t* sdmaWorkspace)
+    __gm__ T* src, __gm__ T* dst, int elemCount, uint32_t postCount, bool waitEachEvent, bool useExternalSession,
+    __gm__ uint8_t* sdmaWorkspace)
 {
-    if (!BoundsOkOrFinalize<count>(elem_count)) {
+    if (!BoundsOkOrFinalize<count>(elemCount) || postCount == 0U) {
         return;
     }
 
-    KernelShapeDyn shape(1, 1, 1, 1, elem_count);
-    KernelStrideDyn stride(elem_count, elem_count, elem_count, elem_count, 1);
+    KernelShapeDyn shape(1, 1, 1, 1, elemCount);
+    KernelStrideDyn stride(elemCount, elemCount, elemCount, elemCount, 1);
     KernelGlobal<T> srcGlobal(src, shape, stride);
-    pto::PrefetchAsyncContext ctx(sdmaWorkspace);
-
-    auto evt = pto::TPREFETCH_ASYNC(srcGlobal, ctx);
-    (void)evt.Wait(ctx.session);
-
-    CopyViaTile<T, count>(src, dst, elem_count);
+    pto::comm::AsyncSession sharedSession;
+    pto::PrefetchAsyncContext ctx(sdmaWorkspace, useExternalSession ? &sharedSession : nullptr);
+    pto::comm::AsyncEvent lastEvent;
+    bool success = true;
+    if (useExternalSession) {
+        TASSIGN(ctx.scratchTile, 0x0);
+        success = pto::comm::BuildAsyncSession(ctx.scratchTile, sdmaWorkspace, sharedSession);
+    }
+    for (uint32_t post = 0U; post < postCount && success; ++post) {
+        lastEvent = pto::TPREFETCH_ASYNC(srcGlobal, ctx);
+        success = lastEvent.valid();
+        if (success && waitEachEvent) {
+            success = lastEvent.Wait(ctx.GetSession());
+        }
+    }
+    if (success && !waitEachEvent) {
+        success = lastEvent.Wait(ctx.GetSession());
+    }
+    if (success) {
+        CopyViaTile<T, count>(src, dst, elemCount);
+    }
     pipe_barrier(PIPE_ALL);
 }
 
-// ============================================================================
-// Test helpers - shared setup/teardown/verify
-// ============================================================================
+#ifdef PTO_TPREFETCH_ASYNC_L2_BENEFIT_ST
+inline AICORE uint64_t ReadSystemCounter()
+{
+    uint64_t syscnt;
+    asm volatile("MOV %0, SYS_CNT\n" : "+l"(syscnt));
+    return syscnt;
+}
+
+template <typename TileData>
+PTO_INTERNAL uint64_t MeasureGmRead(__gm__ float* src, TileData& tile)
+{
+    constexpr int kTileCols = 256;
+    constexpr int kElemCount = 4096;
+    using ChunkShape = pto::Shape<1, 1, 1, 1, kTileCols>;
+    using ChunkStride = pto::Stride<1, 1, 1, 1, 1>;
+
+    pipe_barrier(PIPE_ALL);
+    const uint64_t begin = ReadSystemCounter();
+    for (int offset = 0; offset < kElemCount; offset += kTileCols) {
+        pto::GlobalTensor<float, ChunkShape, ChunkStride, pto::Layout::ND> srcChunk(src + offset);
+        TLOAD(tile, srcChunk);
+        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    }
+    pipe_barrier(PIPE_ALL);
+    return ReadSystemCounter() - begin;
+}
+
+__global__ AICORE void TPrefetchAsyncL2BenefitKernel(
+    __gm__ float* src, uint32_t pairCount, __gm__ uint64_t* metrics, __gm__ uint8_t* sdmaWorkspace)
+{
+    constexpr int kElemCount = 4096;
+    constexpr int kTileCols = 256;
+    using TileData = pto::Tile<pto::TileType::Vec, float, 1, kTileCols, pto::BLayout::RowMajor>;
+
+    TileData tile;
+    TASSIGN(tile, 0x4000);
+    pto::PrefetchAsyncContext ctx(sdmaWorkspace);
+    uint64_t coldCycles = 0U;
+    uint64_t prefetchedCycles = 0U;
+    bool success = true;
+
+    KernelShapeDyn shape(1, 1, 1, 1, kElemCount);
+    KernelStrideDyn stride(kElemCount, kElemCount, kElemCount, kElemCount, 1);
+    for (uint32_t pair = 0U; pair < pairCount && success; ++pair) {
+        __gm__ float* cold = src + static_cast<uint64_t>(pair) * kElemCount;
+        __gm__ float* prefetched = src + static_cast<uint64_t>(pairCount + pair) * kElemCount;
+        coldCycles += MeasureGmRead(cold, tile);
+
+        KernelGlobal<float> prefetchedGlobal(prefetched, shape, stride);
+        pto::comm::AsyncEvent event = pto::TPREFETCH_ASYNC(prefetchedGlobal, ctx);
+        success = event.valid() && event.Wait(ctx.GetSession());
+        if (success) {
+            prefetchedCycles += MeasureGmRead(prefetched, tile);
+        }
+    }
+
+    metrics[0] = coldCycles;
+    metrics[1] = prefetchedCycles;
+    metrics[2] = success ? pairCount : 0U;
+    __asm__ __volatile__("");
+    dcci((__gm__ void*)metrics, SINGLE_CACHE_LINE);
+    __asm__ __volatile__("");
+    dsb(DSB_DDR);
+}
+#endif
+
 struct SingleCardTestEnv {
     aclrtStream stream = nullptr;
     uint8_t* inputHost = nullptr;
@@ -123,11 +184,13 @@ struct SingleCardTestEnv {
         aclStatus |= aclrtMalloc(&dstDevice, dataBytes, ACL_MEM_MALLOC_HUGE_FIRST);
         return aclStatus == 0;
     }
+
     void SyncAndReadBack()
     {
         aclStatus |= aclrtSynchronizeStream(stream);
         aclStatus |= aclrtMemcpy(outputHost, dataBytes, dstDevice, dataBytes, ACL_MEMCPY_DEVICE_TO_HOST);
     }
+
     void Teardown()
     {
         aclStatus |= aclrtFree(srcDevice);
@@ -167,21 +230,18 @@ inline bool VerifyOutputAndPrint(const SingleCardTestEnv& env, size_t count, int
     const size_t checkedModulus = static_cast<size_t>(modulus);
     const T* out = reinterpret_cast<const T*>(env.outputHost);
     for (size_t i = 0; i < count; ++i) {
-        T expected = static_cast<T>(i % checkedModulus);
+        const T expected = static_cast<T>(i % checkedModulus);
         if (out[i] != expected) {
-            std::cout << tag << ": index " << i << " expected " << (float)expected << " got " << (float)out[i]
-                      << std::endl;
+            std::cout << tag << ": index " << i << " expected " << static_cast<float>(expected) << " got "
+                      << static_cast<float>(out[i]) << std::endl;
             return false;
         }
     }
     return true;
 }
 
-// ============================================================================
-// Host-side test runner
-// ============================================================================
 template <typename T, size_t count>
-bool RunPrefetchAsyncCorrectness(int deviceId)
+bool RunPrefetchAsyncCorrectness(int deviceId, uint32_t postCount, bool waitEachEvent, bool useExternalSession)
 {
     constexpr size_t dataBytes = count * sizeof(T);
     SingleCardTestEnv env;
@@ -192,21 +252,78 @@ bool RunPrefetchAsyncCorrectness(int deviceId)
     FillAndUpload<T>(env, count, 1000);
 
     SdmaWorkspaceManager sdmaMgr;
-    bool sdmaOk = sdmaMgr.Init();
+    const bool sdmaOk = sdmaMgr.Init();
     if (!sdmaOk) {
         std::cerr << "[WARN] SdmaWorkspaceManager Init failed - prefetch will be skipped inside kernel" << std::endl;
     }
     uint8_t* wsAddr = sdmaOk ? reinterpret_cast<uint8_t*>(sdmaMgr.GetWorkspaceAddr()) : nullptr;
 
     TPrefetchAsyncCorrectnessKernel<T, count><<<1, nullptr, env.stream>>>(
-        reinterpret_cast<T*>(env.srcDevice), reinterpret_cast<T*>(env.dstDevice), static_cast<int>(count), wsAddr);
+        reinterpret_cast<T*>(env.srcDevice), reinterpret_cast<T*>(env.dstDevice), static_cast<int>(count), postCount,
+        waitEachEvent, useExternalSession, wsAddr);
     env.SyncAndReadBack();
 
-    bool is_ok = VerifyOutputAndPrint<T>(env, count, 1000, "TPREFETCH_ASYNC GlobalTensor correctness");
+    const bool isOk = VerifyOutputAndPrint<T>(env, count, 1000, "TPREFETCH_ASYNC GlobalTensor correctness");
     env.Teardown();
     sdmaMgr.Finalize();
-    return is_ok && (env.aclStatus == 0);
+    return isOk && env.aclStatus == 0;
 }
 
-template bool RunPrefetchAsyncCorrectness<float, 4096>(int deviceId);
-template bool RunPrefetchAsyncCorrectness<int32_t, 4096>(int deviceId);
+template bool RunPrefetchAsyncCorrectness<float, 4096>(
+    int deviceId, uint32_t postCount, bool waitEachEvent, bool useExternalSession);
+template bool RunPrefetchAsyncCorrectness<int32_t, 4096>(
+    int deviceId, uint32_t postCount, bool waitEachEvent, bool useExternalSession);
+
+#ifdef PTO_TPREFETCH_ASYNC_L2_BENEFIT_ST
+bool RunPrefetchAsyncL2Benefit(int deviceId, double& coldAverageUs, double& prefetchedAverageUs)
+{
+    constexpr uint32_t kPairCount = 64U;
+    constexpr size_t kElemCount = 4096U;
+    constexpr size_t kDataBytes = 2U * kPairCount * kElemCount * sizeof(float);
+    constexpr size_t kMetricsBytes = 64U;
+    constexpr double kSystemCounterTicksPerUs = 50.0;
+
+    SingleCardTestEnv env;
+    if (!env.Init(deviceId, kDataBytes)) {
+        std::cerr << "[ERROR] TPREFETCH_ASYNC L2 benefit: init failed!" << std::endl;
+        return false;
+    }
+    FillAndUpload<float>(env, 2U * kPairCount * kElemCount, 1000);
+
+    void* metricsDevice = nullptr;
+    uint64_t metricsHost[kMetricsBytes / sizeof(uint64_t)]{};
+    env.aclStatus |= aclrtMalloc(&metricsDevice, kMetricsBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+    env.aclStatus |= aclrtMemset(metricsDevice, kMetricsBytes, 0, kMetricsBytes);
+    env.aclStatus |= aclrtCmoAsync(env.srcDevice, kDataBytes, ACL_RT_CMO_TYPE_INVALID, env.stream);
+
+    SdmaWorkspaceManager sdmaMgr;
+    const bool sdmaOk = sdmaMgr.Init();
+    uint8_t* wsAddr = sdmaOk ? reinterpret_cast<uint8_t*>(sdmaMgr.GetWorkspaceAddr()) : nullptr;
+    if (env.aclStatus == 0 && sdmaOk) {
+        TPrefetchAsyncL2BenefitKernel<<<1, nullptr, env.stream>>>(
+            reinterpret_cast<float*>(env.srcDevice), kPairCount, reinterpret_cast<uint64_t*>(metricsDevice), wsAddr);
+        env.aclStatus |= aclrtSynchronizeStream(env.stream);
+        env.aclStatus |=
+            aclrtMemcpy(metricsHost, kMetricsBytes, metricsDevice, kMetricsBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+    }
+
+    bool kernelOk = metricsHost[2] == kPairCount;
+    if (kernelOk) {
+        coldAverageUs = static_cast<double>(metricsHost[0]) / kPairCount / kSystemCounterTicksPerUs;
+        prefetchedAverageUs = static_cast<double>(metricsHost[1]) / kPairCount / kSystemCounterTicksPerUs;
+        kernelOk = prefetchedAverageUs > 0.0;
+    }
+    if (kernelOk) {
+        std::cout << "[TPREFETCH_ASYNC L2] bytes=16384 samples=" << kPairCount << " cold_avg_us=" << coldAverageUs
+                  << " prefetched_avg_us=" << prefetchedAverageUs << " speedup=" << coldAverageUs / prefetchedAverageUs
+                  << "x" << std::endl;
+    }
+
+    env.aclStatus |= aclrtFree(metricsDevice);
+    env.Teardown();
+    sdmaMgr.Finalize();
+    return sdmaOk && kernelOk && env.aclStatus == 0;
+}
+#endif
+
+#undef PTO_TPREFETCH_ASYNC_L2_BENEFIT_ST

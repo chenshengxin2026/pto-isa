@@ -22,8 +22,13 @@ AICORE constexpr typename TileData::DType getPadValue()
 {
     switch (TileData::PadVal) {
         case PadValue::Null:
-        case PadValue::Zero:
-            return typename TileData::DType(0);
+        case PadValue::Zero: {
+            if constexpr (std::is_same_v<typename TileData::DType, int4b_t>) {
+                return int4b_t(0);
+            } else {
+                return typename TileData::DType(0);
+            }
+        }
         case PadValue::Min:
             if constexpr (std::numeric_limits<typename TileData::DType>::has_infinity) {
                 return -std::numeric_limits<typename TileData::DType>::infinity();
@@ -37,7 +42,11 @@ AICORE constexpr typename TileData::DType getPadValue()
                 return std::numeric_limits<typename TileData::DType>::max();
             }
     }
-    return 0;
+    if constexpr (std::is_same_v<typename TileData::DType, int4b_t>) {
+        return int4b_t(0);
+    } else {
+        return 0;
+    }
 }
 
 template <typename GlobalData, typename TileData>
@@ -58,9 +67,16 @@ __tf__ PTO_INLINE void LoadPlainGT(TileData& dst, GlobalData& src)
                         src.GetShape(GlobalTensorDim::DIM_4),
                     [&](std::size_t r) {
                         const auto cols = src.GetShape(GlobalTensorDim::DIM_4);
+                        const auto srcOffset = i * src.GetStride(GlobalTensorDim::DIM_0) +
+                                               j * src.GetStride(GlobalTensorDim::DIM_1) +
+                                               k * src.GetStride(GlobalTensorDim::DIM_2) +
+                                               static_cast<int64_t>(r) * src.GetStride(GlobalTensorDim::DIM_3);
+                        const auto* rowStart = src.data() + srcOffset;
+                        const auto* rowEnd = rowStart + (cols - 1) * src.GetStride(GlobalTensorDim::DIM_4);
+                        const bool rowMapped = cpu::IsMappedAddress(rowStart) && cpu::IsMappedAddress(rowEnd);
                         PTO_CPU_VECTORIZE_LOOP
                         for (int64_t c = 0; c < cols; c++) {
-                            const auto val = src.GetElement(i, j, k, r, c);
+                            const auto val = rowMapped ? src.GetElement(i, j, k, r, c) : getPadValue<TileData>();
                             if constexpr (TileData::BFractal == BLayout::RowMajor) {
                                 dst.SetElement(tileHighRankOffset2 + r, c, val);
                             } else {
@@ -71,6 +87,29 @@ __tf__ PTO_INLINE void LoadPlainGT(TileData& dst, GlobalData& src)
             }
         }
     }
+}
+
+template <typename TileData>
+PTO_INTERNAL void FillValidTileWindow(TileData& tile)
+{
+    const auto pad = getPadValue<TileData>();
+    for (int64_t r = 0; r < tile.GetValidRow(); ++r) {
+        for (int64_t c = 0; c < tile.GetValidCol(); ++c) {
+            tile.SetElement(r, c, pad);
+        }
+    }
+}
+
+template <typename TileData>
+PTO_INTERNAL void FillTileForLoad(TileData& tile)
+{
+    constexpr bool hasStaticSubView = (TileData::ValidRow != DYNAMIC && TileData::ValidRow < TileData::Rows) ||
+                                      (TileData::ValidCol != DYNAMIC && TileData::ValidCol < TileData::Cols);
+    if (!tile.HasAssignedAddress() || !hasStaticSubView) {
+        std::fill(tile.data(), tile.data() + TileData::GetSizeInUnits(), getPadValue<TileData>());
+        return;
+    }
+    FillValidTileWindow(tile);
 }
 
 template <typename TileData, typename GlobalData>
@@ -84,10 +123,8 @@ PTO_INTERNAL void TLOAD_TILE_IMPL(TileData& dst, GlobalData& src)
             GlobalData::layout == pto::Layout::NZ,
         "Only ND, DN and NZ GLobal Tensors are currently supported");
 
-    // Filling padding
-    std::fill(dst.data(), dst.data() + TileData::GetSizeInUnits(), getPadValue<TileData>());
+    FillTileForLoad(dst);
 
-    // Filling data
     if constexpr (GlobalData::layout == pto::Layout::NZ) {
         assert(
             dst.GetValidRow() == src.GetShape(GlobalTensorDim::DIM_2) * src.GetShape(GlobalTensorDim::DIM_3) &&
@@ -121,7 +158,6 @@ PTO_INTERNAL void TLoadInstrGm2L1(
     __cbuf__ typename TileData::DType* dst, typename GlobalData::DType* src, uint16_t nBurst, uint16_t lenBurst,
     uint16_t gmGap, uint16_t l1Gap)
 {
-    // Use reinterpret_cast for pointer reinterpretation
     uint8_t* dP = reinterpret_cast<uint8_t*>(dst);
     const uint8_t* sP = reinterpret_cast<const uint8_t*>(src);
 
@@ -150,10 +186,10 @@ __tf__ PTO_INTERNAL void TLoad5HD(
     typename GlobalData::DType* srcAddrP = srcAddr;
     __cbuf__ typename TileData::DType* dstAddrP = dstAddr;
     constexpr uint32_t maxSupportBurst = 4095;
-    // gmGap unit is 32B
+    // DMA gaps are encoded in 32-byte blocks.
     uint32_t gmGap = ((gStride1 - dstH * dstW * c0ElemCount) * sizeof(typename TileData::DType)) >> SHIFT_BLOCK_BYTE;
 
-    if ((gStride2 == dstW * c0ElemCount || dstH == 1) && // process for W direction all load or H=1
+    if ((gStride2 == dstW * c0ElemCount || dstH == 1) && // H/W slice is contiguous.
         gmGap <= UINT16_MAX && dstC1 <= maxSupportBurst && dstH * dstW <= UINT16_MAX) {
         uint16_t nBurst = dstC1;
         uint16_t srcGap = gmGap;
@@ -193,14 +229,11 @@ __tf__ PTO_INTERNAL void TLoad6HD(
     typename GlobalData::DType* srcAddr = src;
     constexpr uint32_t c0ElemCount = C0_SIZE_BYTE / sizeof(typename TileData::DType);
 
-    // Assuming we are still doing 2D-Linear collapse at the end (Burst load)
-    // We iterate through the new 6th dimension (Group/G)
+    // Load each group as one 5D slice.
     for (uint32_t g = 0; g < dstG; g++) {
-        // Calculate the base pointer for the current Group
         int64_t groupOffsetSrc = g * gStride5;
         int64_t groupOffsetDst = g * dstN * dstH * dstW * dstC1 * c0ElemCount;
 
-        // Call the 5D loader for this slice of the 6D tensor
         TLoad5HD<TileData, GlobalData>(
             dst + groupOffsetDst, src + groupOffsetSrc, srcN, srcC1, srcH, srcW, gStride0, gStride1, gStride2, gStride3,
             gStride4, dstN, dstC1, dstH, dstW);
@@ -220,7 +253,7 @@ __tf__ PTO_INTERNAL void TLoadFractalZ(
     typename GlobalData::DType* srcAddrP = srcAddr;
     __cbuf__ typename TileData::DType* dstAddrP = dstAddr;
 
-    if constexpr (TileData::totalDimCount == 4) { // ConvTile layout is [C1HW,N/16,16,C0]
+    if constexpr (TileData::totalDimCount == 4) { // Tile layout: [C1HW,N/16,16,C0].
         static_assert(
             TileData::staticShape[2] == FRACTAL_NZ_ROW && TileData::staticShape[3] == c0ElemCount,
             "Fix: The TileData last 2 dim must be static and satisfy [16, 32 / sizeof(DataType)]");
@@ -234,7 +267,7 @@ __tf__ PTO_INTERNAL void TLoadFractalZ(
             ((gStride1 - srcShape2 * srcShape3 * c0ElemCount) * sizeof(typename TileData::DType)) >> SHIFT_BLOCK_BYTE;
         TLoadInstrGm2L1<TileData, GlobalData>(dstAddrP, srcAddrP, nBurst, lenBurst, gmGap, 0);
 
-    } else { //  [C1,H,W,N,C0]
+    } else { // Tile layout: [C1,H,W,N,C0].
         PTO_ASSERT(
             srcShape1 == dstShape1 && srcShape2 == dstShape2,
             "Fix: layout is Fractal_Z, [srcH,srcW] && [dstH,dstW] should be same!");
@@ -244,7 +277,7 @@ __tf__ PTO_INTERNAL void TLoadFractalZ(
         uint16_t gmGap = ((gStride2 - srcShape3 * c0ElemCount) * sizeof(typename TileData::DType)) >> SHIFT_BLOCK_BYTE;
         constexpr uint32_t maxSupportBurst = 4095;
 
-        if (dstShape0 * dstShape1 * dstShape2 <= maxSupportBurst) { // if burst <= 4095, only load once
+        if (dstShape0 * dstShape1 * dstShape2 <= maxSupportBurst) { // Single burst fits hardware limit.
             uint16_t nBurst = dstShape0 * dstShape1 * dstShape2;
             TLoadInstrGm2L1<TileData, GlobalData>(dstAddrP, srcAddrP, nBurst, lenBurst, gmGap, 0);
         } else {
@@ -285,25 +318,24 @@ template <typename TileData, typename GlobalData>
 PTO_INTERNAL void TLOAD_CONVTILE_IMPL(TileData& dst, GlobalData& src)
 {
     CheckConvTileData<TileData, GlobalData>(dst, src);
-    if constexpr (GlobalData::layout == pto::Layout::NC1HWC0) { // layout is NC1HWC0, dst dim4 is c0Size
+    if constexpr (GlobalData::layout == pto::Layout::NC1HWC0) { // C0 is implicit in the tile element count.
         TLoad5HD<TileData, GlobalData>(
             dst.data(), src.data(), src.GetShape(0), src.GetShape(1), src.GetShape(2), src.GetShape(3),
             src.GetStride(0), src.GetStride(1), src.GetStride(2), src.GetStride(3), src.GetStride(4), dst.GetShape(0),
             dst.GetShape(1), dst.GetShape(2), dst.GetShape(3));
-    } else if constexpr (GlobalData::layout == pto::Layout::FRACTAL_Z) { // C1HWNC0, dst dim4 is c0Size
+    } else if constexpr (GlobalData::layout == pto::Layout::FRACTAL_Z) { // C1HWNC0 source layout.
         TLoadFractalZ<TileData, GlobalData>(
             dst.data(), src.data(), src.GetShape(0), src.GetShape(1), src.GetShape(2), src.GetShape(3), src.GetShape(4),
             src.GetStride(0), src.GetStride(1), src.GetStride(2), src.GetStride(3), src.GetStride(4), dst.GetShape(0),
             dst.GetShape(1), dst.GetShape(2), dst.GetShape(3));
     } else if constexpr (GlobalData::layout == pto::Layout::NDC1HWC0) {
-        // Layout is NDC1HWC0:
-        // dst dim0=N, dim1=D, dim2=C1, dim3=H, dim4=W (C0 is implicit in the tile type)
+        // NDC1HWC0 carries N,D,C1,H,W; C0 is implicit in the tile type.
         TLoad6HD<TileData, GlobalData>(
             dst.data(), src.data(), src.GetShape(0), src.GetShape(1), src.GetShape(2), src.GetShape(3),
-            src.GetShape(4), // src sizes: N, D, C1, H, W
-            src.GetStride(0), src.GetStride(1), src.GetStride(2), src.GetStride(3), src.GetStride(4), 0, // src strides
+            src.GetShape(4), // Source shape: N,D,C1,H,W.
+            src.GetStride(0), src.GetStride(1), src.GetStride(2), src.GetStride(3), src.GetStride(4), 0, // Strides.
             dst.GetShape(0), dst.GetShape(1), dst.GetShape(2), dst.GetShape(3),
-            dst.GetShape(4) // dst sizes: N, D, C1, H, W
+            dst.GetShape(4) // Destination shape: N,D,C1,H,W.
         );
     }
 }

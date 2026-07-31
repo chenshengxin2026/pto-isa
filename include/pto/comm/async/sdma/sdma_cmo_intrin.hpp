@@ -89,7 +89,7 @@ PTO_INTERNAL void AddOneCmoSqe(
 template <typename = void>
 PTO_INTERNAL void SubmitCmoPrefetchSqes(
     __gm__ BatchWriteChannelInfo* batchWriteChannelInfo, __gm__ uint8_t* src, const SdmaConfig& config,
-    uint32_t* sqTail, uint32_t sqTailLen)
+    SdmaRuntimeContext& runtimeCtx)
 {
     for (uint32_t idx = 0U; idx < config.iter_num; ++idx) {
         uint32_t queueIdx = idx % config.queue_num;
@@ -102,55 +102,26 @@ PTO_INTERNAL void SubmitCmoPrefetchSqes(
 
         __gm__ uint8_t* srcAddr = src + config.comm_block_offset + idx * config.block_bytes;
 
-        AddOneCmoSqe(channelInfo, srcAddr, transferBytes, sqTail[queueIdx], sqTail[queueIdx] - channelInfo->sq_head);
-
-        sqTail[queueIdx] = (sqTail[queueIdx] + 1) % kSqDepth;
-        pipe_barrier(PIPE_ALL);
+        AddOneCmoSqe(
+            channelInfo, srcAddr, transferBytes, runtimeCtx.sqTail[queueIdx],
+            runtimeCtx.sqTail[queueIdx] - runtimeCtx.sqHead[queueIdx]);
+        runtimeCtx.sqTail[queueIdx] = (runtimeCtx.sqTail[queueIdx] + 1U) % channelInfo->sq_depth;
     }
 }
 
 template <typename = void>
-PTO_INTERNAL uint64_t SdmaCmoPrefetch(__gm__ uint8_t* src, uint64_t messageLen, const SdmaExecContext& execCtx)
+PTO_INTERNAL AsyncEvent SdmaCmoPrefetch(__gm__ uint8_t* src, uint64_t messageLen, const SdmaSession& session)
 {
-    __gm__ uint8_t* contextGm = execCtx.contextGm;
-    if (contextGm == nullptr || !IsValidTmpBuffer(execCtx.tmpBuf)) {
-        return 0;
+    if (src == nullptr) {
+        return {};
     }
-
-    const uint32_t syncId = execCtx.syncId;
-    const uint32_t channelGroupIndex = execCtx.channelGroupIdx;
-    UbTmpBuf tmpBuf = execCtx.tmpBuf;
-
-    SdmaConfig config;
-    if (!BuildTransferConfig(execCtx.baseConfig, messageLen, config)) {
-        pipe_barrier(PIPE_ALL);
-        return 0;
+    SdmaConfig config{};
+    SdmaPostState state{};
+    if (!BeginSdmaPost(messageLen, session, config, state)) {
+        return {};
     }
-    if (config.iter_num == 0) {
-        return 0;
-    }
-    if (channelGroupIndex >= (kSdmaMaxChannel / config.queue_num)) {
-        return 0;
-    }
-    const uint32_t sqePerQue = (config.iter_num + config.queue_num - 1) / config.queue_num + 1;
-    if (sqePerQue > kSqDepth) {
-        return 0;
-    }
-
-    __gm__ BatchWriteChannelInfo* batchWriteChannelBase =
-        (__gm__ BatchWriteChannelInfo*)(contextGm + sizeof(BatchWriteFlagInfo));
-    __gm__ BatchWriteChannelInfo* batchWriteChannelInfo = batchWriteChannelBase + channelGroupIndex * config.queue_num;
-
-    uint32_t sqTail[64] = {0};
-    InitSqTailArray(batchWriteChannelInfo, config.queue_num, sqTail, 64, tmpBuf);
-
-    SubmitCmoPrefetchSqes(batchWriteChannelInfo, src, config, sqTail, 64);
-
-    FlushCacheAndRingDoorbell(batchWriteChannelInfo, config, sqTail, tmpBuf, syncId);
-    UpdateSqTailState(batchWriteChannelInfo, config, sqTail, tmpBuf, syncId);
-
-    pipe_barrier(PIPE_ALL);
-    return reinterpret_cast<uint64_t>(contextGm);
+    SubmitCmoPrefetchSqes(state.channels, src, config, session.runtimeCtx);
+    return FinishSdmaPost(config, state, session);
 }
 
 } // namespace detail
@@ -159,12 +130,12 @@ PTO_INTERNAL uint64_t SdmaCmoPrefetch(__gm__ uint8_t* src, uint64_t messageLen, 
 // Public CMO prefetch intrinsic
 // ============================================================================
 template <typename T>
-PTO_INTERNAL uint64_t __sdma_cmo_prefetch(__gm__ T* src, uint64_t prefetch_size, const SdmaExecContext& execCtx)
+PTO_INTERNAL AsyncEvent __sdma_cmo_prefetch(__gm__ T* src, uint64_t prefetch_size, const SdmaSession& session)
 {
     if (prefetch_size == 0) {
-        return 0;
+        return {};
     }
-    return detail::SdmaCmoPrefetch((__gm__ uint8_t*)src, prefetch_size, execCtx);
+    return detail::SdmaCmoPrefetch((__gm__ uint8_t*)src, prefetch_size, session);
 }
 
 } // namespace sdma

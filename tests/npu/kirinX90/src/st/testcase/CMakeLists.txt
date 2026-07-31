@@ -139,11 +139,11 @@ set(ALL_TESTCASES
     tci
     tmatmul
     tload_mix
-    # tload_shape2d
+    tload_shape2d
     tload
     tmrgsort
     ttrans
-    # ttrans_conv
+    ttrans_conv
     tstore
     textract
     textract_compact
@@ -196,7 +196,7 @@ set(ALL_TESTCASES
     tlrelu
     tdiv
     tcmps
-    # tmov_acc2vec
+    tmov_acc2vec
     tsel
     tsels
     trsqrt
@@ -257,8 +257,8 @@ set(ALL_TESTCASES
     tinsert_acc2vec
     textract_nd_vec
     textract_vec
-    # tmov_zz
-    # tmov_nd2nz
+    tmov_zz
+    tmov_nd2nz
     textract_acc2vec
     texpands_mat
     timg2col

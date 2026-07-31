@@ -86,6 +86,14 @@ PTO_INST RecordEvent TEXTRACT_FP(DstTileData &dst, SrcTileData &src, FpTileData 
 - The vector-quantized form additionally requires an `FpTileData` scaling operand, matching the `TEXTRACT_FP(...)` interface.
 - For `TileType::Acc -> TileType::Vec` with a 32-bit destination type (`float`/`int32_t`), when using `DualModeSplitN` the `ValidCol` (before the split) must be a multiple of `32`.
 
+### Vec → Vec extraction path
+
+In addition to the `Mat/Acc -> ...` paths above, `TEXTRACT` supports a `TileType::Vec -> TileType::Vec` extraction path (ND and NZ layouts), enforced via `CheckTExtractVecToVecCommon`:
+
+- `DstTileData::DType` must equal `SrcTileData::DType`.
+- Supported element types (both A2A3 and A5): `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`, `half`, `bfloat16_t`, `float` (any 1-/2-/4-byte standard type). This set differs from the primary tile path: it adds `uint8_t`/`int16_t`/`uint16_t`/`int32_t`/`uint32_t`, and on A5 it does **not** include the fp8/fp4 types.
+- ND path: source/destination row strides must be 32-byte aligned; `Dst` rows/cols must not exceed `Src`.
+
 ## Examples
 
 ### Auto

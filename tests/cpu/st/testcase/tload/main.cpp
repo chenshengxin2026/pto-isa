@@ -9,6 +9,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 */
 
 #include <pto/pto-inst.hpp>
+#include <pto/cpu/NPUMemoryModel.hpp>
 #include "test_common.h"
 #include <gtest/gtest.h>
 #include <filesystem>
@@ -160,3 +161,77 @@ TEST_F(TLOADTest, case_NZ_float_1_1_1_16_8_1_1_2_16_8) { tload_test<11, float, 1
 TEST_F(TLOADTest, case_NZ_int16_t_2_2_2_16_16_5_3_3_16_16) { tload_test<12, int16_t, 1>(); }
 
 TEST_F(TLOADTest, case_NZ_int8_t_1_2_1_16_32_2_4_2_16_32) { tload_test<13, uint8_t, 1>(); }
+
+TEST_F(TLOADTest, DoesNotClearOutsideValidWindowForAssignedTileView)
+{
+    pto::NPU_MEMORY_INIT();
+    pto::NPU_MEMORY_CLEAR();
+
+    constexpr int kRows = 8;
+    constexpr int kCols = 8;
+    constexpr int kTargetRow = 3;
+    constexpr float kSentinel = -99.0f;
+    constexpr float kBase = 10.0f;
+
+    using ViewTile = pto::Tile<pto::TileType::Mat, float, kRows, kCols, pto::BLayout::RowMajor, 1, kCols>;
+    using SrcGlobal =
+        pto::GlobalTensor<float, pto::Shape<1, 1, 1, 1, kCols>, pto::Stride<kCols, kCols, kCols, kCols, 1>>;
+
+    auto* ub = reinterpret_cast<float*>(pto::NPUMemoryModel::Instance().GetUBBase());
+    auto* src = ub;
+    for (int c = 0; c < kCols; ++c) {
+        src[c] = kBase + static_cast<float>(c);
+    }
+
+    auto* l1 = reinterpret_cast<float*>(pto::NPUMemoryModel::Instance().GetL1Base());
+    std::fill(l1, l1 + kRows * kCols, kSentinel);
+
+    ViewTile rowView;
+    pto::TASSIGN(rowView, kTargetRow * kCols * static_cast<int>(sizeof(float)));
+    SrcGlobal srcGlobal(src);
+    pto::TLOAD(rowView, srcGlobal);
+
+    for (int r = 0; r < kRows; ++r) {
+        for (int c = 0; c < kCols; ++c) {
+            const float expected = (r == kTargetRow) ? (kBase + static_cast<float>(c)) : kSentinel;
+            EXPECT_EQ(l1[r * kCols + c], expected) << "r=" << r << " c=" << c;
+        }
+    }
+}
+
+TEST_F(TLOADTest, DoesNotClearOutsideValidWindowForAssignedTileViewAtZeroAddress)
+{
+    pto::NPU_MEMORY_INIT();
+    pto::NPU_MEMORY_CLEAR();
+
+    constexpr int kRows = 8;
+    constexpr int kCols = 8;
+    constexpr int kTargetRow = 0;
+    constexpr float kSentinel = -99.0f;
+    constexpr float kBase = 20.0f;
+
+    using ViewTile = pto::Tile<pto::TileType::Mat, float, kRows, kCols, pto::BLayout::RowMajor, 1, kCols>;
+    using SrcGlobal =
+        pto::GlobalTensor<float, pto::Shape<1, 1, 1, 1, kCols>, pto::Stride<kCols, kCols, kCols, kCols, 1>>;
+
+    auto* ub = reinterpret_cast<float*>(pto::NPUMemoryModel::Instance().GetUBBase());
+    auto* src = ub;
+    for (int c = 0; c < kCols; ++c) {
+        src[c] = kBase + static_cast<float>(c);
+    }
+
+    auto* l1 = reinterpret_cast<float*>(pto::NPUMemoryModel::Instance().GetL1Base());
+    std::fill(l1, l1 + kRows * kCols, kSentinel);
+
+    ViewTile rowView;
+    pto::TASSIGN(rowView, kTargetRow * kCols * static_cast<int>(sizeof(float)));
+    SrcGlobal srcGlobal(src);
+    pto::TLOAD(rowView, srcGlobal);
+
+    for (int r = 0; r < kRows; ++r) {
+        for (int c = 0; c < kCols; ++c) {
+            const float expected = (r == kTargetRow) ? (kBase + static_cast<float>(c)) : kSentinel;
+            EXPECT_EQ(l1[r * kCols + c], expected) << "r=" << r << " c=" << c;
+        }
+    }
+}

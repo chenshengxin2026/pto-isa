@@ -13,7 +13,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "pto/npu/kirin9030/common.hpp"
 
 namespace pto {
-template <typename DstTileData, typename SrcTileData, typename DstType, typename SrcType, bool isCastQuant>
+template <typename DstTileData, typename SrcTileData, typename DstType, typename SrcType, bool isCastQuant = false>
 PTO_INTERNAL void CheckTMovAccValid()
 {
     static_assert((SrcTileData::Loc == TileType::Acc), "Source TileType only support Acc.");

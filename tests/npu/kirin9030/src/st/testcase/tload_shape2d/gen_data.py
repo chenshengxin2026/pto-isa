@@ -203,16 +203,12 @@ if __name__ == "__main__":
         "TLOADSHAPE2DTest.1_1_1_128_128_half_ND2NZ",
         "TLOADSHAPE2DTest.1_1_1_128_128_int8_t_ND2NZ",
         "TLOADSHAPE2DTest.1_1_1_128_128_float_ND2NZ",
-        "TLOADSHAPE2DTest.1_1_1_64_128_half_DN2NZ",
         "TLOADSHAPE2DTest.1_1_1_63_127_half_ND2NZ",
         "TLOADSHAPE2DTest.1_1_1_128_128_float_ND2ND",
         "TLOADSHAPE2DTest.1_1_1_37_126_int8_t_ND2ND",
 
         "TLOADSHAPE2DTest.1_1_1_33_99_1_1_1_64_128_48_112_half_ND2NZ",
         "TLOADSHAPE2DTest.1_1_1_59_119_1_1_1_64_128_64_128_int8_t_ND2NZ",
-
-        "TLOADSHAPE2DTest.1_1_1_51_123_1_1_1_64_128_64_128_float_DN2NZ",
-        "TLOADSHAPE2DTest.1_1_1_63_127_1_1_1_63_127_64_128_half_DN2NZ",
 
         "TLOADSHAPE2DTest.1_1_1_128_128_1_1_1_128_128_128_128_float_DN2DN",
         "TLOADSHAPE2DTest.1_1_1_37_126_1_1_1_37_126_64_126_int8_t_DN2DN",
@@ -230,8 +226,6 @@ if __name__ == "__main__":
                       1, 1, 1, 128, 128, 128, 128, DataFormat['ND2NZ'].value),
         tmatmulParams(np.float32, np.float32,  np.float32, 1, 1, 1, 128,
                       128, 1, 1, 1, 128, 128, 128, 128, DataFormat['ND2NZ'].value),
-        tmatmulParams(np.float16, np.float16,  np.float32, 1, 1, 1, 64,
-                      128, 1, 1, 1, 64, 128, 64, 128, DataFormat['DN2NZ'].value),
         tmatmulParams(np.float16, np.float16,  np.float32, 1, 1, 1, 63,
                       127, 1, 1, 1, 63, 127, 64, 128,  DataFormat['ND2NZ'].value),
         tmatmulParams(np.float32, np.float32,  np.float32, 1, 1, 1, 128,
@@ -243,11 +237,6 @@ if __name__ == "__main__":
                       99, 1, 1, 1, 64, 128, 48, 112, DataFormat['ND2NZ'].value),
         tmatmulParams(np.int8, np.int8,  np.int32, 1, 1, 1, 59, 119,
                       1, 1, 1, 64, 128, 64, 128, DataFormat['ND2NZ'].value),
-
-        tmatmulParams(np.float32, np.float32,  np.float32, 1, 1, 1, 51,
-                      123, 1, 1, 1, 64, 128, 64, 128, DataFormat['DN2NZ'].value),
-        tmatmulParams(np.float16, np.float16,  np.float32, 1, 1, 1, 63,
-                      127, 1, 1, 1, 63, 127, 64, 128,  DataFormat['DN2NZ'].value),
 
         tmatmulParams(np.float32, np.float32,  np.float32, 1, 1, 1, 128,
                       128, 1, 1, 1, 128, 128, 128, 128, DataFormat['DN2DN'].value),

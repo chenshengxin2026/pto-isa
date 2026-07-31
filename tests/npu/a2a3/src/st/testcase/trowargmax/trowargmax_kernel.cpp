@@ -101,11 +101,15 @@ __global__ AICORE void runTRowArgMax(__gm__ TVal __out__* outVal, __gm__ TIdx __
     TASSIGN(tmpTile, tmpOffset);
 
     TLOAD(srcTile, srcGlobal);
+#ifndef __PTO_AUTO__
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+#endif
     TROWARGMAX(dstValTile, dstIdxTile, srcTile, tmpTile);
+#ifndef __PTO_AUTO__
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+#endif
     TSTORE(dstValGlobal, dstValTile);
     TSTORE(dstIdxGlobal, dstIdxTile);
     outVal = dstValGlobal.data();

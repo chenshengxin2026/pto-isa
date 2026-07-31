@@ -52,7 +52,7 @@ PTO_INST RecordEvent TSELS(TileDataDst &dst, TileDataMask &mask, TileDataSrc &sr
 
 - **Implementation checks (A2A3)**:
     - `sizeof(TileDataDst::DType)` must be `2` or `4` bytes.
-    - Supported data types are `half`, `float16_t`, `float`, and `float32_t`.
+    - Supported data types are 2- or 4-byte types: `int16_t`, `uint16_t`, `int32_t`, `uint32_t`, `half`, `bfloat16_t`, `float`.
     - `dst` and `src` must use the same element type.
     - `dst` and `src` must be row-major.
     - Runtime: `src.GetValidRow()/GetValidCol()` must match `dst.GetValidRow()/GetValidCol()`.

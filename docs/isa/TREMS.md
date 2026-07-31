@@ -48,7 +48,7 @@ PTO_INST RecordEvent TREMS(TileDataDst &dst, TileDataSrc &src, typename TileData
 `PrecisionType` has the following values available:
 
 * `RemSAlgorithm::DEFAULT`: Normal algorithm, faster but with lower precision.
-* `RemSAlgorithm::HIGH_PRECISION`: High precision algorithm, but slower, only support `float` type.
+* `RemSAlgorithm::HIGH_PRECISION`: High precision algorithm, but slower, only supports `float` type.
 
 ## Constraints
 

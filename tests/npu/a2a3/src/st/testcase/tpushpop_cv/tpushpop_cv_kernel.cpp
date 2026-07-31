@@ -190,6 +190,273 @@ __global__ AICORE void runTPushPopMatmulAdd(
     }
 }
 
+// Partial-valid TILE_UP_DOWN: Acc tile shape may exceed valid M (e.g. tile [16,N], valid [5,N]).
+// Vec0/Vec1 share tile shape [CASE_TILE_M/2, N] but may use uneven valid rows (ceil/floor).
+template <typename InT, typename OutT, int TOTAL_M, int CASE_TILE_M, int K, int N>
+__global__ AICORE void runTPushPopMatmulAddPartialValid(
+    __gm__ uint64_t* ffts_addr, __gm__ OutT* out, __gm__ InT* srcA, __gm__ InT* srcB, __gm__ OutT* bias,
+    __gm__ OutT* fifoMem)
+{
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    constexpr uint32_t TILE_K = K;
+    constexpr uint32_t TILE_N = N;
+    constexpr uint32_t VEC_M = CASE_TILE_M / VEC_CORES;
+    constexpr uint32_t VALID_M0 = (TOTAL_M + 1) / 2;
+    constexpr uint32_t VALID_M1 = TOTAL_M / 2;
+
+    constexpr uint16_t FLAG_ID = 0;
+    constexpr uint8_t FIFO_DEPTH = 1;
+    constexpr uint32_t localFiFoBase = 0x0;
+
+    using AccTile = TileAcc<OutT, CASE_TILE_M, TILE_N, TOTAL_M, TILE_N>;
+    using VecTileHalf = Tile<TileType::Vec, OutT, VEC_M, TILE_N, BLayout::RowMajor, -1, TILE_N>;
+    using BiasTile = Tile<TileType::Vec, OutT, VEC_M, TILE_N, BLayout::RowMajor, -1, TILE_N>;
+    using OutTile = Tile<TileType::Vec, OutT, VEC_M, TILE_N, BLayout::RowMajor, -1, TILE_N>;
+
+    using MatPipe = TPipe<FLAG_ID, Direction::DIR_C2V, CASE_TILE_M * TILE_N * sizeof(OutT), FIFO_DEPTH>;
+    MatPipe mPipe((__gm__ void*)(uint64_t)fifoMem, 0x0, localFiFoBase);
+
+    constexpr uint32_t blockAlign = C0_SIZE_BYTE / sizeof(InT);
+    constexpr uint32_t ALIGNED_M = CeilAlign<uint32_t>(CASE_TILE_M, 16);
+    constexpr uint32_t ALIGNED_K = CeilAlign<uint32_t>(TILE_K, blockAlign);
+    constexpr uint32_t ALIGNED_N = CeilAlign<uint32_t>(TILE_N, blockAlign);
+
+    using GlobalA = GlobalTensor<
+        InT, pto::Shape<1, 1, 1, TOTAL_M, TILE_K>,
+        pto::Stride<TOTAL_M * TILE_K, TOTAL_M * TILE_K, TOTAL_M * TILE_K, TILE_K, 1>>;
+    using GlobalB = GlobalTensor<
+        InT, pto::Shape<1, 1, 1, TILE_K, TILE_N>,
+        pto::Stride<TILE_K * TILE_N, TILE_K * TILE_N, TILE_K * TILE_N, TILE_N, 1>>;
+    using GlobalBias = GlobalTensor<
+        OutT, pto::Shape<1, 1, 1, -1, TILE_N>,
+        pto::Stride<TOTAL_M * TILE_N, TOTAL_M * TILE_N, TOTAL_M * TILE_N, TILE_N, 1>>;
+    using GlobalOut = GlobalTensor<
+        OutT, pto::Shape<1, 1, 1, -1, TILE_N>,
+        pto::Stride<TOTAL_M * TILE_N, TOTAL_M * TILE_N, TOTAL_M * TILE_N, TILE_N, 1>>;
+
+    using TileMatA =
+        Tile<TileType::Mat, InT, ALIGNED_M, ALIGNED_K, BLayout::ColMajor, TOTAL_M, TILE_K, SLayout::RowMajor, 512>;
+    using TileMatB =
+        Tile<TileType::Mat, InT, ALIGNED_K, ALIGNED_N, BLayout::ColMajor, TILE_K, TILE_N, SLayout::RowMajor, 512>;
+    using LeftTile = TileLeft<InT, ALIGNED_M, ALIGNED_K, TOTAL_M, TILE_K>;
+    using RightTile = TileRight<InT, ALIGNED_K, ALIGNED_N, TILE_K, TILE_N>;
+
+    if constexpr (DAV_CUBE) {
+        TileMatA aMatTile;
+        TileMatB bMatTile;
+        TASSIGN(aMatTile, 0x0);
+        TASSIGN(bMatTile, 0x20000);
+
+        LeftTile aTile;
+        RightTile bTile;
+        AccTile accTile;
+        TASSIGN(aTile, 0x0);
+        TASSIGN(bTile, 0x0);
+        TASSIGN(accTile, 0x0);
+
+        GlobalA globalA(srcA);
+        GlobalB globalB(srcB);
+
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+
+        TLOAD(aMatTile, globalA);
+        TLOAD(bMatTile, globalB);
+
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+        TMOV(aTile, aMatTile);
+        TMOV(bTile, bMatTile);
+
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+
+        TMATMUL(accTile, aTile, bTile);
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+        TPUSH<MatPipe, AccTile, TileSplitAxis::TILE_UP_DOWN_ODD>(mPipe, accTile);
+
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+
+        pipe_barrier(PIPE_ALL);
+    }
+
+    if constexpr (DAV_VEC) {
+        uint32_t subBlockIdx = get_subblockid();
+        uint32_t validM = (subBlockIdx == 0) ? VALID_M0 : VALID_M1;
+        uint32_t rowBase = (subBlockIdx == 0) ? 0 : VALID_M0;
+
+        VecTileHalf vecTileHalf(validM);
+        BiasTile biasTile(validM);
+        OutTile outTile(validM);
+        TASSIGN(biasTile, 0x10000);
+        TASSIGN(outTile, 0x20000);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+
+        TPOP<MatPipe, VecTileHalf, TileSplitAxis::TILE_UP_DOWN_ODD>(mPipe, vecTileHalf);
+
+        size_t biasOffset = static_cast<size_t>(rowBase) * TILE_N;
+        GlobalBias globalBias(bias + biasOffset, typename GlobalBias::Shape(validM));
+        TLOAD(biasTile, globalBias);
+
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        TADD(outTile, vecTileHalf, biasTile);
+
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        size_t outOffset = static_cast<size_t>(rowBase) * TILE_N;
+        GlobalOut globalOut(out + outOffset, typename GlobalOut::Shape(validM));
+        TSTORE(globalOut, outTile);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+
+        pipe_barrier(PIPE_ALL);
+    }
+}
+
+// Partial-valid TILE_LEFT_RIGHT_ODD: Acc tile [CASE_TILE_M, CASE_TILE_N] / valid [TOTAL_M, TOTAL_N]
+// with odd TOTAL_N. Vec0/Vec1 share tile shape [TOTAL_M, CASE_TILE_N/2] with valid cols ceil/floor.
+template <typename InT, typename OutT, int TOTAL_M, int CASE_TILE_M, int CASE_TILE_N, int K, int TOTAL_N>
+__global__ AICORE void runTPushPopMatmulAddPartialValidLeftRight(
+    __gm__ uint64_t* ffts_addr, __gm__ OutT* out, __gm__ InT* srcA, __gm__ InT* srcB, __gm__ OutT* bias,
+    __gm__ OutT* fifoMem)
+{
+    set_ffts_base_addr((uint64_t)ffts_addr);
+    constexpr uint32_t TILE_K = K;
+    constexpr uint32_t VEC_N = CASE_TILE_N / VEC_CORES;
+    constexpr uint32_t VALID_N0 = (TOTAL_N + 1) / 2;
+    constexpr uint32_t VALID_N1 = TOTAL_N / 2;
+
+    constexpr uint16_t FLAG_ID = 0;
+    constexpr uint8_t FIFO_DEPTH = 1;
+    constexpr uint32_t localFiFoBase = 0x0;
+
+    using AccTile = TileAcc<OutT, CASE_TILE_M, CASE_TILE_N, TOTAL_M, TOTAL_N>;
+    using VecTileHalf = Tile<TileType::Vec, OutT, TOTAL_M, VEC_N, BLayout::RowMajor, TOTAL_M, -1>;
+    using BiasTile = Tile<TileType::Vec, OutT, TOTAL_M, VEC_N, BLayout::RowMajor, TOTAL_M, -1>;
+    using OutTile = Tile<TileType::Vec, OutT, TOTAL_M, VEC_N, BLayout::RowMajor, TOTAL_M, -1>;
+
+    using MatPipe = TPipe<FLAG_ID, Direction::DIR_C2V, CASE_TILE_M * CASE_TILE_N * sizeof(OutT), FIFO_DEPTH>;
+    MatPipe mPipe((__gm__ void*)(uint64_t)fifoMem, 0x0, localFiFoBase);
+
+    constexpr uint32_t blockAlign = C0_SIZE_BYTE / sizeof(InT);
+    constexpr uint32_t ALIGNED_M = CeilAlign<uint32_t>(CASE_TILE_M, 16);
+    constexpr uint32_t ALIGNED_K = CeilAlign<uint32_t>(TILE_K, blockAlign);
+    constexpr uint32_t ALIGNED_N = CeilAlign<uint32_t>(CASE_TILE_N, blockAlign);
+
+    using GlobalA = GlobalTensor<
+        InT, pto::Shape<1, 1, 1, TOTAL_M, TILE_K>,
+        pto::Stride<TOTAL_M * TILE_K, TOTAL_M * TILE_K, TOTAL_M * TILE_K, TILE_K, 1>>;
+    using GlobalB = GlobalTensor<
+        InT, pto::Shape<1, 1, 1, TILE_K, TOTAL_N>,
+        pto::Stride<TILE_K * TOTAL_N, TILE_K * TOTAL_N, TILE_K * TOTAL_N, TOTAL_N, 1>>;
+    using GlobalBias = GlobalTensor<
+        OutT, pto::Shape<1, 1, 1, TOTAL_M, -1>,
+        pto::Stride<TOTAL_M * TOTAL_N, TOTAL_M * TOTAL_N, TOTAL_M * TOTAL_N, TOTAL_N, 1>>;
+    using GlobalOut = GlobalTensor<
+        OutT, pto::Shape<1, 1, 1, TOTAL_M, -1>,
+        pto::Stride<TOTAL_M * TOTAL_N, TOTAL_M * TOTAL_N, TOTAL_M * TOTAL_N, TOTAL_N, 1>>;
+
+    using TileMatA =
+        Tile<TileType::Mat, InT, ALIGNED_M, ALIGNED_K, BLayout::ColMajor, TOTAL_M, TILE_K, SLayout::RowMajor, 512>;
+    using TileMatB =
+        Tile<TileType::Mat, InT, ALIGNED_K, ALIGNED_N, BLayout::ColMajor, TILE_K, TOTAL_N, SLayout::RowMajor, 512>;
+    using LeftTile = TileLeft<InT, ALIGNED_M, ALIGNED_K, TOTAL_M, TILE_K>;
+    using RightTile = TileRight<InT, ALIGNED_K, ALIGNED_N, TILE_K, TOTAL_N>;
+
+    if constexpr (DAV_CUBE) {
+        TileMatA aMatTile;
+        TileMatB bMatTile;
+        TASSIGN(aMatTile, 0x0);
+        TASSIGN(bMatTile, 0x20000);
+
+        LeftTile aTile;
+        RightTile bTile;
+        AccTile accTile;
+        TASSIGN(aTile, 0x0);
+        TASSIGN(bTile, 0x0);
+        TASSIGN(accTile, 0x0);
+
+        GlobalA globalA(srcA);
+        GlobalB globalB(srcB);
+
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+
+        TLOAD(aMatTile, globalA);
+        TLOAD(bMatTile, globalB);
+
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+        TMOV(aTile, aMatTile);
+        TMOV(bTile, bMatTile);
+
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+
+        TMATMUL(accTile, aTile, bTile);
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+        TPUSH<MatPipe, AccTile, TileSplitAxis::TILE_LEFT_RIGHT_ODD>(mPipe, accTile);
+
+        set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+
+        pipe_barrier(PIPE_ALL);
+    }
+
+    if constexpr (DAV_VEC) {
+        uint32_t subBlockIdx = get_subblockid();
+        uint32_t validN = (subBlockIdx == 0) ? VALID_N0 : VALID_N1;
+        uint32_t colBase = (subBlockIdx == 0) ? 0 : VALID_N0;
+
+        VecTileHalf vecTileHalf(validN);
+        BiasTile biasTile(validN);
+        OutTile outTile(validN);
+        TASSIGN(biasTile, 0x10000);
+        TASSIGN(outTile, 0x20000);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+
+        TPOP<MatPipe, VecTileHalf, TileSplitAxis::TILE_LEFT_RIGHT_ODD>(mPipe, vecTileHalf);
+
+        size_t biasOffset = static_cast<size_t>(colBase);
+        GlobalBias globalBias(bias + biasOffset, typename GlobalBias::Shape(validN));
+        TLOAD(biasTile, globalBias);
+
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        TADD(outTile, vecTileHalf, biasTile);
+
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        size_t outOffset = static_cast<size_t>(colBase);
+        GlobalOut globalOut(out + outOffset, typename GlobalOut::Shape(validN));
+        TSTORE(globalOut, outTile);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+
+        pipe_barrier(PIPE_ALL);
+    }
+}
+
 template <int32_t tilingKey>
 void LaunchTPushPopMatmulAdd(
     uint8_t* ffts, uint8_t* out, uint8_t* srcA, uint8_t* srcB, uint8_t* bias, uint8_t* fifoMem, void* stream)
@@ -228,6 +495,16 @@ void LaunchTPushPopMatmulAdd(
         runTPushPopMatmulAdd<half, float, 64, 16, 32, 32, TileSplitAxis::TILE_LEFT_RIGHT><<<1, nullptr, stream>>>(
             reinterpret_cast<uint64_t*>(ffts), reinterpret_cast<float*>(out), reinterpret_cast<half*>(srcA),
             reinterpret_cast<half*>(srcB), reinterpret_cast<float*>(bias), reinterpret_cast<float*>(fifoMem));
+        // Key 13: float32 partial-valid TILE_UP_DOWN_ODD (M=5 tile=16, vec valid 3/2)
+    } else if constexpr (tilingKey == 13) {
+        runTPushPopMatmulAddPartialValid<float, float, 5, 16, 32, 128><<<1, nullptr, stream>>>(
+            reinterpret_cast<uint64_t*>(ffts), reinterpret_cast<float*>(out), reinterpret_cast<float*>(srcA),
+            reinterpret_cast<float*>(srcB), reinterpret_cast<float*>(bias), reinterpret_cast<float*>(fifoMem));
+        // Key 14: float32 partial-valid TILE_LEFT_RIGHT_ODD (M=5, N=127 tileN=128, vec valid 64/63)
+    } else if constexpr (tilingKey == 14) {
+        runTPushPopMatmulAddPartialValidLeftRight<float, float, 5, 16, 128, 32, 127><<<1, nullptr, stream>>>(
+            reinterpret_cast<uint64_t*>(ffts), reinterpret_cast<float*>(out), reinterpret_cast<float*>(srcA),
+            reinterpret_cast<float*>(srcB), reinterpret_cast<float*>(bias), reinterpret_cast<float*>(fifoMem));
     }
 }
 
@@ -246,4 +523,8 @@ template void LaunchTPushPopMatmulAdd<6>(
 template void LaunchTPushPopMatmulAdd<7>(
     uint8_t* ffts, uint8_t* out, uint8_t* srcA, uint8_t* srcB, uint8_t* bias, uint8_t* fifoMem, void* stream);
 template void LaunchTPushPopMatmulAdd<8>(
+    uint8_t* ffts, uint8_t* out, uint8_t* srcA, uint8_t* srcB, uint8_t* bias, uint8_t* fifoMem, void* stream);
+template void LaunchTPushPopMatmulAdd<13>(
+    uint8_t* ffts, uint8_t* out, uint8_t* srcA, uint8_t* srcB, uint8_t* bias, uint8_t* fifoMem, void* stream);
+template void LaunchTPushPopMatmulAdd<14>(
     uint8_t* ffts, uint8_t* out, uint8_t* srcA, uint8_t* srcB, uint8_t* bias, uint8_t* fifoMem, void* stream);

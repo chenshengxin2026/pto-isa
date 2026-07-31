@@ -88,6 +88,14 @@ PTO_INST RecordEvent TEXTRACT_FP(DstTileData &dst, SrcTileData &src, FpTileData 
 - 向量量化形式额外要求提供 `FpTileData` 缩放操作数，对应 `TEXTRACT_FP(...)` 接口。
 - 对于 `TileType::Acc -> TileType::Vec`，当目标为32位类型（`float`/`int32_t`）且使用 `DualModeSplitN` 时，切分前的 `ValidCol` 必须是 `32` 的整数倍。
 
+### Vec → Vec 抽取路径
+
+除上述 `Mat/Acc -> ...` 路径外，`TEXTRACT` 还支持 `TileType::Vec -> TileType::Vec` 抽取路径（ND 与 NZ 布局），由 `CheckTExtractVecToVecCommon` 强制：
+
+- `DstTileData::DType` 必须等于 `SrcTileData::DType`。
+- 支持的元素类型（A2A3 与 A5 均同）：`int8_t`、`uint8_t`、`int16_t`、`uint16_t`、`int32_t`、`uint32_t`、`half`、`bfloat16_t`、`float`（任意 1/2/4 字节标准类型）。该集合与主 tile 路径不同：新增 `uint8_t`/`int16_t`/`uint16_t`/`int32_t`/`uint32_t`，且在 A5 上**不含** fp8/fp4 类型。
+- ND 路径：源/目标行步进须 32 字节对齐；`Dst` 行/列不得超过 `Src`。
+
 ## 示例
 
 ### 自动（Auto）

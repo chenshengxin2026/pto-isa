@@ -67,7 +67,7 @@ def get_quant_vector(dst_dtype, n):
     return np.array(result, dtype=np.uint64)
 
 
-def extract_quant_params(quant_gm):
+def extract_quant_params(quant_gm, is_vector):
     """
     Extract the parameters M1, offset, and sign from the quant_gm of type uint64.
     Args:
@@ -78,23 +78,35 @@ def extract_quant_params(quant_gm):
         sign: A 1-bit boolean value (0 or 1)
     """
     quant_gm = int(quant_gm)
-    m1_bits = (quant_gm >> 13) & 0x7FFFF
+    
     offset = (quant_gm >> 37) & 0x1FF
     sign = (quant_gm >> 46) & 0x1
+    sat_bit = (quant_gm >> 48) & 0x1
 
-    # Parse M1 into a floating-point number in (1,8,10) format.
-    sign_bit = (m1_bits >> 18) & 0x1
-    exponent = (m1_bits >> 10) & 0xFF
-    mantissa = m1_bits & 0x3FF
+    if is_vector:
+        m1_bits = (quant_gm >> 13) & 0x7FFFF
+        # Parse M1 into a floating-point number in (1,8,10) format.
+        sign_bit = (m1_bits >> 18) & 0x1
+        exponent = (m1_bits >> 10) & 0xFF
+        mantissa = m1_bits & 0x3FF
+        mantissa_bits = 10
+    else:
+        m1_bits = quant_gm & 0xFFFFFFFF
+        # Parse M1 into a floating-point number in (1,8,10) format.
+        sign_bit = (m1_bits >> 31) & 0x1
+        exponent = (m1_bits >> 23) & 0xFF
+        mantissa = m1_bits & 0x7FFFFF
+        mantissa_bits = 23
+
     exponent_bias = 127  # Assuming the exponent bias is 127, which aligns with float32.
-    m1 = (-1) ** sign_bit * (1 + mantissa / 1024) * (2 ** (exponent - exponent_bias))
+    m1 = (-1) ** sign_bit * (1 + mantissa / (2 ** mantissa_bits)) * (2 ** (exponent - exponent_bias))
 
     return m1, offset, sign
 
 
-def apply_quant_element(src_val, quant_gm, mode, dst_dtype, use_relu=False, saturate_inf=False):
+def apply_quant_element(src_val, quant_gm, mode, is_vector, dst_dtype, use_relu=False, saturate_inf=False):
     quant_gm = int(quant_gm)
-    m1, offset, sign = extract_quant_params(quant_gm)
+    m1, offset, sign = extract_quant_params(quant_gm, is_vector)
     res = src_val.astype(np.float32) * m1
 
     if mode in [QuantMode.F32_TO_B8, QuantMode.I32_TO_B8]:
@@ -136,7 +148,7 @@ def process_quant(data_array, quant_array, src_dtype, dst_dtype, is_vector, use_
     for j in range(cols):
         q_param = quant_array[j] if is_vector else quant_array[0]
         for i in range(rows):
-            out[i, j] = apply_quant_element(data_array[i, j], q_param, mode, dst_dtype, use_relu, saturate_inf)
+            out[i, j] = apply_quant_element(data_array[i, j], q_param, mode, is_vector, dst_dtype, use_relu, saturate_inf)
     
     return out
 
@@ -248,7 +260,7 @@ if __name__ == "__main__":
         GlobalTensorInfo(np.int32, np.int16, "ND", True, True, False, 1, 2, 1, 23, 121, 3, 2, 2, 35, 125),
         GlobalTensorInfo(np.int32, np.int8, "ND", True, False, True, 2, 2, 3, 23, 47, 3, 3, 4, 32, 50),
         GlobalTensorInfo(np.float32, np.float16, "DN",False, True, True, 1, 1, 1, 4, 21, 1, 1, 1, 8, 32),
-        GlobalTensorInfo(np.float32, np.float16, "DN", True, False, False, 3, 1, 1, 1, 124, 5, 1, 1, 2, 128),
+        GlobalTensorInfo(np.float32, np.float16, "DN", False, False, False, 3, 1, 1, 1, 124, 5, 1, 1, 2, 128),
         GlobalTensorInfo(np.int32, np.int8, "DN", False, True, False, 2, 1, 2, 32, 32, 3, 4, 3, 64, 35),
         GlobalTensorInfo(np.float32, np.float16, "DN", False, False, True, 1, 1, 1, 16, 8, 1, 1, 2, 16, 8),
         GlobalTensorInfo(np.int32, np.int16, "DN", False, False, False, 2, 2, 2, 16, 16, 5, 3, 3, 16, 16),

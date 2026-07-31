@@ -330,12 +330,13 @@ __tf__ PTO_INTERNAL void TMovCcToUb(
         SetLoop3Para();
     }
     auto srcStride = CeilAlignment(validRow, BLOCK_LEN);
-    __ubuf__ dstType* dstAddr = (__cbuf__ dstType*)__cce_get_tile_ptr(dst);
+    __ubuf__ dstType* dstAddr = (__ubuf__ dstType*)__cce_get_tile_ptr(dst);
     __cc__ srcType* srcData = (__cc__ srcType*)__cce_get_tile_ptr(src);
 
-    copy_matrix_cc_to_ubuf(
-        dstAddr, srcData, 0, validCol, validRow, dstStride, srcStride, 0, unitFlagCtrl, QuantPre,
-        static_cast<uint8_t>(reluMode), Cfg::channelSplitEnable, Cfg::isNz2Nd, false);
+    pto_copy_matrix_cc_to_ub(
+        dstAddr, srcData, 0, validCol, validRow, dstStride, srcStride, 0, false, 0, unitFlagCtrl, QuantPre,
+        static_cast<uint8_t>(reluMode), Cfg::channelSplitEnable, Cfg::isNz2Nd, 0, 0, false, false, 0, false, false,
+        false, false, false, false);
 }
 
 template <typename DstTileData, typename SrcTileData>
@@ -441,7 +442,7 @@ template <
     STPhase Phase = STPhase::Unspecified>
 PTO_INTERNAL void TMOV_IMPL(DstTileData& dst, SrcTileData& src, uint64_t preQuantScalar)
 {
-    CheckTMovAccValid<DstTileData, SrcTileData, typename DstTileData::DType, typename SrcTileData::DType, false>();
+    CheckTMovAccValid<DstTileData, SrcTileData, typename DstTileData::DType, typename SrcTileData::DType, true>();
     uint16_t m = src.GetValidRow();
     uint16_t n = src.GetValidCol();
     constexpr QuantMode_t quantPre = GetScalarPreQuantMode<typename SrcTileData::DType, typename DstTileData::DType>();
@@ -453,13 +454,34 @@ PTO_INTERNAL void TMOV_IMPL(DstTileData& dst, SrcTileData& src, uint64_t preQuan
     }
 }
 
+template <
+    typename DstTileData, typename SrcTileData, AccToVecMode mode, ReluPreMode reluMode = ReluPreMode::NoRelu,
+    STPhase Phase = STPhase::Unspecified>
+PTO_INTERNAL void TMOV_IMPL(DstTileData& dst, SrcTileData& src)
+{
+    CheckTMovAccValid<DstTileData, SrcTileData, typename DstTileData::DType, typename SrcTileData::DType>();
+    static_assert((DstTileData::Loc == TileType::Vec), "Destination location only support Vec.");
+    uint16_t m = src.GetValidRow();
+    uint16_t n = src.GetValidCol();
+    constexpr QuantMode_t quantPre = GetCastPreQuantMode<typename SrcTileData::DType, typename DstTileData::DType>();
+    TMovCcToUb<DstTileData, SrcTileData, quantPre, reluMode, Phase>(dst.data(), src.data(), m, n);
+}
+
+template <typename FpTile>
+__tf__ PTO_INTERNAL void SetFPC(typename FpTile::TileDType __in__ fp)
+{
+    __fbuf__ typename FpTile::DType* dstAddrFp = (__fbuf__ typename FpTile::DType*)__cce_get_tile_ptr(fp);
+    uint64_t deqTensorAddr = ((uint64_t)dstAddrFp >> static_cast<uint64_t>(7)) << 8;
+    set_fpc(deqTensorAddr);
+}
+
 // vector quant
 template <
     typename DstTileData, typename SrcTileData, typename FpTileData, ReluPreMode reluMode = ReluPreMode::NoRelu,
     STPhase Phase = STPhase::Unspecified>
 PTO_INTERNAL void TMOV_IMPL(DstTileData& dst, SrcTileData& src, FpTileData& fp)
 {
-    CheckTMovAccValid<DstTileData, SrcTileData, typename DstTileData::DType, typename SrcTileData::DType, false>();
+    CheckTMovAccValid<DstTileData, SrcTileData, typename DstTileData::DType, typename SrcTileData::DType, true>();
     static_assert(FpTileData::Loc == TileType::Scaling, "Fp only support Scaling.");
     constexpr QuantMode_t quantPre = GetVectorPreQuantMode<typename SrcTileData::DType, typename DstTileData::DType>();
     uint16_t m = src.GetValidRow();

@@ -7,7 +7,6 @@ THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, E
 INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 See LICENSE in the root of the software repository for the full text of the License.
 */
-
 #ifndef PTO_MOCKER_LIGHTWEIGHT_COSTMODEL_HPP
 #define PTO_MOCKER_LIGHTWEIGHT_COSTMODEL_HPP
 
@@ -364,36 +363,42 @@ inline bool TryEstimateTransferLatency(
     return true;
 }
 
-inline bool EstimateCycles(
+inline bool TryEstimateA5Cycles(
     const CostModelInput& input, const PredictRuntimeConfig& predict_config, CostModelResult& result)
 {
-    if (input.arch == CostModelArch::A5) {
-        uint64_t cycles = 0;
-        if (!a5::TryEstimateA5VfCycles(input, cycles)) {
-            return WarnAndFallbackToZero(input, result, "unsupported A5 VF curve key");
-        }
-        result.cycles = static_cast<double>(cycles);
-        result.latency_us = evaluator::CyclesToUs(cycles, predict_config.frequency_mhz);
+    uint64_t cycles = 0;
+    if (!a5::TryEstimateA5VfCycles(input, cycles)) {
+        return WarnAndFallbackToZero(input, result, "unsupported A5 VF curve key");
+    }
+    result.cycles = static_cast<double>(cycles);
+    result.latency_us = evaluator::CyclesToUs(cycles, predict_config.frequency_mhz);
+    return true;
+}
+
+inline bool TryEstimateTransferCycles(
+    const CostModelInput& input, const PredictRuntimeConfig& predict_config, CostModelResult& result)
+{
+    if (TryEstimateTransferLatency(input, predict_config, result)) {
         return true;
     }
+    return WarnAndFallbackToZero(input, result, "unsupported transfer op/tile_type/data_size/dtype");
+}
 
-    if (input.op == PtoOpcode::TLOAD || input.op == PtoOpcode::TSTORE || input.op == PtoOpcode::TMOV) {
-        if (TryEstimateTransferLatency(input, predict_config, result)) {
-            return true;
-        }
-        return WarnAndFallbackToZero(input, result, "unsupported transfer op/tile_type/data_size/dtype");
+inline bool TryEstimateMatmulCyclesWithResult(
+    const CostModelInput& input, const PredictRuntimeConfig& predict_config, CostModelResult& result)
+{
+    uint64_t cycles = 0;
+    if (!TryEstimateMatmulCycles(input, cycles)) {
+        return WarnAndFallbackToZero(input, result, "unsupported matmul shape/dtype combination");
     }
+    result.cycles = static_cast<double>(cycles);
+    result.latency_us = evaluator::CyclesToUs(cycles, predict_config.frequency_mhz);
+    return true;
+}
 
-    if (input.op == PtoOpcode::TMATMUL) {
-        uint64_t cycles = 0;
-        if (!TryEstimateMatmulCycles(input, cycles)) {
-            return WarnAndFallbackToZero(input, result, "unsupported matmul shape/dtype combination");
-        }
-        result.cycles = static_cast<double>(cycles);
-        result.latency_us = evaluator::CyclesToUs(cycles, predict_config.frequency_mhz);
-        return true;
-    }
-
+inline bool TryEstimateElementwiseCycles(
+    const CostModelInput& input, const PredictRuntimeConfig& predict_config, CostModelResult& result)
+{
     if (input.rows <= 0 || input.cols <= 0) {
         return WarnAndFallbackToZero(input, result, "unsupported rows/cols");
     }
@@ -419,6 +424,21 @@ inline bool EstimateCycles(
     result.cycles = static_cast<double>(cycles);
     result.latency_us = evaluator::CyclesToUs(cycles, predict_config.frequency_mhz);
     return true;
+}
+
+inline bool EstimateCycles(
+    const CostModelInput& input, const PredictRuntimeConfig& predict_config, CostModelResult& result)
+{
+    if (input.arch == CostModelArch::A5) {
+        return TryEstimateA5Cycles(input, predict_config, result);
+    }
+    if (input.op == PtoOpcode::TLOAD || input.op == PtoOpcode::TSTORE || input.op == PtoOpcode::TMOV) {
+        return TryEstimateTransferCycles(input, predict_config, result);
+    }
+    if (input.op == PtoOpcode::TMATMUL) {
+        return TryEstimateMatmulCyclesWithResult(input, predict_config, result);
+    }
+    return TryEstimateElementwiseCycles(input, predict_config, result);
 }
 
 inline bool EstimateCycles(const CostModelInput& input, CostModelResult& result)

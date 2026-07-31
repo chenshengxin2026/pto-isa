@@ -9,10 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 if(NOT PROJECT_SOURCE_DIR)
-    set(CANN_CMAKE_TAG "master-017")
-    if(NOT CANN_3RD_LIB_PATH)
-        set(CANN_3RD_LIB_PATH "${CMAKE_BINARY_DIR}/third_party" CACHE PATH "CANN third-party dependency cache")
-    endif()
+    set(CANN_CMAKE_TAG "master-042")
     if(CANN_3RD_LIB_PATH AND IS_DIRECTORY "${CANN_3RD_LIB_PATH}/cann-cmake")
         include("${CANN_3RD_LIB_PATH}/cann-cmake/function/prepare.cmake")
     else()

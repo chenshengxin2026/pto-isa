@@ -50,12 +50,12 @@ PTO_INTERNAL bool BuildAsyncSession(ScratchTile &scratchTile,
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `scratchTile` | — | 用于SDMA控制元数据的UB scratch tile（参见 [scratchTile的作用](#scratchtile-的作用)）。|
+| `scratchTile` | — | 用于SDMA控制元数据的UB scratch tile（参见 [scratchTile的作用](#scratchtile的作用)）。|
 | `workspace` | — | 由主机侧 `SdmaWorkspaceManager` 分配的GM指针。|
 | `session` | — | 输出的 `AsyncSession` 对象。|
 | `syncId` | `0` | MTE3/MTE2管道同步事件ID（0-7）。若kernel在相同ID上使用了其他管道屏障，则需覆盖此值。|
 | `baseConfig` | `{kDefaultSdmaBlockBytes, 0, 1}` | `{block_bytes, comm_block_offset, queue_num}`。适用于大多数单队列传输场景。|
-| `channelGroupIdx` | `kAutoChannelGroupIdx` | SDMA通道组索引。默认内部使用 `get_block_idx()` 映射到当前AI Core。多block或自定义通道映射场景下需覆盖此值。|
+| `channelGroupIdx` | `kAutoChannelGroupIdx` | SDMA通道组索引。默认内部使用 `get_block_idx()` 映射到当前AI Core。多block、并发或自定义通道映射场景下需覆盖此值。|
 
 ### URMA构建（仅NPU_ARCH 3510）
 
@@ -86,6 +86,7 @@ URMA不需要 `scratchTile`——轮询通过 `ld_dev`/`st_dev` 硬件原语直�
 - SDMA和URMA路径均要求源tensor为**扁平连续的逻辑一维**
 - SDMA workspace必须是由主机侧 `SdmaWorkspaceManager` 分配的有效GM指针
 - URMA workspace必须是由主机侧 `UrmaWorkspaceManager` 分配的有效GM指针
+- Session和workspace的生命周期必须覆盖相关Event的完成阶段
 - URMA仅在NPU_ARCH 3510（Ascend 950PR/Ascend 950DT）上可用
 - URMA要求CANN Toolkit **>= 9.1.0**
 - 传给 `UrmaWorkspaceManager::Init()` 的对称数据缓冲区必须由大页内存支撑（使用 `ACL_MEM_MALLOC_HUGE_ONLY` 分配）。底层MR注册要求大页背景；`ACL_MEM_MALLOC_HUGE_FIRST` 在小尺寸分配时可能静默回退到4KB小页，导致注册失败
@@ -115,14 +116,23 @@ URMA不需要 `scratchTile`——轮询通过 `ld_dev`/`st_dev` 硬件原语直�
 
 不同引擎的底层完成机制不同，但用户侧的quiet语义行为一致：
 
-- **SDMA**：`TPUT_ASYNC` 仅提交数据传输SQE，flag SQE延迟到 `Wait` 时提交，通过轮询flag判断完成。
+- **SDMA**：每次`TPUT_ASYNC`都会提交数据传输SQE和用于标记本次操作完成的flag SQE。对其返回的Event调用`Wait`或`Test`时，通过轮询对应flag判断该次`TPUT_ASYNC`是否完成；完成后也能保证同一Session中此前提交的所有SDMA操作均已完成。
 - **URMA**：`TPUT_ASYNC` 立即提交RDMA WRITE WQE并敲门铃。`Wait` 通过轮询Completion Queue（CQ）等待所有预期的CQE被消费。
 
 - `event.Wait(session)` —阻塞，直到**自上次Wait以来所有已发出的异步操作**全部完成
 
 这意味着多次 `TPUT_ASYNC` 调用后，只需对最后一个返回的 `AsyncEvent` 调用一次 `Wait`，即可等待所有pending操作完成（类似shmem的quiet语义）。
 
+同一Session最多可有64个未完成操作，超过后提交可能产生背压。
+
 wait成功后，所有已发出的 `dstGlobalData` 写入均已全部完成。
+
+## SDMA并发与Session所有权
+
+- 同一个Session不能被多个执行流并发使用。
+- 共用同一Channel Group的操作必须共享同一个Session。
+- 并发Kernel或Kernel内多个独立Session必须使用隔离的Channel Group。
+- 重新构建Session或复用Channel Group前，必须先完成此前所有Event。
 
 ## 示例
 

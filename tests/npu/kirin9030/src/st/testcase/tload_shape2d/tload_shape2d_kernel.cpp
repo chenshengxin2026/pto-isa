@@ -41,13 +41,6 @@ AICORE inline void runTLOAD_MIX_ND2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     __ubuf__ T* srcUbAddr = srcTile.data();
     __gm__ T* outAddr = dstGlobal.data();
 
-    // L1清0 方便测试非对齐场景
-#if defined(__DAV_CUBE__)
-    int64_t repeatBit =
-        (static_cast<uint64_t>(baseM * baseK * sizeof(T) / 32) << 16) | (static_cast<uint64_t>(0) << 32) | 1;
-    create_cbuf_matrix((__cbuf__ uint16_t*)srcMatAddr, repeatBit, 0);
-#endif
-
     /*************************************TLOAD****************************************/
     TLOAD<TileMatAData, GlobalDataSrc0>(aMatTile, src0Global);
     uint8_t syncID = 0;
@@ -59,12 +52,7 @@ AICORE inline void runTLOAD_MIX_ND2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     copy_cbuf_to_ubuf(
         (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 0, blockCount, blockLen, 0,
-        0); // move to vector
-            // core0
-    copy_cbuf_to_ubuf(
-        (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 1, blockCount, blockLen, 0,
-        0); // move to vector
-            // core1
+        0); // move to vector core0
     set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
 
@@ -99,13 +87,6 @@ AICORE inline void runTLOAD_MIX_DN2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     __ubuf__ T* srcUbAddr = srcTile.data();
     __gm__ T* outAddr = dstGlobal.data();
 
-    // L1清0 方便测试非对齐场景
-#if defined(__DAV_CUBE__)
-    int64_t repeatBit =
-        (static_cast<uint64_t>(baseM * baseK * sizeof(T) / 32) << 16) | (static_cast<uint64_t>(0) << 32) | 1;
-    create_cbuf_matrix((__cbuf__ uint16_t*)srcMatAddr, repeatBit, 0);
-#endif
-
     /*************************************TLOAD****************************************/
     TLOAD<TileMatAData, GlobalDataSrc0>(aMatTile, src0Global);
     uint8_t syncID = 0;
@@ -117,12 +98,7 @@ AICORE inline void runTLOAD_MIX_DN2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     copy_cbuf_to_ubuf(
         (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 0, blockCount, blockLen, 0,
-        0); // move to vector
-            // core0
-    copy_cbuf_to_ubuf(
-        (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 1, blockCount, blockLen, 0,
-        0); // move to vector
-            // core1
+        0); // move to vector core0
     set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
 
@@ -170,12 +146,7 @@ AICORE inline void runTLOAD_MIX_ND2ND(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     copy_cbuf_to_ubuf(
         (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 0, blockCount, blockLen, 0,
-        0); // move to vector
-            // core0
-    copy_cbuf_to_ubuf(
-        (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 1, blockCount, blockLen, 0,
-        0); // move to vector
-            // core1
+        0); // move to vector core0
     set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
 
@@ -223,12 +194,7 @@ AICORE inline void runTLOAD_MIX_DN2DN(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     copy_cbuf_to_ubuf(
         (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 0, blockCount, blockLen, 0,
-        0); // move to vector
-            // core0
-    copy_cbuf_to_ubuf(
-        (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 1, blockCount, blockLen, 0,
-        0); // move to vector
-            // core1
+        0); // move to vector core0
     set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
 
@@ -269,13 +235,6 @@ AICORE inline void runTLOAD_MIX_NZ2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     __ubuf__ T* srcUbAddr = srcTile.data();
     __gm__ T* outAddr = dstGlobal.data();
 
-    // L1清0 方便测试非对齐场景
-#if defined(__DAV_CUBE__)
-    int64_t repeatBit =
-        (static_cast<uint64_t>(baseM * baseK * sizeof(T) / 32) << 16) | (static_cast<uint64_t>(0) << 32) | 1;
-    create_cbuf_matrix((__cbuf__ uint16_t*)srcMatAddr, repeatBit, 0);
-#endif
-
     /*************************************TLOAD****************************************/
     TLOAD<TileMatAData, GlobalDataSrc0>(aMatTile, src0Global);
     uint8_t syncID = 0;
@@ -287,12 +246,7 @@ AICORE inline void runTLOAD_MIX_NZ2NZ(__gm__ T* out, __gm__ T* src0, __gm__ T* s
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     copy_cbuf_to_ubuf(
         (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 0, blockCount, blockLen, 0,
-        0); // move to vector
-            // core0
-    copy_cbuf_to_ubuf(
-        (__ubuf__ void*)srcUbAddr, (__cbuf__ void*)srcMatAddr, 1, blockCount, blockLen, 0,
-        0); // move to vector
-            // core1
+        0); // move to vector core0
     set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
 
@@ -350,14 +304,6 @@ template void launchTLOADMIX<uint16_t, 0, 1, 1, 1, 128, 128, 1, 1, 1, 128, 128, 
 template void launchTLOADMIX<uint16_t, 0, 1, 1, 1, 33, 99, 1, 1, 1, 64, 128, 48, 112>(
     uint8_t* out, uint8_t* src0, uint8_t* src1, void* stream);
 template void launchTLOADMIX<int8_t, 0, 1, 1, 1, 59, 119, 1, 1, 1, 64, 128, 64, 128>(
-    uint8_t* out, uint8_t* src0, uint8_t* src1, void* stream);
-
-// 1:DN2NZ
-template void launchTLOADMIX<uint16_t, 1, 1, 1, 1, 64, 128, 1, 1, 1, 64, 128, 64, 128>(
-    uint8_t* out, uint8_t* src0, uint8_t* src1, void* stream);
-template void launchTLOADMIX<float, 1, 1, 1, 1, 51, 123, 1, 1, 1, 64, 128, 64, 128>(
-    uint8_t* out, uint8_t* src0, uint8_t* src1, void* stream);
-template void launchTLOADMIX<uint16_t, 1, 1, 1, 1, 63, 127, 1, 1, 1, 63, 127, 64, 128>(
     uint8_t* out, uint8_t* src0, uint8_t* src1, void* stream);
 
 // 3:DN2DN

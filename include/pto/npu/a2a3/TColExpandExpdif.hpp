@@ -56,6 +56,10 @@ template <typename TileDataDst, typename TileDataSrc0, typename TileDataSrc1>
 PTO_INTERNAL void TCOLEXPANDEXPDIF_IMPL(TileDataDst& dst, TileDataSrc0& src0, TileDataSrc1& src1)
 {
     using T = typename TileDataDst::DType;
+    static_assert(
+        std::is_same_v<T, half> || std::is_same_v<T, float16_t> || std::is_same_v<T, float> ||
+            std::is_same_v<T, float32_t>,
+        "Fix: TCOLEXPANDEXPDIF Invalid data type (exp(a-b) supports half/float only).");
     TCOLEXPANDOP_IMPL<ColExpandExpdifOp<T>, ColExpandExpdifOp2<T>, TileDataDst, TileDataSrc0, TileDataSrc1>(
         dst, src0, src1);
 }

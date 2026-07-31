@@ -45,6 +45,9 @@ std::vector<typename TileData::DType> BuildExpected(const ConvTileData& src, uin
     const int64_t outH = (fmapH + src.GetPadList(2) + src.GetPadList(3) - dilationH * (filterH - 1) - 1) / strideH + 1;
     const int64_t outW = (fmapW + src.GetPadList(0) + src.GetPadList(1) - dilationW * (filterW - 1) - 1) / strideW + 1;
 
+    const int64_t kernelSize = filterH * filterW;
+    const int64_t kC0HW = fmapC0 * kernelSize;
+
     std::vector<typename TileData::DType> expected(TileData::Numel, 0);
     for (int r = 0; r < TileData::ValidRow; ++r) {
         const int64_t mIndex = posM + r;
@@ -55,18 +58,17 @@ std::vector<typename TileData::DType> BuildExpected(const ConvTileData& src, uin
         for (int c = 0; c < TileData::ValidCol; ++c) {
             const int64_t kIndex = posK + c;
             const int64_t channelIndex = kIndex / (filterH * filterW);
-            const int64_t kernelOffset = kIndex % (filterH * filterW);
+            const int64_t c1 = kIndex / kC0HW;
+            const int64_t c0 = kIndex % fmapC0;
+            const int64_t kernelOffset = (kIndex % kC0HW) / (fmapC0);
             const int64_t kernelH = kernelOffset / filterW;
             const int64_t kernelW = kernelOffset % filterW;
+
             typename TileData::DType value = src.GetPadValue();
-            if (channelIndex < src.GetChannelSize()) {
-                const int64_t c1 = channelIndex / fmapC0;
-                const int64_t c0 = channelIndex % fmapC0;
-                const int64_t inputH = outRow * strideH + kernelH * dilationH - padTop;
-                const int64_t inputW = outCol * strideW + kernelW * dilationW - padLeft;
-                if (nIndex < fmapN && inputH >= 0 && inputH < fmapH && inputW >= 0 && inputW < fmapW && c1 < fmapC1) {
-                    value = src.data()[Nc1hwc0Offset<ConvTileData>(nIndex, c1, inputH, inputW, c0)];
-                }
+            const int64_t inputH = outRow * strideH + kernelH * dilationH - padTop;
+            const int64_t inputW = outCol * strideW + kernelW * dilationW - padLeft;
+            if (nIndex < fmapN && inputH >= 0 && inputH < fmapH && inputW >= 0 && inputW < fmapW && c1 < fmapC1) {
+                value = src.data()[Nc1hwc0Offset<ConvTileData>(nIndex, c1, inputH, inputW, c0)];
             }
             expected[GetTileElementOffset<TileData>(r, c)] = value;
         }

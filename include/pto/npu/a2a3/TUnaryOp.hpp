@@ -405,6 +405,10 @@ struct ReluOp {
 template <typename DstTile, typename SrcTile>
 PTO_INTERNAL void TRELU_IMPL(DstTile& dst, SrcTile& src)
 {
+    static_assert(
+        std::is_same_v<typename DstTile::DType, half> || std::is_same_v<typename DstTile::DType, float> ||
+            std::is_same_v<typename DstTile::DType, int32_t>,
+        "TRELU: Invalid data type (supported: half, float, int32_t).");
     TUNARY_IMPL<ReluOp<typename DstTile::DType>, DstTile, SrcTile, false>(dst, src);
 }
 

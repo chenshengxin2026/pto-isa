@@ -141,6 +141,13 @@ PTO_INTERNAL void TEXPANDS_IMPL(TileData& dst, typename TileData::DType scalar)
     static_assert(
         TileData::Loc == TileType::Vec || TileData::Loc == pto::TileType::Mat,
         "TileType of tiles must be TileType::Vec or Mat.");
+    static_assert(
+        std::is_same_v<typename TileData::DType, uint8_t> || std::is_same_v<typename TileData::DType, int8_t> ||
+            std::is_same_v<typename TileData::DType, uint16_t> || std::is_same_v<typename TileData::DType, int16_t> ||
+            std::is_same_v<typename TileData::DType, uint32_t> || std::is_same_v<typename TileData::DType, int32_t> ||
+            std::is_same_v<typename TileData::DType, half> || std::is_same_v<typename TileData::DType, bfloat16_t> ||
+            std::is_same_v<typename TileData::DType, float>,
+        "TEXPANDS: Invalid data type.");
 
     if constexpr (TileData::Loc == TileType::Vec) {
         static_assert(

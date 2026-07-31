@@ -1,5 +1,5 @@
 /**
-Copyright (c) 2025 Huawei Technologies Co., Ltd.
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
 This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 CANN Open Software License Agreement Version 2.0 (the "License").
 Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -7,7 +7,6 @@ THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, E
 INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 See LICENSE in the root of the software repository for the full text of the License.
 */
-
 #ifndef PTO_INSTR_HPP
 #define PTO_INSTR_HPP
 #include <string_view>
@@ -64,7 +63,6 @@ inline void InjectTileCycles(T& obj)
     }
 }
 
-// ── Perf-Sim instruction recording ──────────────────────────────────────────
 // Record one PTO instruction to the pipeline simulator.
 // Called from MAP_INSTR_IMPL after the _IMPL call and InjectTileCycles.
 
@@ -129,10 +127,19 @@ inline void RecordInstr(const char* opcode, auto&& first_tile, auto&&... rest_ti
     // For TSTORE(dst=GlobalData, src=TileData), this skips GlobalData and uses TileData.
     ExtractFirstTileInfo(r.rows, r.cols, r.dtype, first_tile, rest_tiles...);
 
-    // Cycle estimate: use captured CCE cycles, else fallback
-    uint64_t cycles = GetLastPtoInstrCycles();
-    if (cycles == 0) {
-        cycles = perf_sim::EstimateInstrCycles(opcode, r.rows, r.cols, r.dtype.empty() ? "unknown" : r.dtype.c_str());
+    const uint64_t measured_cycles = GetLastPtoInstrCycles();
+    const uint64_t estimated_cycles =
+        perf_sim::EstimateInstrCycles(opcode, r.rows, r.cols, r.dtype.empty() ? "unknown" : r.dtype.c_str());
+    uint64_t cycles = measured_cycles;
+    const bool useEstimatedCycles = cycles == 0 ||
+                                    (std::string_view(opcode) == "TROWEXPAND" && estimated_cycles > cycles) ||
+                                    (std::string_view(opcode) == "TDIVS" && (r.dtype == "int16" || r.dtype == "int32"));
+    if (useEstimatedCycles) {
+        cycles = estimated_cycles;
+        auto& trace = ::pto::mocker::GetMutableTrace();
+        if (!trace.executed_pto.empty()) {
+            trace.executed_pto.back().total_cycles = cycles;
+        }
     }
     r.estimated_cycles = cycles;
 
@@ -166,12 +173,7 @@ inline void RecordInstrFromFirst(OpcodeStr&& opcode_str, Args&&... args)
     ::pto::mocker::RecordInstr(std::forward<OpcodeStr>(opcode_str), std::forward<Args>(args)...);
 }
 
-// ── CV Ring Buffer sync for TPUSH/TPOP ────────────────────────────────────────
-// TPUSH record(): ffts_cross_core_sync(PIPE_FIX/MTE3, FlagID) — data ready
-// TPOP wait():   wait_flag_dev(FlagID)                     — wait data ready
 //
-// TPUSH alloc(): wait_flag_dev(FlagID+1)                   — wait free space
-// TPOP free():   ffts_cross_core_sync(PIPE_MTE2, FlagID+1)  — buffer freed
 
 // TPUSH: Record push event to CV ring buffer
 // pipe: TPipe<FlagID, DirType, ...> or TMPipe<FlagID, ...> instance
@@ -208,6 +210,7 @@ inline void RecordTPopSync(Pipe& pipe, TileCons& tile, int tile_index)
     do {                                                             \
         ::pto::mocker::PtoInstrScope _scope(#API);                   \
         API##_IMPL(__VA_ARGS__);                                     \
+        _scope.Finish();                                             \
         ::pto::mocker::InjectTileCycles(PTO_FIRST_ARG(__VA_ARGS__)); \
         ::RecordInstrFromFirst(#API, __VA_ARGS__);                   \
     } while (0)
@@ -217,6 +220,7 @@ inline void RecordTPopSync(Pipe& pipe, TileCons& tile, int tile_index)
     do {                                                             \
         ::pto::mocker::PtoInstrScope _scope(#API);                   \
         API##_IMPL TEMPLATE_ARGS(__VA_ARGS__);                       \
+        _scope.Finish();                                             \
         ::pto::mocker::InjectTileCycles(PTO_FIRST_ARG(__VA_ARGS__)); \
         ::RecordInstrFromFirst(#API, __VA_ARGS__);                   \
     } while (0)
@@ -227,6 +231,7 @@ inline void RecordTPopSync(Pipe& pipe, TileCons& tile, int tile_index)
     do {                                                                                                             \
         ::pto::mocker::PtoInstrScope _scope(#API);                                                                   \
         API##_IMPL TEMPLATE_ARGS(__VA_ARGS__);                                                                       \
+        _scope.Finish();                                                                                             \
         ::pto::mocker::InjectTileCycles(PTO_FIRST_ARG(__VA_ARGS__));                                                 \
         /* Call RecordTPushSync or RecordTPopSync for FFTS sync */                                                   \
         if constexpr (IS_TPUSH) {                                                                                    \
@@ -243,6 +248,7 @@ inline void RecordTPopSync(Pipe& pipe, TileCons& tile, int tile_index)
     do {                                                                                                         \
         ::pto::mocker::PtoInstrScope _scope(#API);                                                               \
         API##_IMPL TEMPLATE_ARGS(__VA_ARGS__);                                                                   \
+        _scope.Finish();                                                                                         \
         ::pto::mocker::InjectTileCycles(PTO_FIRST_ARG(__VA_ARGS__));                                             \
         ::RecordTPushSync(                                                                                       \
             PTO_FIRST_ARG(__VA_ARGS__), PTO_SECOND_ARG(__VA_ARGS__), PTO_FIRST_ARG(__VA_ARGS__).prod.tileIndex); \
@@ -254,6 +260,7 @@ inline void RecordTPopSync(Pipe& pipe, TileCons& tile, int tile_index)
     do {                                                                                                         \
         ::pto::mocker::PtoInstrScope _scope(#API);                                                               \
         API##_IMPL TEMPLATE_ARGS(__VA_ARGS__);                                                                   \
+        _scope.Finish();                                                                                         \
         ::pto::mocker::InjectTileCycles(PTO_FIRST_ARG(__VA_ARGS__));                                             \
         ::RecordTPopSync(                                                                                        \
             PTO_FIRST_ARG(__VA_ARGS__), PTO_SECOND_ARG(__VA_ARGS__), PTO_FIRST_ARG(__VA_ARGS__).cons.tileIndex); \
@@ -920,33 +927,37 @@ PTO_INST RecordEvent TFILLPAD(TileData& dst, TileData& src, WaitEvents&... event
 }
 
 template <
-    typename DstTileData, typename SrcTileData,
+    TFillPadMode mode = TFillPadMode::Normal, typename DstTileData, typename SrcTileData,
     std::enable_if_t<(DstTileData::Loc == TileType::Vec) && (SrcTileData::Loc == TileType::Vec), int> = 0,
     typename... WaitEvents>
 PTO_INST RecordEvent TFILLPAD(DstTileData& dst, SrcTileData& src, WaitEvents&... events)
 {
+    static_assert(
+        mode == TFillPadMode::Normal || mode == TFillPadMode::InPlace || mode == TFillPadMode::Expand,
+        "TFILLPAD: invalid mode.");
     TSYNC(events...);
-    MAP_INSTR_IMPL_T(TFILLPAD, PTO_TEMPLATE_ARGS(DstTileData, SrcTileData), dst, src);
+    if constexpr (mode == TFillPadMode::Normal) {
+        MAP_INSTR_IMPL_T(TFILLPAD, PTO_TEMPLATE_ARGS(DstTileData, SrcTileData), dst, src);
+    } else if constexpr (mode == TFillPadMode::InPlace) {
+        MAP_INSTR_IMPL(TFILLPAD_INPLACE, dst, src);
+    } else if constexpr (mode == TFillPadMode::Expand) {
+        MAP_INSTR_IMPL(TFILLPAD_EXPAND, dst, src);
+    }
     return {};
 }
 
 template <typename DstTileData, typename SrcTileData, typename... WaitEvents>
 PTO_INST RecordEvent TFILLPAD_INPLACE(DstTileData& dst, SrcTileData& src, WaitEvents&... events)
 {
-    TSYNC(events...);
-    MAP_INSTR_IMPL(TFILLPAD_INPLACE, dst, src);
-    return {};
+    return TFILLPAD<TFillPadMode::InPlace>(dst, src, events...);
 }
 
 template <typename DstTileData, typename SrcTileData, typename... WaitEvents>
 PTO_INST RecordEvent TFILLPAD_EXPAND(DstTileData& dst, SrcTileData& src, WaitEvents&... events)
 {
-    TSYNC(events...);
-    MAP_INSTR_IMPL(TFILLPAD_EXPAND, dst, src);
-    return {};
+    return TFILLPAD<TFillPadMode::Expand>(dst, src, events...);
 }
 
-// TSORT32不自动实现wait, 需手动TSYNC(events...)
 template <typename DstTileData, typename SrcTileData, typename IdxTileData>
 PTO_INST RecordEvent TSORT32(DstTileData& dst, SrcTileData& src, IdxTileData& idx)
 {

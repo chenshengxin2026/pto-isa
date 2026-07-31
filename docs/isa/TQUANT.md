@@ -156,9 +156,11 @@ DN data FP8 mantissas share the same physical addresses as ND (the `(r,c)` eleme
 
 | Format | Accepted input dtypes | Notes |
 |--------|----------------------|-------|
-| MXFP8 | FP32, BF16, FP16 | FP32: in-place FP8 output (4:1). BF16/FP16: source zero-padded to `StaticCols`; upcast to FP32 before cast (no direct b16→e4m3). |
-| MXFP4 (e2m1) | **FP16, BF16 only** (not FP32) | output `float4_e2m1x2_t` (packed). |
+| MXFP8 *(A5 only)* | FP32, BF16, FP16 | FP32: in-place FP8 output (4:1). BF16/FP16: source zero-padded to `StaticCols`; upcast to FP32 before cast (no direct b16→e4m3). |
+| MXFP4 (e2m1) *(A5 only)* | **FP16, BF16 only** (not FP32) | output `float4_e2m1x2_t` (packed). |
 | INT8 (sym/asym) | **FP32 only** | SYM→`int8_t`, ASYM→`uint8_t`. A2/A3 need `tmp` = src size. |
+
+> Microscaling (MXFP8/MXFP4) is supported on **A5 only**; A2/A3 support the **INT8** path only (FP32 input).
 
 ## Math Interpretation
 

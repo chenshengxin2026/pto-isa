@@ -10,6 +10,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #ifndef MXTYPES_HPP
 #define MXTYPES_HPP
+#include <cstring>
 
 constexpr unsigned int MAN_DBL = 52;
 constexpr unsigned int EXP_DBL = 11;
@@ -23,13 +24,10 @@ public:
 
     static inline MXType FromRaw(uint8_t rawData) { return MXType(rawData, true); }
 
-    MXType(double value)
+    MXType(double value) : data(0)
     {
-        uint64_t data = 0;
-
         // Handle zero explicitly
         if (value == 0.0) {
-            data = 0;
             return;
         }
 
@@ -61,7 +59,6 @@ public:
             if (outExponent < 0) {
                 outMantissa = (outMantissa | (1 << MAN_SZ)) >> (1 - outExponent);
                 outExponent = 0;
-                return;
             }
         } else {
             // Subnormals of double are too small to fit into new number
@@ -70,7 +67,9 @@ public:
             return;
         }
 
-        data = (dblSign << (MAN_SZ + EXP_SZ)) | (outExponent << MAN_SZ) | outMantissa;
+        data = static_cast<uint8_t>(
+            (dblSign << (MAN_SZ + EXP_SZ)) | ((outExponent & ((1ULL << EXP_SZ) - 1)) << MAN_SZ) |
+            (outMantissa & ((1ULL << MAN_SZ) - 1)));
     }
 
     operator double() const

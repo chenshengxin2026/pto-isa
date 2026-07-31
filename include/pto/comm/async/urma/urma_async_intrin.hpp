@@ -226,6 +226,15 @@ AICORE inline bool UrmaWaitEvent(uint64_t eventHandle, const UrmaEventContext& e
     return ret == 0;
 }
 
+AICORE inline bool UrmaWaitEvent(uint64_t eventHandle, const AsyncSession& session)
+{
+    uint32_t destRankId = 0;
+    uint32_t curHead = 0;
+    DecodeHandle(eventHandle, destRankId, curHead);
+    uint32_t ret = UrmaPollCq(session.contextGm, destRankId, session.qpIdx, curHead);
+    return ret == 0;
+}
+
 // ============================================================================
 // UrmaTestEvent — non-blocking completion check
 // ============================================================================
@@ -256,41 +265,120 @@ AICORE inline bool UrmaTestEvent(uint64_t eventHandle, const UrmaEventContext& e
     return (validOwner ^ lastCqe->owner) != 0;
 }
 
+AICORE inline bool UrmaTestEvent(uint64_t eventHandle, const AsyncSession& session)
+{
+    uint32_t destRankId = 0;
+    uint32_t curHead = 0;
+    DecodeHandle(eventHandle, destRankId, curHead);
+
+    __gm__ UrmaInfo* urmaInfo = (__gm__ UrmaInfo*)session.contextGm;
+    uint32_t qpNum = urmaInfo->qpNum;
+    __gm__ UrmaCqCtx* cqCtxEntry =
+        (__gm__ UrmaCqCtx*)(urmaInfo->scqPtr + (destRankId * qpNum + session.qpIdx) * sizeof(UrmaCqCtx));
+    uint32_t curTail = ld_dev((__gm__ uint32_t*)cqCtxEntry->tailAddr, 0);
+    if (static_cast<int32_t>(curTail - curHead) >= 0) {
+        return true;
+    }
+
+    uint64_t cqBaseAddr = cqCtxEntry->bufAddr;
+    uint32_t depth = cqCtxEntry->depth;
+    uint32_t cqeSize = 1U << cqCtxEntry->cqeShiftSize;
+
+    uint32_t lastIdx = curHead - 1;
+    __gm__ UrmaJfcCqeCtx* lastCqe = (__gm__ UrmaJfcCqeCtx*)(cqBaseAddr + cqeSize * (lastIdx & (depth - 1)));
+    bool validOwner = (lastIdx / depth) & 1;
+
+    DcciCachelines((__gm__ uint8_t*)lastCqe, sizeof(UrmaJfcCqeCtx));
+
+    return (validOwner ^ lastCqe->owner) != 0;
+}
+
 } // namespace detail
 
 // ============================================================================
 // Public API: __urma_put_async / __urma_get_async
+// peer selects SQ/CQ/MemInfo; preferred over execCtx.destRankId for multi-peer reuse.
 // ============================================================================
+
+AICORE inline uint64_t __urma_put_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const UrmaExecContext& execCtx, uint32_t peer)
+{
+    uint32_t curHead =
+        detail::UrmaPostSend(execCtx.contextGm, dst, src, peer, execCtx.qpIdx, UrmaOpcode::WRITE, transferSize);
+    return detail::EncodeHandle(peer, curHead);
+}
+
+AICORE inline uint64_t __urma_put_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const AsyncSession& session, uint32_t peer)
+{
+    uint32_t curHead =
+        detail::UrmaPostSend(session.contextGm, dst, src, peer, session.qpIdx, UrmaOpcode::WRITE, transferSize);
+    return detail::EncodeHandle(peer, curHead);
+}
+
+AICORE inline uint64_t __urma_get_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const UrmaExecContext& execCtx, uint32_t peer)
+{
+    // RDMA READ: remote addr = src (SQE remote field), local addr = dst (SGE.va)
+    uint32_t curHead =
+        detail::UrmaPostSend(execCtx.contextGm, src, dst, peer, execCtx.qpIdx, UrmaOpcode::READ, transferSize);
+    return detail::EncodeHandle(peer, curHead);
+}
+
+AICORE inline uint64_t __urma_get_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const AsyncSession& session, uint32_t peer)
+{
+    // RDMA READ: remote addr = src (SQE remote field), local addr = dst (SGE.va)
+    uint32_t curHead =
+        detail::UrmaPostSend(session.contextGm, src, dst, peer, session.qpIdx, UrmaOpcode::READ, transferSize);
+    return detail::EncodeHandle(peer, curHead);
+}
+
+AICORE inline uint64_t __urma_put_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const AsyncSession& session)
+{
+    return __urma_put_async(dst, src, transferSize, session, session.destRankId);
+}
+
+AICORE inline uint64_t __urma_get_async(
+    __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const AsyncSession& session)
+{
+    return __urma_get_async(dst, src, transferSize, session, session.destRankId);
+}
 
 AICORE inline uint64_t __urma_put_async(
     __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const UrmaExecContext& execCtx)
 {
-    uint32_t curHead = detail::UrmaPostSend(
-        execCtx.contextGm, dst, src, execCtx.destRankId, execCtx.qpIdx, UrmaOpcode::WRITE, transferSize);
-    return detail::EncodeHandle(execCtx.destRankId, curHead);
+    return __urma_put_async(dst, src, transferSize, execCtx, execCtx.destRankId);
 }
 
 AICORE inline uint64_t __urma_get_async(
     __gm__ uint8_t* dst, __gm__ uint8_t* src, uint64_t transferSize, const UrmaExecContext& execCtx)
 {
-    // RDMA READ: remote addr = src (SQE remote field), local addr = dst (SGE.va)
-    uint32_t curHead = detail::UrmaPostSend(
-        execCtx.contextGm, src, dst, execCtx.destRankId, execCtx.qpIdx, UrmaOpcode::READ, transferSize);
-    return detail::EncodeHandle(execCtx.destRankId, curHead);
+    return __urma_get_async(dst, src, transferSize, execCtx, execCtx.destRankId);
 }
 
 // ============================================================================
-// BuildUrmaSession — fill UrmaSession from workspace and destRankId
+// BuildUrmaSession — fill UrmaSession from workspace (peer at TPUT_ASYNC / TGET_ASYNC)
 // ============================================================================
 
-AICORE inline bool BuildUrmaSession(__gm__ uint8_t* contextGm, uint32_t destRankId, UrmaSession& session)
+AICORE inline bool BuildUrmaSession(__gm__ uint8_t* contextGm, UrmaSession& session)
 {
     session.execCtx.contextGm = contextGm;
-    session.execCtx.destRankId = destRankId;
+    session.execCtx.destRankId = 0;
     session.execCtx.qpIdx = 0;
     session.eventCtx.contextGm = contextGm;
     session.valid = (contextGm != nullptr);
     return session.valid;
+}
+
+AICORE inline bool BuildUrmaSession(__gm__ uint8_t* contextGm, uint32_t destRankId, UrmaSession& session)
+{
+    if (!BuildUrmaSession(contextGm, session)) {
+        return false;
+    }
+    session.execCtx.destRankId = destRankId;
+    return true;
 }
 
 // ============================================================================

@@ -150,7 +150,10 @@ PTO_INTERNAL void TMATMUL_BIAS_IMPL(TileRes& cMatrix, TileLeft& aMatrix, TileRig
     // cmatrixSource control matrix source, 0: C matrix is in L0C, 1: C matrix is in C2
     // cmatrixInitVal Indicates the initial matrix, 1: the number in C matrix is 0, 0：use the real number in C matrix
     CheckMadValid<TileRes, TileLeft, TileRight>();
+#if defined(PTO_NPU_ARCH_KIRIN9030)
     static_assert(std::is_same_v<typename TileRes::DType, typename TileBias::DType>, "No supported bias data type.");
+#endif
+
     static_assert(
         (TileBias::Loc == TileType::Bias) && (TileBias::Rows == 1) && (TileBias::isRowMajor),
         "Non-conforming bias fractal.");
