@@ -41,6 +41,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #define __gm__
 #endif
 
+// Skip SdmaWorkspaceManager pull-in from common.hpp (needs CCE attrs on host).
+#define PTO_COMM_ST_SKIP_SDMA_WORKSPACE_MANAGER
 #include "common.hpp"
 
 #include "bcast_smoke_config.hpp"

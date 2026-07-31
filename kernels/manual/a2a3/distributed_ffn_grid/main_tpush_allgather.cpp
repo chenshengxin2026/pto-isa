@@ -48,6 +48,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #define __gm__
 #endif
 
+// Skip SdmaWorkspaceManager pull-in from common.hpp (needs CCE attrs on host).
+#define PTO_COMM_ST_SKIP_SDMA_WORKSPACE_MANAGER
 #include "common.hpp"
 
 #ifdef DT_UNDEFINED
@@ -327,6 +329,12 @@ static const char* GridPipeFaultName(uint32_t code)
             return "wait ready timeout";
         case 0x302:
             return "wait free timeout";
+        case 0x401:
+            return "push payload window out of slot range";
+        case 0x402:
+            return "pop payload window out of slot range";
+        case 0x403:
+            return "broadcast payload window out of slot range";
         default:
             return "unknown";
     }
