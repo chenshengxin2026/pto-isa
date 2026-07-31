@@ -6,16 +6,16 @@
 
 | 例子（运行脚本 / 可执行文件） | 验证的接口 | FFN 模式 | 跨 cell 集合通信 |
 | --- | --- | --- | --- |
-| `run_tpush_reducesum.sh` / `distributed_ffn_grid_tpush_reducesum` | **TPUSH** | ReduceSum | 显式 `TPOP<Dir>` + `TADD` + `TPUSH<Dir>`（即 `TREDUCE` 的 A3 展开式，方向性中继） |
+| `run_tpush_reducesum.sh` / `distributed_ffn_grid_tpush_reducesum` | **TPUSH** | ReduceSum | 显式 `TPOP` + `TADD` + `TPUSH`（即 `TREDUCE` 的 A3 展开式，方向性中继） |
 | `run_tpush_allgather.sh` / `distributed_ffn_grid_tpush_allgather` | **TPUSH** | AllGather | 最近邻 `TPUSH`/`TPOP` 中继 gather（fan-in-1 DAG） |
-| `run_tbroadcast_allgather.sh` / `distributed_ffn_grid_tbroadcast_allgather` | **TBROADCAST** | AllGather | `TBROADCAST<GridGroup>` MPSC 组广播 |
+| `run_tbroadcast_allgather.sh` / `distributed_ffn_grid_tbroadcast_allgather` | **TBROADCAST** | AllGather | `TBROADCAST` MPSC 组广播 |
 | `run_treduce_reducesum.sh` / `distributed_ffn_grid_treduce_reducesum` | **TREDUCE** | ReduceSum | 融合 `TREDUCE<GridGroup, Sum>` 的 N→1 组扇入（`mov_ubuf_group`，op=SUM） |
 
 每个例子都用 `1e-3` 容差把 `[T, H]` 输出与 `golden.bin` 比对。四个例子在 NPU 上全部 **位精确通过**（`max diff = 0`，用 `-r npu` 运行）；详见 [位精确性说明](#位精确性说明)。
 
 跨 cell 的集合通信走 A2/A3 GridPipe mock 后端：mock 中由 GM 撑起的本地 SRAM windows、fake `HcclDeviceContext` window 指针、ready/free 计数器、`dcci/dsb` fence 和自旋等待。该 demo 验证的是编程模型和同设备 mock 路径，不是多卡通信验证。
 
-除这些 FFN 例子外，GridPipe 还支持路由 K-hop unicast（`TPUSH<dir, dist>` / `TPOP<dir, dist>`）与并发组广播（`TBROADCAST<GridGroup>` / `TPOP<GridGroup>`）。这两个能力各有一个独立的 Vec-only 冒烟测试，位于 `smoke/` 子目录（见 [GridPipe 冒烟测试](#gridpipe-冒烟测试)）。
+除这些 FFN 例子外，GridPipe 还支持路由 K-hop unicast（pipe 绑定 `(dir, dist)`）与并发组广播（`GridGroupPipe` 上的 `TBROADCAST` / `TPOP`）。这两个能力各有一个独立的 Vec-only 冒烟测试，位于 `smoke/` 子目录（见 [GridPipe 冒烟测试](#gridpipe-冒烟测试)）。
 
 ## 文件作用
 
@@ -29,9 +29,9 @@
 | `kernel_launch.hpp` | host 侧 mixed kernel launch 接口声明（每个例子一份）。 |
 | `main_treduce_reducesum.cpp` / `main_tpush_reducesum.cpp` | ReduceSum host driver：ACL 初始化、fake HCCL context / 本地 GridPipe windows、工作 buffer、Batcher 加载/分发、kernel launch、golden 比对、资源清理。 |
 | `distributed_ffn_grid_treduce_reducesum_compute_kernel.cpp` | TREDUCE ReduceSum kernel：EAST+SOUTH 归约用融合的 `TREDUCE<GridGroup, Sum>` 组扇入（`mov_ubuf_group`，op=SUM）。 |
-| `distributed_ffn_grid_tpush_reducesum_compute_kernel.cpp` | TPUSH ReduceSum kernel：同样的计算，但 EAST+SOUTH 归约用显式 `TPOP<Dir>` + `TADD` + `TPUSH<Dir>` 拼出。 |
+| `distributed_ffn_grid_tpush_reducesum_compute_kernel.cpp` | TPUSH ReduceSum kernel：同样的计算，但 EAST+SOUTH 归约用显式 `TPOP` + `TADD` + `TPUSH` 拼出。 |
 | `main_tbroadcast_allgather.cpp` / `main_tpush_allgather.cpp` | AllGather host driver。 |
-| `distributed_ffn_grid_tbroadcast_allgather_compute_kernel.cpp` | TBROADCAST AllGather kernel：两个 gather 阶段用 `TBROADCAST<GridGroup>` + `TPOP<GridGroup>`。 |
+| `distributed_ffn_grid_tbroadcast_allgather_compute_kernel.cpp` | TBROADCAST AllGather kernel：两个 gather 阶段用 `TBROADCAST` + `TPOP`。 |
 | `distributed_ffn_grid_tpush_allgather_compute_kernel.cpp` | TPUSH AllGather kernel：两个 gather 阶段用双向 `TPUSH`/`TPOP` 中继。 |
 | `batcher.hpp` | host 侧 **GM 模拟 Batcher**：在 GM 中持有全量输入 + 全量 DRAM 常驻权重，沿列切分成 per-cell shard，广播 x，并暴露输出收集区。 |
 | `tpipe_tmov_inl.hpp` | 把 Cube↔Vec 的 C2V/V2C 搬运封装成方向化 `TMOV` 重载，内部转发到现有 `TPUSH`/`TPOP`，使 kernel 正文不再出现该 handshake。 |
@@ -47,7 +47,7 @@
 
 用 `-r npu` 运行（`sim`/`camodel` 模式会在 `aclrtSetDevice` 报 507033）；共享主机上每次运行都要走 `task-submit`。四个例子全部产出 `max diff = 0`（对 `golden.bin`）——位精确，而不只是落在 `1e-3` 容差内。曾经遮住这一点的是两个真实 bug，现都已修复：
 
-- **缓存行门铃步长（TBROADCAST MPSC）。** `TBROADCAST<GridGroup>` 是真·同时 MPSC 通道——组内每个成员可**同一瞬间**调用，各自只敲自己的 per-source ready lane。这些 lane 原本被打包成连续 `u32`：`GroupMax` lane × 4 B ≤ 32 B < 一条 64 B cache line。于是多个生产者各自写**同一条 line** 的不同 word，而消费者每次轮询都 `dcci` 失效+读取；AICore store 是 line 粒度的，一个生产者的写回就会踩掉另一个的 word，那个门铃便**从 GM 永久丢失**（由绕过消费者 `dcci` 的 D2H lane dump 证伪/证实）。现象：偶发 `wait ready timeout`。修复：让每个 ready/free lane **独占一条 cache line**——`grid_intrinsic.hpp` 的 `kBcastLaneStride = 64` / `kBcastLaneStrideU32 = 16`，在 `ffn_config.hpp` 镜像为 `FFN_NCUT_LANE_STRIDE = 64`，并在 `GridTBroadcast.hpp` 的全部 4 个 lane 下标点应用。phase B/C 的握手从 10–20 s（重试风暴）降到 ~40 µs。
+- **缓存行门铃步长（TBROADCAST MPSC）。** `TBROADCAST` 是真·同时 MPSC 通道——组内每个成员可**同一瞬间**调用，各自只敲自己的 per-source ready lane。这些 lane 原本被打包成连续 `u32`：`GroupMax` lane × 4 B ≤ 32 B < 一条 64 B cache line。于是多个生产者各自写**同一条 line** 的不同 word，而消费者每次轮询都 `dcci` 失效+读取；AICore store 是 line 粒度的，一个生产者的写回就会踩掉另一个的 word，那个门铃便**从 GM 永久丢失**（由绕过消费者 `dcci` 的 D2H lane dump 证伪/证实）。现象：偶发 `wait ready timeout`。修复：让每个 ready/free lane **独占一条 cache line**——`grid_intrinsic.hpp` 的 `kBcastLaneStride = 64` / `kBcastLaneStrideU32 = 16`，在 `ffn_config.hpp` 镜像为 `FFN_NCUT_LANE_STRIDE = 64`，并在 `GridTBroadcast.hpp` 的全部 4 个 lane 下标点应用。phase B/C 的握手从 10–20 s（重试风暴）降到 ~40 µs。
 - **phase-D 输出 T 步长（两个 AllGather kernel）。** AllGather 的 y-shard `[T, Hc]` 写进**完整** `[T, H]` 输出，所以其行步长必须是完整输出宽度 `kHfull`（= `H` = 7168）。从 `hidden_full` store 复制粘贴时遗留成 `kIfull`（= `I` = 3072），把 y 的第 1–7 行打乱（≈50 % 零输出 / 大漂移）。两个 AllGather kernel 的 `GY` store 各改一行 `kIfull` → `kHfull` 即修复。
 
 `treduce` ReduceSum 还要求其 per-cell partial buffer（`partialBuf` / `rowPartialBuf`）以**段主序（segment-major）**布局——每个 `[T, kHBase]` H 段在偏移 `h*(T*kHBase)` 处连续存放——这样组扇入才能把每个同行成员的段当作一段连续字节读出来；只有最终的 `yFull` 保留 strided `[T, H]` golden 布局。
@@ -89,7 +89,7 @@ Vec:
   downPartial --跨列 GridPipe 归约--> yOutput[row] 落在最终列
 ```
 
-跨 cell 的 reduce 与 gather 保持显式的 GridPipe 调用；只有 block 内 Cube↔Vec 的 C2V/V2C 搬运被收敛到 `TMOV`。其中 ReduceSum 例子的 EAST/SOUTH 归约：`treduce` 用 `TREDUCE<GridGroup, Sum>` 组扇入（在 sink 处一次性 N→1 折叠），`tpush` 用 `TPOP<Dir>` + `TADD` + `TPUSH<Dir>` 方向性中继逐跳累加。
+跨 cell 的 reduce 与 gather 保持显式的 GridPipe 调用；只有 block 内 Cube↔Vec 的 C2V/V2C 搬运被收敛到 `TMOV`。其中 ReduceSum 例子的 EAST/SOUTH 归约：`treduce` 用 `TREDUCE<GridGroup, Sum>` 组扇入（在 sink 处一次性 N→1 折叠），`tpush` 用 `TPOP` + `TADD` + `TPUSH` 方向性中继逐跳累加。
 
 10. host 同步 stream，检查 GridPipe fault flags，拷回 `yOutput` 并与 `golden.bin` 比对。
 
@@ -135,9 +135,33 @@ col  = cell % gridCols
 
 所有 cell 都在同一个 device 上运行。`gridRows` 控制 data-parallel token tile 数，`gridCols` 控制 model-parallel FFN shard 数。
 
+### GridPipe 通道绑定（一个 pipe = 一个「生产者 / 消费者」对）
+
+一个 `GridPipe` 存的全部是**核内寄存器状态**：真实硬件上 `ready_scb` / `free_scb` 是 IPC_SCB（SPR），`prod_idx` / `cons_idx` 是 GPR。寄存器不能中途改指向别的对端，所以对端身份写进 pipe 的**类型**里：
+
+```cpp
+// 单播 SPSC 通道：生产者 = 沿 Dir 上游 Dist 跳的核，消费者 = 下游 Dist 跳的核
+GridPipe<Tile, GridDirection::EAST, SlotStride, SlotCount /*, Dist = 1, ScbId = 2*Dir */>
+// 组集合通道（真·同时 MPSC）：生产者/消费者 = 整个 group
+GridGroupPipe<Tile, GridGroup::ROW, SlotStride, SlotCount, GroupMax>
+```
+
+于是 `TPUSH(pipe, tile)` / `TPOP(pipe, tile)` / `TREDUCE<Op>(pipe, acc, recv)` / `TBROADCAST(pipe, tile)` / `TPOP(pipe, tile, srcRank)` 都不再带方向或 group 模板参数——**换生产者或换消费者 ⇒ 定义新的 pipe**。双向中继因此是两个 pipe（前向一个、后向一个），reduce 的 EAST 相与 SOUTH 相也是两个 pipe，各自占用 window 的一段（`FFN_NCUT_TPUSH_PIPE_WIN_P*` / `FFN_RS_REDUCE_PIPE_WIN`）。两段必须互不重叠：否则第二相会从第一相留下的 ready/free 计数开始。
+
+pipe 内部按三类信息分组，与硬件一一对应：
+
+| 成员 | 内容 | 硬件对应 |
+| --- | --- | --- |
+| `pipe.ctx` | `runtimeCtx`（全局上下文实例，用于寻址对端）+ `shape` / `coord` / `pipeId` | 核外的运行时句柄 + 本核在网格中的坐标 |
+| `pipe.slots` | payload ring 基址 + `SlotStride`（单 slot 大小）+ `SlotCount`（环长） | 本核 SRAM 里的 payload ring |
+| `pipe.prod` | `freeScb` + `prodIndex` + payload 子窗口 | IPC_SCB（SPR）+ GPR |
+| `pipe.cons` | `readyScb` + `consIndex` + payload 子窗口 | IPC_SCB（SPR）+ GPR |
+
+`pipe.HasProducer()` / `HasConsumer()` / `ProducerRank()` / `ConsumerRank()` 由绑定的 `(Dir, Dist)` + `coord` / `shape` 推出，kernel 用它们判断自己是链首、链尾还是中间节点。
+
 ### 本地 GridPipe mock
 
-host 分配 `gridRows * gridCols` 个本地 SRAM windows（mock 中由 GM backing）。`TPUSH<EAST>` 通过 `ResolvePeerSlotAddr` 运行时 helper 解析 east neighbor 的 SRAM slot 后写入 payload，再发布 ready counter；`TPOP<EAST>` 等待本地 ready counter、读取本地 SRAM slot，并向 west neighbor 归还 free credit。
+host 分配 `gridRows * gridCols` 个本地 SRAM windows（mock 中由 GM backing）。在一个 EAST-bound pipe 上，`TPUSH` 通过 `ResolvePeerSlotAddr` 运行时 helper 解析 east neighbor 的 SRAM slot 后写入 payload，再发布 ready counter；`TPOP` 等待本地 ready counter、读取本地 SRAM slot，并向 west neighbor 归还 free credit。
 
 mock 使用 GM flag polling 和 cache maintenance 在 A2/A3 上模拟 LPU WSE 预期的 `SPR` / `WFE` 行为。
 
@@ -153,8 +177,8 @@ mock 使用 GM flag polling 和 cache maintenance 在 A2/A3 上模拟 LPU WSE �
 
 这样就把真实硅片的 NoC 约束显式化并**强制**起来：fabric 只能跨核**写**，不能跨核**读**。
 
-- `TPUSH<dir>` 把 payload 写入**邻居核**的段——这是跨段写，正是 fabric 的行为。
-- `TPOP<dir>` 只能 POP **本核自己**的段。`GRID_TRY_TPOP_IMPL` 在 payload 读取前先调用 `PopSlotIsLocal` 守卫；一旦发生跨段读，就写入 `kFaultPopNonLocal`（`0x205`，"pop non-local segment"）并放弃本次 pop，host 的 `CheckGridPipeFaults` 会报出来。
+- `TPUSH` 把 payload 写入**邻居核**的段——这是跨段写，正是 fabric 的行为。
+- `TPOP` 只能 POP **本核自己**的段。`GRID_TRY_TPOP_IMPL` 在 payload 读取前先调用 `PopSlotIsLocal` 守卫；一旦发生跨段读，就写入 `kFaultPopNonLocal`（`0x205`，"pop non-local segment"）并放弃本次 pop，host 的 `CheckGridPipeFaults` 会报出来。
 
 在 native 硬件上 `PopSlotIsLocal` 是恒为 `true` 的 no-op：TPOP 的读地址天然就是本地的，因为 fabric 根本没有远程读通路。这个守卫只是为了 A2/A3 mock——mock 用一块 GM window 模拟 SRAM，它物理上可以读任意地址，若没有守卫，demo 就可能悄悄依赖一次硅片做不到的远程读。每个 A2/A3 kernel 都会编入一条 `static_assert(GmSramArenaSelfCheck())`，因此段计算一旦回归就会在编译期失败，而不是把 pop 误路由出去。
 
@@ -172,7 +196,7 @@ payload 的远端地址解析（把本地 slot / 计分板字解析为对端 GM 
 
 native lowering 对接真实 CCE HSCB/IPC_SCB 栈（`__sync_hscb`/`__st_hscb`；阻塞等待用 `__builtin_cce___wait_ipc_scb`，或现成最贴近的 `__wait_ast_scb`——头文件尚未暴露 IPC_SCB 上的阻塞 `WAIT_SPR`）。当前 A2/A3 mock 用 GM 字 + cache 维护替代这些 IPC_SCB 计分板。native 硬件提供邻居 IPC_SCB 寻址（V8 HW-DEP-1）与 `COPY_UBUF_TO_NBR` builtin（V8 HW-DEP-0）后，上层 GridPipe 调用点不需要修改——打开 `PTO_GRID_CCE_NATIVE`，门面即路由到真实内建。
 
-`TPUSH<EAST>` 先用 `wait_ipc_scb` 等待本核 `free_scb`，写 payload slot，再用 `sync_hscb` 把 `prod_idx` 发布到下游 `ready_scb`。`TPOP<EAST>` 先等待本核 `ready_scb`，读取 payload slot，再发布 `cons_idx` 到上游 `free_scb`。
+EAST-bound pipe 上的 `TPUSH` 先用 `wait_ipc_scb` 等待本核 `free_scb`，写 payload slot，再用 `sync_hscb` 把 `prod_idx` 发布到下游 `ready_scb`。`TPOP` 先等待本核 `ready_scb`，读取 payload slot，再发布 `cons_idx` 到上游 `free_scb`。
 
 ### 组广播与归约 intrinsic（G4 / MOV_UBUF_GROUP）
 
@@ -183,28 +207,28 @@ native lowering 对接真实 CCE HSCB/IPC_SCB 栈（`__sync_hscb`/`__st_hscb`；
   - `op == SUM/MAX/MIN`——归约：本核为**汇**，读每个成员的贡献 slot，按 op 逐元素折叠进 UB（N→1 扇入，pull）。逐元素合并必须知道元素位宽，故 `eltype`（1/2/4 字节）选合并粒度——正是旧的 `reduce_group_to_ubuf`，模板 `T` 换成运行期 `eltype` = `sizeof(T)` 分派。
   `GridCollOp` 数值故意取 `comm::ReduceOp{Sum,Max,Min}` + 1，故 Tier-2 归约调用方用 `static_cast<GridCollOp>(uint32_t(commOp) + 1)` 映射（`COPY=0` 留给广播）。非自同步：data-ready 仍由调用方在 publish fence 后单独 `sync_hscb(READY)` 发出。它按**升序**折叠成员（member 0 播种 `ubTile`），所以 SPMD 行/列扇入能逐位复现方向性中继的从左到右累加（IEEE-754 加法可交换）。A3 mock 下归约把每个成员 GM→UB 拉进来，再用 per-member `combineScratch` 跑核内 `vadd`/`vmax`/`vmin`（mock 必需，COPY 与 native/`__CPU_SIM` 忽略）。三态函数体与旧的两个门面逐字一致——只是模板 `T`/`Op` 换成运行期 `eltype`/`op` 分派——故行为按构造保持 bit-exact。
 
-`GRID_TBROADCAST` 的 per-member 拷贝循环现在**坍缩成一条** `mov_ubuf_group(..., op=COPY, eltype=1)`——只要该组的接收 slot 构成等步长 arena：ROW 和 COL 永远如此（连续 rank → `memberStride = 解析出的 slot₁ − slot₀`）；SUBRECT 在单行/单列时等步长，多行矩形则回退到 per-member `copy_ubuf_to_neighbor_ubuf` 循环。`treduce` ReduceSum 的 EAST（行）与 SOUTH（列）阶段在 sink（`col == gridCols-1` / `row == gridRows-1`）处用 `GRID_TREDUCE_GROUP_IMPL<ROW/COL, Sum, float>` 扇入，后者下译成 `mov_ubuf_group(..., op=SUM, eltype=sizeof(float))`——这是真正的 N→1 扇入，与 `tpush` ReduceSum 例子用 `TPOP<Dir>` + `TADD` + `TPUSH<Dir>` 拼出的方向性中继是不同的集合通信**形状**。两条 Tier-2 门面（`GRID_TBROADCAST` / `GRID_TREDUCE_GROUP_IMPL`）保留各自的 `<Group[,Op,T]>` 模板——该结构性信息属于 PTO 层，不在 CCE 指令层——但它们 tile 无关，所以 `gridpipe_payload_inl.hpp` 的 `TileUbPtr<T>` 负责抽取 tile 的 `__ubuf__` 指针交给 intrinsic。
+`GRID_TBROADCAST` 的 per-member 拷贝循环现在**坍缩成一条** `mov_ubuf_group(..., op=COPY, eltype=1)`——只要该组的接收 slot 构成等步长 arena：ROW 和 COL 永远如此（连续 rank → `memberStride = 解析出的 slot₁ − slot₀`）；SUBRECT 在单行/单列时等步长，多行矩形则回退到 per-member `copy_ubuf_to_neighbor_ubuf` 循环。`treduce` ReduceSum 的 EAST（行）与 SOUTH（列）阶段在 sink（`col == gridCols-1` / `row == gridRows-1`）处用 `GRID_TREDUCE_GROUP_IMPL<ROW/COL, Sum, float>` 扇入，后者下译成 `mov_ubuf_group(..., op=SUM, eltype=sizeof(float))`——这是真正的 N→1 扇入，与 `tpush` ReduceSum 例子用 `TPOP` + `TADD` + `TPUSH` 拼出的方向性中继是不同的集合通信**形状**。两条 Tier-2 门面（`GRID_TBROADCAST` / `GRID_TREDUCE_GROUP_IMPL`）保留各自的 `<Group[,Op,T]>` 模板——该结构性信息属于 PTO 层，不在 CCE 指令层——但它们 tile 无关，所以 `gridpipe_payload_inl.hpp` 的 `TileUbPtr<T>` 负责抽取 tile 的 `__ubuf__` 指针交给 intrinsic。
 
 ### fp32 归约
 
-归约 slot 携带 fp32 `[T, H]`，所以 `FFN_SLOT_BYTES = T * H * 4`。这让 `downPartial`、`yOutput` 和 `golden.bin` 都保持 fp32，host 可直接做容差比较。ReduceSum 的归约是按 H 分段的（`FFN_RS_REDUCE_SLOT_COUNT = kHSegs` = 7，每个 H 段一个 slot）：`treduce` 例子用 `GRID_TREDUCE_GROUP_IMPL` 在 sink 处折叠 segment-h 的 partial；`tpush` 例子用 `TPOP<EAST/SOUTH>` + `TADD` + `TPUSH<EAST/SOUTH>` 逐跳中继累加。在中继形式下 slot 数必须等于 `kHSegs`——跨段复用 slot 会在跨段 *free* 门铃上死锁。
+归约 slot 携带 fp32 `[T, H]`，所以 `FFN_SLOT_BYTES = T * H * 4`。这让 `downPartial`、`yOutput` 和 `golden.bin` 都保持 fp32，host 可直接做容差比较。ReduceSum 的归约是按 H 分段的（`FFN_RS_REDUCE_SLOT_COUNT = kHSegs` = 7，每个 H 段一个 slot）：`treduce` 例子用 `GRID_TREDUCE_GROUP_IMPL` 在 sink 处折叠 segment-h 的 partial；`tpush` 例子用 `TPOP` + `TADD` + `TPUSH` 逐跳中继累加。在中继形式下 slot 数必须等于 `kHSegs`——跨段复用 slot 会在跨段 *free* 门铃上死锁。
 
 ### 路由 K-hop unicast
 
-`TPUSH<dir, dist>` / `TPOP<dir, dist>` 把最近邻 pipe 扩展为沿 `dir` 方向 `dist` 跳的路由 unicast（Scheme A）。payload 写入解析到 `dist` 跳邻居段内的 slot，ready/free 计分板 store 经 `RemoteScbPtr` 解析到 `dist` 跳对端的 IPC_SCB、由 `sync_hscb` 发出，因此下游 `dist` 跳的接收方直接 pop，中间不需要任何中继。`dist == 1` 即原有最近邻行为。fan-in 保持为 1（每个方向/距离只有一个上游），无需 slot/flag 扩容。
+把 pipe 声明成 `GridPipe<Tile, dir, …, dist>` 就把最近邻 pipe 扩展为沿 `dir` 方向 `dist` 跳的路由 unicast（Scheme A）；`TPUSH` / `TPOP` 的写法完全不变。payload 写入解析到 `dist` 跳邻居段内的 slot，ready/free 计分板 store 经 `RemoteScbPtr` 解析到 `dist` 跳对端的 IPC_SCB、由 `sync_hscb` 发出，因此下游 `dist` 跳的接收方直接 pop，中间不需要任何中继。`dist == 1` 即原有最近邻行为。fan-in 保持为 1（每个方向/距离只有一个上游），无需 slot/flag 扩容。
 
 ### 并发组广播（TBROADCAST）
 
-`TBROADCAST<GridGroup>`（首个模板参数为 `ROW` 或 `COL`）把本 cell 的 tile 一次性广播给所在行（`ROW`）或列（`COL`）的所有其它 cell：逐目标写入各接收方共享 ring 批量发出且目标之间无 fence，整个广播只付一次 publish fence，随后逐源 ready lane 批量触发。它不是按跳展开的 `TPUSH` 循环。
+`TBROADCAST`（首个模板参数为 `ROW` 或 `COL`）把本 cell 的 tile 一次性广播给所在行（`ROW`）或列（`COL`）的所有其它 cell：逐目标写入各接收方共享 ring 批量发出且目标之间无 fence，整个广播只付一次 publish fence，随后逐源 ready lane 批量触发。它不是按跳展开的 `TPUSH` 循环。
 
-与旧的单源多播 `TPUSH<GridSpan>`（fan-in=1，禁止并发写者）不同，`TBROADCAST` 是真·同时 MPSC 通道（设计文档 `Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移`）：组内每个成员可**同一瞬间**调用。每个源只写自己在每个接收方共享 ring 中的前缀偏移槽、只敲自己的 per-source ready lane，因此 K 个并发写者永不会踩同一个计数器。这正是"每个 AICORE 广播自己的分片"的 AllGather 得以正确的关键。接收方用 `TPOP<GridGroup>(pipe, tile, srcRank)` 取源 `srcRank` 的分片（按 srcRank 升序，使定向 free 通知链随消费推进）。per-member 的 payload 扇出本身在该组是等步长 arena 时坍缩成单条 `mov_ubuf_group` intrinsic（见 [组广播与归约 intrinsic](#组广播与归约-intrinsicg4--mov_ubuf_group)）。完整握手见 `Grid_TPUSH_TBROADCAST_TREDUCE_接口设计说明.md`。
+与旧的单源多播 `TPUSH<GridSpan>`（fan-in=1，禁止并发写者）不同，`TBROADCAST` 是真·同时 MPSC 通道（设计文档 `Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移`）：组内每个成员可**同一瞬间**调用。每个源只写自己在每个接收方共享 ring 中的前缀偏移槽、只敲自己的 per-source ready lane，因此 K 个并发写者永不会踩同一个计数器。这正是"每个 AICORE 广播自己的分片"的 AllGather 得以正确的关键。接收方用 `TPOP(pipe, tile, srcRank)` 取源 `srcRank` 的分片（按 srcRank 升序，使定向 free 通知链随消费推进）。per-member 的 payload 扇出本身在该组是等步长 arena 时坍缩成单条 `mov_ubuf_group` intrinsic（见 [组广播与归约 intrinsic](#组广播与归约-intrinsicg4--mov_ubuf_group)）。完整握手见 `Grid_TPUSH_TBROADCAST_TREDUCE_接口设计说明.md`。
 
 ### GridPipe 冒烟测试
 
 上述两个能力在 `smoke/` 下各有一个 Vec-only 纯搬运冒烟测试（无 Cube、无 matmul、无数据文件，进程内校验，复用 FFN demo 的 GM-backed mock）：
 
 - `khop_smoke`：`1 x cols` 行网格；每个 cell 向东 `DIST` 跳 push 一块带标记的 fp32 `[T, W]` tile，接收方 pop 后写出；host 校验 `out[c] == in[c-DIST]`。
-- `bcast_smoke`：源 cell（`--src`）经 `TBROADCAST<GridGroup>` 向整行（`--span-col 1` 时为整列、`--subrect 1` 时为子矩形）广播带标记 tile；其余 cell 用 `TPOP<GridGroup>(pipe, tile, src)` 取回并写出；host 校验 `out[cell] == in[source]`。默认 1x5 行、源在 col 2，一次运行同时覆盖源两侧的接收方。
+- `bcast_smoke`：源 cell（`--src`）经 `TBROADCAST` 向整行（`--span-col 1` 时为整列、`--subrect 1` 时为子矩形）广播带标记 tile；其余 cell 用 `TPOP(pipe, tile, src)` 取回并写出；host 校验 `out[cell] == in[source]`。默认 1x5 行、源在 col 2，一次运行同时覆盖源两侧的接收方。
 
 ### AllGather 版本
 

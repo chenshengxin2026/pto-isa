@@ -340,34 +340,43 @@ static const char* GridPipeFaultName(uint32_t code)
     }
 }
 
-// Scan one arena's per-cell flag header (first 128 B = unicast ready/free scbs +
-// reserved) for fault sentinels (any word >= 0x100).
-static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char* arenaName)
+// Scan every PIPE's flag header in one arena for fault sentinels (any word
+// >= 0x100).  A cell's window holds FFN_NCUT_RELAY_PIPE_COUNT pipe windows
+// (forward channel, then backward), each opening with its own 128 B header of
+// ready/free scoreboards + reserved fault words.
+static bool CheckArenaFaults(void* arenaDev, int winBytes, int pipeWinBytes, int cells, const char* arenaName)
 {
     constexpr size_t kFlagWords = static_cast<size_t>(FFN_NCUT_GRID_FLAGS_BYTES) / sizeof(uint32_t);
-    std::vector<uint32_t> flags(static_cast<size_t>(cells) * kFlagWords, 0);
+    constexpr int kPipesPerCell = FFN_NCUT_RELAY_PIPE_COUNT;
+    std::vector<uint32_t> flags(static_cast<size_t>(cells) * kPipesPerCell * kFlagWords, 0);
     for (int cell = 0; cell < cells; ++cell) {
-        auto* src = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes;
-        auto* dst = flags.data() + static_cast<size_t>(cell) * kFlagWords;
-        if (aclrtMemcpy(
-                dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t), ACL_MEMCPY_DEVICE_TO_HOST) !=
-            ACL_SUCCESS) {
-            std::cerr << "[ERROR] GridPipe flag D2H failed (" << arenaName << " cell " << cell << ")" << std::endl;
-            return false;
+        for (int p = 0; p < kPipesPerCell; ++p) {
+            auto* src = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes +
+                        static_cast<size_t>(p) * pipeWinBytes;
+            auto* dst = flags.data() + (static_cast<size_t>(cell) * kPipesPerCell + p) * kFlagWords;
+            if (aclrtMemcpy(
+                    dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t),
+                    ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                std::cerr << "[ERROR] GridPipe flag D2H failed (" << arenaName << " cell " << cell << " pipe " << p
+                          << ")" << std::endl;
+                return false;
+            }
         }
     }
     bool ok = true;
     for (int cell = 0; cell < cells; ++cell) {
         int row = cell / FFN_NCUT_COLS;
         int col = cell - row * FFN_NCUT_COLS;
-        const uint32_t* cellFlags = flags.data() + static_cast<size_t>(cell) * kFlagWords;
-        for (size_t i = 0; i < kFlagWords; ++i) {
-            uint32_t value = cellFlags[i];
-            if (value >= 0x100U) {
-                std::cerr << "[ERROR] GridPipe fault " << arenaName << " cell=" << cell << " row=" << row
-                          << " col=" << col << " word=" << i << " code=0x" << std::hex << value << std::dec << " ("
-                          << GridPipeFaultName(value) << ")" << std::endl;
-                ok = false;
+        for (int p = 0; p < kPipesPerCell; ++p) {
+            const uint32_t* pipeFlags = flags.data() + (static_cast<size_t>(cell) * kPipesPerCell + p) * kFlagWords;
+            for (size_t i = 0; i < kFlagWords; ++i) {
+                uint32_t value = pipeFlags[i];
+                if (value >= 0x100U) {
+                    std::cerr << "[ERROR] GridPipe fault " << arenaName << " cell=" << cell << " row=" << row
+                              << " col=" << col << " pipe=" << p << " word=" << i << " code=0x" << std::hex << value
+                              << std::dec << " (" << GridPipeFaultName(value) << ")" << std::endl;
+                    ok = false;
+                }
             }
         }
     }
@@ -376,8 +385,8 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char
 
 static bool CheckGridPipeFaults(DeviceResources& r)
 {
-    return CheckArenaFaults(r.p1_windows_dev, FFN_NCUT_TPUSH_WIN_P1, r.cells, "P1") &&
-           CheckArenaFaults(r.p2_windows_dev, FFN_NCUT_TPUSH_WIN_P2, r.cells, "P2");
+    return CheckArenaFaults(r.p1_windows_dev, FFN_NCUT_TPUSH_WIN_P1, FFN_NCUT_TPUSH_PIPE_WIN_P1, r.cells, "P1") &&
+           CheckArenaFaults(r.p2_windows_dev, FFN_NCUT_TPUSH_WIN_P2, FFN_NCUT_TPUSH_PIPE_WIN_P2, r.cells, "P2");
 }
 
 static bool VerifyOutput(DeviceResources& r)

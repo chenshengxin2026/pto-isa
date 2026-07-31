@@ -8,8 +8,9 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// A2/A3 backend for GridPipe TREDUCE<Direction, Op, Dist>: a fused
-// "receive-combine-forward" reduce hop along a mesh direction.  Builds on
+// A2/A3 backend for GridPipe TREDUCE<Op>: a fused "receive-combine-forward"
+// reduce hop along the PIPE's direction (the hop's peers are the pipe's bound
+// producer/consumer -- Op is the only per-call template argument).  Builds on
 // GridTPush.hpp / GridTPop.hpp -- see the V7 design spec section 5 (worked
 // ReduceSum example), which frames the row reduce as the SAME single-hop SPSC
 // handshake as AllGather, differing ONLY in the per-hop middle operation:
@@ -65,7 +66,7 @@ AICORE inline void GridReduceCombine(TileAcc& acc, TileRecv& recv)
     }
 }
 
-// GridPipe TREDUCE<Dir, Op, Dist>: one fused reduce hop (see the file header).
+// GridPipe TREDUCE<Op>: one fused reduce hop (see the file header).
 // `acc` is in/out -- on entry the cell's local contribution, on return the
 // running reduction up to and including this cell (at the sink, the complete
 // result).  `recv` is the landing tile for the transiting partial (mandatory on
@@ -82,17 +83,18 @@ AICORE inline void GridReduceCombine(TileAcc& acc, TileRecv& recv)
 // The push half additionally carries its own data-before-ready publish fence
 // inside GRID_TPUSH_IMPL.  The pop / push are gated on CanPopK / CanPushK so a
 // boundary cell never enters GRID_TPUSH_IMPL's out-of-mesh fault path.
-template <pto::GridDirection Dir, pto::comm::ReduceOp Op, int Dist, typename Pipe, typename TileAcc, typename TileRecv>
+template <pto::comm::ReduceOp Op, typename Pipe, typename TileAcc, typename TileRecv>
 AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv)
 {
-    static_assert(Dir != pto::GridDirection::SOURCE, "GridPipe TREDUCE<SOURCE> is illegal (SOURCE is TPOP-only)");
-    static_assert(Dist >= 1, "GridPipe TREDUCE distance must be >= 1 (routed K-hop reduce)");
+    static_assert(
+        Pipe::Dir != pto::GridDirection::SOURCE,
+        "GridPipe TREDUCE on a SOURCE-bound pipe is illegal (SOURCE is TPOP-only)");
 
-    // Receive-and-combine half.  A source cell (no upstream along Dir) has nothing
-    // to drain and forwards its own contribution unchanged.
-    const bool didCombine = CanPopK(Dir, pipe.coord, pipe.shape, Dist);
+    // Receive-and-combine half.  A source cell (no producer peer on this pipe) has
+    // nothing to drain and forwards its own contribution unchanged.
+    const bool didCombine = pipe.HasProducer();
     if (didCombine) {
-        GRID_TPOP_IMPL<Dir, Dist, Pipe, TileRecv>(pipe, recv);
+        GRID_TPOP_IMPL<Pipe, TileRecv>(pipe, recv);
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
@@ -100,14 +102,14 @@ AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv)
         GridReduceCombine<Op, TileAcc, TileRecv>(acc, recv);
     }
 
-    // Forward half.  A sink cell (no downstream along Dir) keeps the complete
-    // reduction in `acc` for the caller to store.
-    if (CanPushK(Dir, pipe.coord, pipe.shape, Dist)) {
+    // Forward half.  A sink cell (no consumer peer on this pipe) keeps the
+    // complete reduction in `acc` for the caller to store.
+    if (pipe.HasConsumer()) {
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
         dsb(DSB_DDR);
-        GRID_TPUSH_IMPL<Dir, Dist, Pipe, TileAcc>(pipe, acc);
+        GRID_TPUSH_IMPL<Pipe, TileAcc>(pipe, acc);
     }
 }
 

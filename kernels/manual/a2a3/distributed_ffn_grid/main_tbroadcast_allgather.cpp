@@ -382,8 +382,9 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char
 static void DumpArenaLanes(
     void* arenaDev, int winBytes, int slotBytes, int bcastSlots, int groupMax, int dumpCells, const char* arenaName)
 {
-    const int readyOff = FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_GRID_DIRECTION_COUNT * FFN_NCUT_SLOT_COUNT * slotBytes +
-                         bcastSlots * slotBytes;
+    // A group pipe's window is flags + shared ring + ready lanes + free lanes;
+    // there is no unicast ring in front of the lanes.
+    const int readyOff = FFN_NCUT_GRID_FLAGS_BYTES + bcastSlots * slotBytes;
     const int freeOff = readyOff + groupMax * FFN_NCUT_LANE_STRIDE;
     std::cout << "[DEBUG] " << arenaName << " lanes (readyOff=" << readyOff << " freeOff=" << freeOff
               << " stride=" << FFN_NCUT_LANE_STRIDE << "):" << std::endl;

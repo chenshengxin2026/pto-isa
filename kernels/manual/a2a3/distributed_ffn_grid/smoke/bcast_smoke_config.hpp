@@ -99,10 +99,8 @@ constexpr int BCAST_W = CONFIG_BCAST_W;
 constexpr int BCAST_TILE_ELEMS = BCAST_T * BCAST_W;
 constexpr int BCAST_TILE_BYTES = BCAST_TILE_ELEMS * 4; // fp32 payload tile
 
-// Unicast slot ring (unused by this pure-broadcast smoke, but the GridPipe
-// template still carries it).  One [T, W] fp32 tile per slot.
+// The group pipe's shared ring carries one [T, W] fp32 tile per slot.
 constexpr int BCAST_SLOT_BYTES = BCAST_TILE_BYTES;
-constexpr int BCAST_SLOT_COUNT = 2;
 
 // TBROADCAST (scheme-②) region sizing: the group is the sub-rectangle extent
 // (SUBRECT) or the larger of the row/col extent (ROW/COL); the shared ring
@@ -113,14 +111,12 @@ constexpr int BCAST_GROUP_MAX = (BCAST_SUBRECT != 0) ?
                                     ((BCAST_ROWS > BCAST_COLS) ? BCAST_ROWS : BCAST_COLS);
 constexpr int BCAST_BCAST_SLOT_COUNT = BCAST_GROUP_MAX;
 
-// Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>():
-//   unicast layout = kFlagsBytes (128) + R dirs * SlotCount * SlotStride,
-//                    R = popcount(DirMask); this smoke is pure broadcast, so
-//                    DirMask = kGridDirNone and R = 0.
-//   + TBROADCAST region: BcastSlotCount * SlotStride (shared ring)
-//                       + 2 * GroupMax * BCAST_LANE_STRIDE (ready + free lanes)
-// Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int BCAST_GRID_DIRECTION_COUNT = 0; // pure broadcast: no unicast rings
+// Host-visible mirror of pto::a2a3_grid::WindowBytes<GridGroupPipe<...>>():
+//   kFlagsBytes (128)                          reserved / fault sentinels
+//   + SlotCount * SlotStride                   shared MPSC ring
+//   + 2 * GroupMax * BCAST_LANE_STRIDE         per-source ready + free lanes
+// A group pipe carries no scoreboard pair and no unicast ring -- its semaphores
+// ARE the lanes.  Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
 constexpr int BCAST_GRID_FLAGS_BYTES = 128;
 // One full cache line per lane -- must match grid_mock::kBcastLaneStride.  This
 // was sizeof(uint32_t) here while the device had already moved to 64, so every
@@ -128,10 +124,7 @@ constexpr int BCAST_GRID_FLAGS_BYTES = 128;
 // into the next cell's window; receivers then waited on a doorbell that had been
 // written outside their window and the smoke hung.
 constexpr int BCAST_LANE_STRIDE = 64;
-constexpr int BCAST_UNICAST_WINDOW_BYTES =
-    BCAST_GRID_FLAGS_BYTES + BCAST_GRID_DIRECTION_COUNT * BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
-constexpr int BCAST_BCAST_REGION_BYTES =
-    BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES + 2 * BCAST_GROUP_MAX * BCAST_LANE_STRIDE;
-constexpr int BCAST_WINDOW_BYTES = BCAST_UNICAST_WINDOW_BYTES + BCAST_BCAST_REGION_BYTES;
+constexpr int BCAST_READY_LANES_OFF = BCAST_GRID_FLAGS_BYTES + BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
+constexpr int BCAST_WINDOW_BYTES = BCAST_READY_LANES_OFF + 2 * BCAST_GROUP_MAX * BCAST_LANE_STRIDE;
 
 #endif // BCAST_SMOKE_CONFIG_HPP

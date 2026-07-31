@@ -43,9 +43,10 @@ constexpr bool DAV_VEC = false;
 #endif
 
 using SmokeTile = Tile<TileType::Vec, float, KHOP_T, KHOP_W, BLayout::RowMajor>;
-// One direction only (the K-hop chain runs EAST), so one slot ring instead of five.
-constexpr int kKhopDirMask = pto::GridDirBit(GridDirection::EAST);
-using SmokePipe = GridPipe<SmokeTile, KHOP_SLOT_BYTES, KHOP_SLOT_COUNT, 0, 0, kKhopDirMask>;
+// One channel: the K-hop chain runs EAST at distance KHOP_DIST, so the pipe binds
+// (EAST, KHOP_DIST) and carries exactly one slot ring.  Its producer peer is the
+// cell KHOP_DIST hops west, its consumer peer the one KHOP_DIST hops east.
+using SmokePipe = GridPipe<SmokeTile, GridDirection::EAST, KHOP_SLOT_BYTES, KHOP_SLOT_COUNT, KHOP_DIST>;
 
 using ShapeTW = Shape<1, 1, 1, KHOP_T, KHOP_W>;
 using StrideTW = Stride<KHOP_T * KHOP_W, KHOP_T * KHOP_W, KHOP_T * KHOP_W, KHOP_W, 1>;
@@ -69,10 +70,6 @@ __global__ AICORE void KHopSmokeKernel(
     }
 
     if constexpr (DAV_VEC) {
-        using pto::GridDirection;
-        constexpr GridDirection kDir = GridDirection::EAST;
-        constexpr int kDist = KHOP_DIST;
-
         SmokeTile sendTile;
         SmokeTile recvTile;
         TASSIGN(sendTile, kUbSend);
@@ -96,18 +93,18 @@ __global__ AICORE void KHopSmokeKernel(
 #endif
         dsb(DSB_DDR);
 
-        // Routed K-hop unicast push to the cell kDist hops east (if it exists).
-        if (CanPushK(kDir, coord, shape, kDist)) {
-            TPUSH<kDir, kDist>(pipe, sendTile);
+        // Routed K-hop unicast push to this pipe's consumer peer (if it exists).
+        if (pipe.HasConsumer()) {
+            TPUSH(pipe, sendTile);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
             dsb(DSB_DDR);
         }
 
-        // Cells that have a kDist-hop east upstream pop what it pushed and store it.
-        if (CanPopK(kDir, coord, shape, kDist)) {
-            TPOP<kDir, kDist>(pipe, recvTile);
+        // Cells that have a producer peer pop what it pushed and store it.
+        if (pipe.HasProducer()) {
+            TPOP(pipe, recvTile);
 #ifndef __PTO_AUTO__
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);

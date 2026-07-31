@@ -8,13 +8,15 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// A2/A3 backend for GridPipe TPUSH<Direction, Dist>.
+// A2/A3 backend for GridPipe TPUSH.
 //
-// Dist is the hop count of a routed unicast push (Dist == 1 is the original
-// nearest-neighbor behavior).  Scheme A: a K-hop unicast keeps the receiver's
-// per-direction slot/flag state at fan-in 1, so distance only changes the
-// resolved target rank and the doorbell reach -- the window layout, slot rings,
-// flag counts and the TPOP read-locality guard are all unchanged.  See
+// The direction and hop distance are the PIPE's (Pipe::Dir / Pipe::Dist), not
+// the call's: a pipe is bound to one (producer, consumer) pair, and pushing
+// elsewhere means using another pipe (grid_intrinsic.hpp section 1).  Dist == 1
+// is the original nearest-neighbor behavior.  Scheme A: a K-hop unicast keeps
+// the receiver's per-channel slot/flag state at fan-in 1, so distance only
+// changes the resolved target rank and the doorbell reach -- the window layout,
+// slot ring, flag count and the TPOP read-locality guard are all unchanged.  See
 // RankForPushK/CanPushK in grid_intrinsic.hpp and the design analysis 2026-06-02.
 //
 // Producer-side expansion calls the V8 CCE facades directly (V8 section 3.5.3
@@ -83,29 +85,21 @@ AICORE bool PopSlotIsLocal(__gm__ void* runtimeCtx, __gm__ uint8_t* localSlot, u
 
 namespace pto {
 
-// SOURCE direction is illegal as a TPUSH target.  Provide an
-// undefined primary template so attempts to instantiate it fail at link time
-// with a clear symbol name; the static_assert in pto_instr.hpp catches this
-// earlier at compile time.
-template <pto::GridDirection Dir, int Dist, typename Pipe, typename TileProd>
+// The channel is the pipe's: Dir/Dist come from Pipe, so a TPUSH always targets
+// the consumer peer the pipe was declared for.  A pipe bound to SOURCE cannot
+// push (SOURCE is a TPOP-only injection channel) and is rejected below; the
+// static_assert in pto_instr.hpp catches it at the call site first.
+template <typename Pipe, typename TileProd>
 AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
-    static_assert(Dir != GridDirection::SOURCE, "GridPipe TPUSH<SOURCE> is illegal (design doc 4.3)");
-    static_assert(Dist >= 1, "GridPipe TPUSH distance must be >= 1 (routed K-hop unicast)");
-    // Plain bit test, not GridDirInMask(): that helper is host-callable (see
-    // grid_intrinsic.hpp) and this body is AICORE.
-    static_assert(
-        ((Pipe::DirMask >> static_cast<int>(Dir)) & 1) != 0,
-        "GridPipe TPUSH<Dir> needs Dir in the pipe's DirMask -- that direction has no slot ring "
-        "(add GridDirBit(Dir) to the GridPipe DirMask template argument).");
-
-    constexpr int dirIdx = GridDirectionIndex(Dir);
+    constexpr GridDirection Dir = Pipe::Dir;
+    static_assert(Dir != GridDirection::SOURCE, "GridPipe TPUSH on a SOURCE-bound pipe is illegal (design doc 4.3)");
 
     // Boundary check. In production builds the compiler folds CanPushK() against
     // constexpr coord/Dist; here we keep the runtime check so dynamic
     // coordinates still trap.  Dist == 1 is the original nearest-neighbor path.
-    if (!CanPushK(Dir, pipe.coord, pipe.shape, Dist)) {
-        grid_mock::MockBoundaryFault(pipe.readyScb[dirIdx], grid_mock::PushFaultCode(Dir));
+    if (!pipe.HasConsumer()) {
+        grid_mock::MockBoundaryFault(pipe.cons.readyScb, grid_mock::PushFaultCode(Dir));
         return false;
     }
 
@@ -113,17 +107,15 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
     //   WAIT_SPR alone reads the local free_scb and blocks (read+block in one
     //   instruction; no MOV_SPR2X peek -- V8).  The `prodIndex >= SlotCount` guard is
     //   exactly threshold > 0, so the first SlotCount pushes skip the wait (startup
-    //   zero-block, V8 R6).  free_scb_<dir> occupies IPC_SCB slot
-    //   kGridDirectionCount+dirIdx.
-    const uint32_t idx = pipe.prodIndex[dirIdx];
-    const uint32_t freeSlot = static_cast<uint32_t>(kGridDirectionCount) + static_cast<uint32_t>(dirIdx);
+    //   zero-block, V8 R6).  This pipe's free_scb is IPC_SCB slot Pipe::FreeScbSlot.
+    const uint32_t idx = pipe.prod.prodIndex;
     if (idx >= static_cast<uint32_t>(Pipe::SlotCount)) {
         const uint32_t freeThreshold = idx + 1 - Pipe::SlotCount;
-        if (!wait_ipc_scb_sim(pipe.freeScb[dirIdx], freeThreshold, freeSlot, maxSpins)) {
+        if (!wait_ipc_scb_sim(pipe.prod.freeScb, freeThreshold, Pipe::FreeScbSlot, maxSpins)) {
             // Offset the fault-flag word only when the base scb pointer is real: nullptr + offset
             // is UB and would slip a non-null (but invalid) pointer past MockSetFault's null guard.
             __gm__ uint32_t* freeFault =
-                pipe.freeScb[dirIdx] ? pipe.freeScb[dirIdx] + grid_mock::kFaultFlagWordOffset : nullptr;
+                pipe.prod.freeScb ? pipe.prod.freeScb + grid_mock::kFaultFlagWordOffset : nullptr;
             grid_mock::MockSetFault(freeFault, grid_mock::kFaultWaitFreeTimeout);
             return false;
         }
@@ -131,23 +123,21 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
 
     // Step 2 (V7 P2): compute the local slot address from the producer GPR
     //   (slot_off = (prod_idx % SlotCount) * SlotStride); pure local scalar math.
-    //   SlotStride addresses the ring; the payload window says what part of the
-    //   slot this push actually moves (a5 TPipe: entryBase + entryOffset, with the
-    //   length coming from the transfer descriptor rather than the slot size).
-    const GridPayloadWindow win = pipe.pushWindow[dirIdx];
+    //   SlotStride addresses the ring; the producer's payload window says what part
+    //   of the slot this push actually moves (a5 TPipe: entryBase + entryOffset,
+    //   with the length coming from the transfer descriptor, not the slot size).
+    const GridPayloadWindow win = pipe.prod.window;
 
     // Range guard (differs from a5: there the length is implied by the tile /
     // GlobalTensor descriptors and cannot exceed the slot; here it is a runtime
     // number, and an overrun writes into the PEER's window).
     if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
-        __gm__ uint32_t* rangeFault =
-            pipe.freeScb[dirIdx] ? pipe.freeScb[dirIdx] + grid_mock::kFaultFlagWordOffset : nullptr;
+        __gm__ uint32_t* rangeFault = pipe.prod.freeScb ? pipe.prod.freeScb + grid_mock::kFaultFlagWordOffset : nullptr;
         grid_mock::MockSetFault(rangeFault, grid_mock::kFaultPushPayloadRange);
         return false;
     }
 
-    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotStride + win.entryOffset;
-    __gm__ uint8_t* localSlot = pipe.slotBase[dirIdx] + slotOff;
+    __gm__ uint8_t* localSlot = pipe.slots.Slot(idx) + win.entryOffset;
 
     // Step 3 (V7 P3): payload transfer to the *target's* SRAM/L1 slot region.
     //   For Dist > 1 this is the rank Dist hops away along Dir (a routed write);
@@ -155,8 +145,8 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
     //   The runtime helper resolves the target rank's slot; the payload hook then
     //   extracts the tile UB pointer and calls the copy_ubuf_to_neighbor_ubuf CCE
     //   facade (V7 COPY_UBUF_TO_NBR).
-    const int peerRank = RankForPushK(Dir, pipe.coord, pipe.shape, Dist);
-    __gm__ uint8_t* neighborSlot = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, localSlot, peerRank);
+    const int peerRank = pipe.ConsumerRank();
+    __gm__ uint8_t* neighborSlot = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.ctx.runtimeCtx, localSlot, peerRank);
     if (win.rowCount == 0) {
         a2a3_grid_payload::CopyTileToNeighborSramSlot<TileProd>(neighborSlot, tile, Pipe::SlotStride);
     } else {
@@ -179,26 +169,28 @@ AICORE bool GRID_TRY_TPUSH_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = 
     dsb(DSB_DDR);
 
     // Step 4 (V7 P5): announce readiness -- sync_hscb (SYNC_HSCB) store of
-    //   prod_idx (= idx+1) into the downstream neighbor's ready_scb_<dir> IPC_SCB
-    //   (overwrite store of a monotone absolute count; single external writer per
-    //   SPSC).  ready_scb_<dir> occupies IPC_SCB slot dirIdx.
+    //   prod_idx (= idx+1) into the consumer peer's ready_scb IPC_SCB (overwrite
+    //   store of a monotone absolute count; single external writer per SPSC).  The
+    //   peer declared the same pipe type at the same window offset, so its ready
+    //   scb is ours resolved to its rank; natively it is IPC_SCB slot
+    //   Pipe::ReadyScbSlot.
     //
     // Doorbell reach (Dist > 1): the A2/A3 mock routes the HSCB store to any rank
     // via RemoteScbPtr(peerRank), so K-hop works here as-is.  Native lowering
     // resolves the peer IPC_SCB address from (dir,dist) (V7 HW-DEP-1).
-    __gm__ uint32_t* neighborReady = a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.readyScb[dirIdx], peerRank);
+    __gm__ uint32_t* neighborReady = a2a3_grid_payload::RemoteScbPtr(pipe.ctx.runtimeCtx, pipe.cons.readyScb, peerRank);
     sync_hscb(neighborReady, idx + 1);
 
     // Step 5 (V7 P5): bump the local producer GPR (drives slot addr / free
-    //   threshold / the absolute count published to the downstream peer).
-    pipe.prodIndex[dirIdx] = idx + 1;
+    //   threshold / the absolute count published to the consumer peer).
+    pipe.prod.prodIndex = idx + 1;
     return true;
 }
 
-template <pto::GridDirection Dir, int Dist, typename Pipe, typename TileProd>
+template <typename Pipe, typename TileProd>
 AICORE void GRID_TPUSH_IMPL(Pipe& pipe, TileProd& tile)
 {
-    (void)GRID_TRY_TPUSH_IMPL<Dir, Dist, Pipe, TileProd>(pipe, tile, 0);
+    (void)GRID_TRY_TPUSH_IMPL<Pipe, TileProd>(pipe, tile, 0);
 }
 
 } // namespace pto
