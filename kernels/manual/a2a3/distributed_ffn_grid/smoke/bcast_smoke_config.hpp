@@ -112,12 +112,12 @@ constexpr int BCAST_GROUP_MAX = (BCAST_SUBRECT != 0) ?
 constexpr int BCAST_BCAST_SLOT_COUNT = BCAST_GROUP_MAX;
 
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<GridGroupPipe<...>>():
-//   kFlagsBytes (128)                          reserved / fault sentinels
+//   kFlagsBytes (512)                          reserved / fault sentinels
 //   + SlotCount * SlotStride                   shared MPSC ring
 //   + 2 * GroupMax * BCAST_LANE_STRIDE         per-source ready + free lanes
 // A group pipe carries no scoreboard pair and no unicast ring -- its semaphores
 // ARE the lanes.  Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int BCAST_GRID_FLAGS_BYTES = 128;
+constexpr int BCAST_GRID_FLAGS_BYTES = 512;
 // One full cache line per lane -- must match grid_mock::kBcastLaneStride.  This
 // was sizeof(uint32_t) here while the device had already moved to 64, so every
 // window was short by 2*GroupMax*60 bytes and the ready lanes ran off the end

@@ -2747,6 +2747,42 @@ PTO_INST RecordEvent TBROADCAST(Pipe& pipe, TileProd& tile, WaitEvents&... event
     return {};
 }
 
+// ---------------------------------------------------------------------------
+// GridPipe THANDOFF overload: 接力计数 (relay counting) across a time-division
+// producer handoff (design doc Grid_TPUSH_TPOP_WSE核间握手机制选型 §1.3 / §3.2 B1).
+//
+// Use it where a channel's CONSUMER stays put across a phase boundary while its
+// PRODUCER changes.  The new producer means a new pipe -- peers are part of the
+// pipe TYPE -- but the ring and the scoreboard pair do not move, so `oldPipe` and
+// `newPipe` must be declared over ONE window with ONE shared ScbId and only the
+// counters cross: relayed (the successor starts at the retiring producer's final
+// prod_idx, so it lands behind the tiles still in the ring) or, at a provably
+// drained boundary, rebased to 0.  GRID_TRY_THANDOFF_IMPL states the protocol.
+//
+// Every core calls it; the halves it executes follow from the topology, exactly
+// as TPUSH/TPOP/TREDUCE derive theirs.  `handoffSeq` is the window's monotone
+// handoff generation (1, 2, ...) and must be identical across the mesh;
+// `retiredEnd` is the retiring phase's tile count on this edge, which lets the
+// consumer PROVE the retiring producer is done (H3) instead of assuming it -- pass
+// 0 only when the schedule establishes quiescence some other way.
+// ---------------------------------------------------------------------------
+template <
+    typename OldPipe, typename NewPipe, std::enable_if_t<is_grid_pipe_v<OldPipe> && is_grid_pipe_v<NewPipe>, int> = 0,
+    typename... WaitEvents>
+PTO_INST RecordEvent
+THANDOFF(OldPipe& oldPipe, NewPipe& newPipe, uint32_t handoffSeq, uint32_t retiredEnd, WaitEvents&... events)
+{
+#if defined(PTO_NPU_ARCH_A2A3)
+    TSYNC(events...);
+    GRID_THANDOFF_IMPL<OldPipe, NewPipe>(oldPipe, newPipe, handoffSeq, retiredEnd);
+#else
+    static_assert(
+        sizeof(OldPipe) == 0, "GridPipe THANDOFF not supported on this target profile "
+                              "(design doc section 5.4 forbids silent GM fallback).");
+#endif
+    return {};
+}
+
 // GridGroupPipe TPOP overload: drain ONE shard that source `srcRank` broadcast
 // into this receiver's shared ring (the receive half of TBROADCAST).  The group
 // pipe type plus the extra `srcRank` argument select this overload against the

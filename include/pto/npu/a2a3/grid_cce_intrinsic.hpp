@@ -25,16 +25,41 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //   COPY_UBUF_TO_NBR | copy_ubuf_to_neighbor_ubuf   | __builtin_cce_copy_ubuf_to_neighbor_ubuf | copy_ubuf_to_neighbor_ubuf
 //   SYNC_HSCB/ST_HSCB| __sync_hscb                  | __builtin_cce___sync_hscb                | sync_hscb
 //   WAIT_SPR         | __wait_ipc_scb               | __builtin_cce___wait_ipc_scb             | wait_ipc_scb
+//   MOV_SPR2X        | __mov_ipc_scb_to_l1          | __builtin_cce___mov_ipc_scb_to_l1        | mov_ipc_scb_to_l1
+//   MOV_L12X         | __mov_l1_to_gpr              | __builtin_cce___mov_l1_to_gpr            | mov_l1_to_gpr
 // clang-format on
 //
 // V8 revision vs V7: WAIT_SPR alone reads the local IPC_SCB and blocks -- read+block
 // is ONE instruction (entry reads the unsigned count and compares: >= threshold
 // proceeds, < threshold suspends the current pipe until the peer's SYNC_HSCB store
 // raises it).  The V7 "先 get_ipc_scb (MOV_SPR2X) 非阻塞 peek、不足才 WAIT_SPR 阻塞"
-// two-step is GONE: get_ipc_scb / MOV_SPR2X no longer appears in the handshake path,
-// so the machine-instruction count collapses from "新增 1 + 复用 3" to "新增 1 + 复用 2".
-// (MOV_SPR2X remains a hardware fact -- the ScalarUnit *can* read an IPC_SCB via
-// MOV_SPR2X -- but the handshake never uses it; see V8 §3.2.0.)
+// two-step is GONE: get_ipc_scb / MOV_SPR2X no longer appears in the STEADY-STATE
+// handshake path (TPUSH / TPOP / TBROADCAST / TREDUCE), so the per-tile machine
+// instruction count collapses from "新增 1 + 复用 3" to "新增 1 + 复用 2".
+//
+// The MOV-class facades exist for the 接力计数 producer handoff (THANDOFF /
+// GridTHandoff.hpp) and for NOTHING else.  In particular they are NOT how a
+// scoreboard is tested: ready_scb / free_scb live in the SPR file and WAIT_SPR
+// compares their value against the threshold in the instruction itself.  What the
+// handoff needs is to move a prod_idx BETWEEN TWO PRODUCER CORES; prod_idx is a GPR
+// run-counter on both ends, and the only cross-core transport (SYNC_HSCB / ST_HSCB)
+// both SOURCES FROM and LANDS IN L1.  So the two moves are:
+//
+//   MOV_SPR2X (mov_ipc_scb_to_l1) -- SPR -> L1, on the relaying consumer.  It drops
+//     the retiring producer's final prod_idx (already sitting in this core's
+//     ready_scb, put there by that producer's last SYNC_HSCB(READY)) into an L1 word,
+//     which is exactly where ST_HSCB can pick it up.  There is deliberately NO
+//     SPR -> GPR form: nothing needs one, since a scoreboard is only ever compared
+//     (WAIT_SPR) or forwarded (this).  Deliberately NOT named get_ipc_scb either --
+//     that V7 name meant "non-blocking peek in front of a WAIT_SPR", a step V8 deleted.
+//   MOV_L12X  (mov_l1_to_gpr)     -- L1 -> GPR.  The only way a value in memory
+//     becomes a scalar the code can branch on or run a counter with: the incoming
+//     producer uses it to load the delivered baseline into its prod_idx, and the
+//     relaying consumer uses it to read back the word it just staged so it can
+//     compare against cons_idx.
+//
+// Note the asymmetry -- one moves an SPR into memory, the other memory into a
+// register.  They are different machine instructions and must not share a facade.
 //
 // Why the facade names here drop the leading "__" (sync_hscb / wait_ipc_scb):
 // cce_aicore_intrinsics.h *already* declares __sync_hscb and __wait_ast_scb as real
@@ -182,6 +207,39 @@ AICORE inline void sync_hscb(__gm__ uint32_t* peerScb, uint32_t absCount)
 // ===========================================================================
 
 namespace grid_cce_detail {
+// Shared GM-mock scalar read of a word this core owns (an IPC_SCB stand-in or an
+// L1 word).  The dcci is not optional: AICORE caches are not coherent between
+// cores, so without invalidating the line first this can return a stale value that
+// a peer's sync_hscb store already superseded -- the same reason the wait_ipc_scb
+// spin re-invalidates on every iteration.
+AICORE inline uint32_t read_local_word(__gm__ uint32_t* addr)
+{
+    if (addr == nullptr) {
+        return 0;
+    }
+    volatile __gm__ uint32_t* ptr = reinterpret_cast<volatile __gm__ uint32_t*>(addr);
+    __asm__ __volatile__("" ::: "memory");
+    dcci(reinterpret_cast<__gm__ void*>(const_cast<__gm__ uint32_t*>(ptr)), SINGLE_CACHE_LINE);
+    __asm__ __volatile__("" ::: "memory");
+    return *ptr;
+}
+
+// Shared GM-mock scalar write of a word this core owns.  The trailing dcci writes
+// the line back so a later read (this core's mov_l1_to_gpr, or the host's D2H dump)
+// observes it; AICORE caches are not coherent between cores.
+AICORE inline void write_local_word(__gm__ uint32_t* addr, uint32_t value)
+{
+    if (addr == nullptr) {
+        return;
+    }
+    volatile __gm__ uint32_t* ptr = reinterpret_cast<volatile __gm__ uint32_t*>(addr);
+    __asm__ __volatile__("" ::: "memory");
+    *ptr = value;
+    __asm__ __volatile__("" ::: "memory");
+    dcci(reinterpret_cast<__gm__ void*>(const_cast<__gm__ uint32_t*>(ptr)), SINGLE_CACHE_LINE);
+    __asm__ __volatile__("" ::: "memory");
+}
+
 // Shared GM spin-poll for the mock: return true once *localScb >= threshold.
 // `maxSpins == 0` means block-forever (matches hardware WAIT_SPR); `maxSpins > 0`
 // bounds the poll so a handshake deadlock fails the test instead of hanging (mock
@@ -251,6 +309,56 @@ AICORE inline bool wait_ipc_scb_sim(__gm__ uint32_t* localScb, uint32_t threshol
 }
 
 // ===========================================================================
+// (4) MOV_SPR2X  ->  __mov_ipc_scb_to_l1  ->  __builtin_cce___mov_ipc_scb_to_l1
+//
+// Copy a LOCAL IPC_SCB into a LOCAL L1 word.  NOT part of any handshake -- a
+// scoreboard TEST is wait_ipc_scb, which compares inside the instruction.  The one
+// legitimate use is the 接力计数 handoff's relay step: the retiring producer's
+// final prod_idx is sitting in this core's ready_scb and has to be forwarded to the
+// incoming producer, so it must first land somewhere ST_HSCB can source from, which
+// is L1.  There is no SPR -> GPR variant because nothing needs one.
+//
+// `srcSlot` selects the native IPC_SCB slot (0..15); `srcScb` is the GM word the
+// mock reads instead (native ignores it, the mock ignores the slot).  `dstL1` is the
+// local L1 word to deposit into.  Null operands are tolerated as no-ops, matching
+// sync_hscb / wait_ipc_scb.
+// ===========================================================================
+AICORE inline void mov_ipc_scb_to_l1(__gm__ uint32_t* dstL1, __gm__ uint32_t* srcScb, uint32_t srcSlot)
+{
+#if defined(PTO_GRID_CCE_NATIVE)
+    (void)srcScb;
+    __builtin_cce___mov_ipc_scb_to_l1(dstL1, srcSlot); // MOV_SPR2X; encoding per ISA manual
+#else
+    (void)srcSlot;
+    grid_cce_detail::write_local_word(dstL1, grid_cce_detail::read_local_word(srcScb));
+#endif
+}
+
+// ===========================================================================
+// (5) MOV_L12X  ->  __mov_l1_to_gpr  ->  __builtin_cce___mov_l1_to_gpr
+//
+// READ a LOCAL L1/SRAM word into a scalar GPR -- the only way a value in memory
+// becomes something the scalar unit can branch on or run a counter with.  Two uses,
+// both in the 接力计数 relay: the incoming producer loads the delivered baseline
+// into its prod_idx (TPUSH derives the ring slot and the free threshold from it),
+// and the relaying consumer reads back the word MOV_SPR2X just staged so it can
+// compare it against cons_idx.
+//
+// Unlike mov_ipc_scb_to_l1 above this addresses L1 rather than naming a slot, which
+// is exactly why the two cannot share a facade.  On the receiving side the caller
+// must have observed the arrival doorbell (wait_ipc_scb on the install scoreboard)
+// first; this read carries no synchronisation of its own.
+// ===========================================================================
+AICORE inline uint32_t mov_l1_to_gpr(__gm__ uint32_t* localL1)
+{
+#if defined(PTO_GRID_CCE_NATIVE)
+    return __builtin_cce___mov_l1_to_gpr(localL1); // MOV_L12X; encoding per ISA manual
+#else
+    return grid_cce_detail::read_local_word(localL1);
+#endif
+}
+
+// ===========================================================================
 // GridCollOp: the MOV_UBUF_GROUP `op` machine operand -- the NoC collective
 // communication MODE (design: 2026-07-24-bcast-reduce-合并mov_ubuf_group方案.md
 // §2.1).  From the issuing core's perspective a group broadcast (1->N identity
@@ -271,7 +379,7 @@ enum class GridCollOp : uint8_t {
 };
 
 // ===========================================================================
-// (4) MOV_UBUF_GROUP  ->  mov_ubuf_group  ->  __builtin_cce_mov_ubuf_group
+// (6) MOV_UBUF_GROUP  ->  mov_ubuf_group  ->  __builtin_cce_mov_ubuf_group
 //
 // Unified template-free group collective transfer.  The issuing core moves
 // `bytes` between its local UB tile and the resolved per-member group arena,

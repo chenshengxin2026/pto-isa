@@ -30,15 +30,41 @@ namespace a2a3_grid {
 // because the peer resolver maps a local address to the SAME byte offset in the
 // peer's window).
 //
-// Unicast pipe (GridPipe):
-//   offset                        contents
-//   ----------------------------------------------------------------------
-//   kReadyScbOffset (0)           ready scb u32  -- consumer semaphore, written
-//                                 by the producer peer's SYNC_HSCB(READY)
-//   kFreeScbOffset  (4)           free  scb u32  -- producer semaphore, written
-//                                 by the consumer peer's SYNC_HSCB(FREE)
-//   8 .. kFlagsBytes-1            reserved (fault sentinels, alignment, telemetry)
-//   kSlotRegionOffset (128)       slot ring [SlotCount * SlotStride]
+// Unicast pipe (GridPipe).  Every scoreboard owns a FULL CACHE LINE
+// (grid_mock::kScbLineStride) because each has a DIFFERENT external writer and
+// the write-back is line-granular -- see the rationale on kScbLineStride in
+// grid_intrinsic.hpp.  Packing them (the original 4 B spacing) let one peer's
+// store silently drop another peer's doorbell.
+//
+//   offset                        contents                       written by
+//   ------------------------------------------------------------------------
+//   kReadyScbOffset   (0)         ready   scb u32  (consumer sem)  producer peer
+//   kFreeScbOffset    (64)        free    scb u32  (producer sem)  consumer peer
+//   kInstallScbOffset (128)       install scb u32  (producer sem)  consumer peer
+//                                 INSTALL_BASE doorbell = handoff generation
+//   kOpenScbOffset    (192)       open    scb u32  (consumer sem)  producer peer
+//                                 OPEN_ACK, same generation
+//   kBatonOutOffset   (256)       baton L1 u32     (consumer sem)  THIS core
+//                                 the retiring prod_idx staged for ST_HSCB
+//   kBatonInOffset    (320)       baton L1 u32     (producer sem)  consumer peer
+//                                 the relayed prod_idx, delivered by ST_HSCB and
+//                                 lifted into the GPR by MOV_L12X
+//   384 .. kFlagsBytes-1          reserved (alignment, telemetry)
+//   kSlotRegionOffset (512)       slot ring [SlotCount * SlotStride]
+//
+// The last two are L1/SRAM words, NOT scoreboards: they carry a value to be READ,
+// so they have no IPC_SCB slot number and nothing ever waits on them.  Two of them
+// because under SPMD one core is both sides of a handoff at once -- it stages its
+// own outgoing baton while its successor consumer delivers its incoming one, and a
+// single shared word would collide.
+//
+// Each word's fault sentinel sits kFaultFlagWordOffset u32 words INTO ITS OWN
+// line, so the sentinels stay clear of every live word.  (The sentinel write is
+// local, so it shares a line with a remotely-written word; that is harmless in
+// practice because a sentinel is only ever written on a run that has already
+// failed.)
+//
+// The four handoff words are idle in steady state.
 //
 // Group pipe (GridGroupPipe, scheme-② 真·同时 MPSC):
 //   0 .. kFlagsBytes-1            reserved (fault sentinels, alignment); the
@@ -51,17 +77,32 @@ namespace a2a3_grid {
 //   + GroupMax*64                 per-source free lanes  [GroupMax * 64 B]
 //                                 (this core is the sole writer of each)
 //
-// Keep enough reserved words for the GridTPush/GridTPop fault sentinels:
-//   readyScb + kFaultFlagWordOffset   (word 10)
-//   freeScb  + kFaultFlagWordOffset   (word 11)
-inline constexpr uint32_t kFlagsBytes = 128;
-inline constexpr uint32_t kSlotRegionOffset = kFlagsBytes;
-
-// The pipe's scoreboard pair, as u32 word indices / byte offsets into its window.
-inline constexpr uint32_t kReadyScbWord = 0;
-inline constexpr uint32_t kFreeScbWord = 1;
+// The pipe's header words, as u32 word indices / byte offsets into its window.
+// Lines 0/1 are the steady-state ready/free scoreboard pair; lines 2/3 the 接力计数
+// handoff doorbells; lines 4/5 the two baton L1 words (see the layout comment
+// above).  The stride is one cache line, NOT one word -- that is the correctness
+// requirement, not padding.
+inline constexpr uint32_t kHeaderLineCount = 6;
+inline constexpr uint32_t kReadyScbWord = 0 * grid_mock::kScbLineStrideU32;
+inline constexpr uint32_t kFreeScbWord = 1 * grid_mock::kScbLineStrideU32;
+inline constexpr uint32_t kInstallScbWord = 2 * grid_mock::kScbLineStrideU32;
+inline constexpr uint32_t kOpenScbWord = 3 * grid_mock::kScbLineStrideU32;
+inline constexpr uint32_t kBatonOutWord = 4 * grid_mock::kScbLineStrideU32;
+inline constexpr uint32_t kBatonInWord = 5 * grid_mock::kScbLineStrideU32;
 inline constexpr uint32_t kReadyScbOffset = kReadyScbWord * sizeof(uint32_t);
 inline constexpr uint32_t kFreeScbOffset = kFreeScbWord * sizeof(uint32_t);
+inline constexpr uint32_t kInstallScbOffset = kInstallScbWord * sizeof(uint32_t);
+inline constexpr uint32_t kOpenScbOffset = kOpenScbWord * sizeof(uint32_t);
+inline constexpr uint32_t kBatonOutOffset = kBatonOutWord * sizeof(uint32_t);
+inline constexpr uint32_t kBatonInOffset = kBatonInWord * sizeof(uint32_t);
+
+// Flag header: kHeaderLineCount cache lines plus reserved headroom, rounded up so
+// the slot ring stays generously aligned.  Host launchers mirror this constant
+// (the *_GRID_FLAGS_BYTES in the demo configs).
+inline constexpr uint32_t kFlagsBytes = 512;
+static_assert(
+    kFlagsBytes >= kHeaderLineCount * grid_mock::kScbLineStride, "flag header must hold one line per header word");
+inline constexpr uint32_t kSlotRegionOffset = kFlagsBytes;
 
 // Payload ring bytes -- identical formula for both pipe flavours (the group
 // pipe's ring is the shared MPSC ring, so its SlotCount is the ring depth SC).
@@ -134,11 +175,19 @@ AICORE inline void InitGridPipeFromWindow(
         pipe.cons.readyLanes = reinterpret_cast<__gm__ uint32_t*>(window + readyOff);
         pipe.prod.freeLanes = reinterpret_cast<__gm__ uint32_t*>(window + freeOff);
     } else {
-        // SPSC: this pipe's own ready/free scoreboard pair + zeroed GPR counters.
+        // SPSC: this pipe's own ready/free scoreboard pair, its 接力计数 handoff
+        // trio, and zeroed GPR counters.  Two pipes declared over the SAME window
+        // (a time-division producer handoff) therefore land on the same physical
+        // words, which is exactly what lets THANDOFF relay the counters instead of
+        // starting the successor on an unrelated ring.
         __gm__ uint32_t* scbs = reinterpret_cast<__gm__ uint32_t*>(window);
         pipe.cons.readyScb = scbs + kReadyScbWord;
+        pipe.cons.openScb = scbs + kOpenScbWord;
+        pipe.cons.batonL1 = scbs + kBatonOutWord;
         pipe.cons.consIndex = 0;
         pipe.prod.freeScb = scbs + kFreeScbWord;
+        pipe.prod.installScb = scbs + kInstallScbWord;
+        pipe.prod.batonL1 = scbs + kBatonInWord;
         pipe.prod.prodIndex = 0;
     }
     pipe.prod.window = GridPayloadWindow{};

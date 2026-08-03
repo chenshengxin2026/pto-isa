@@ -55,14 +55,14 @@ constexpr int FFN_SLOT_COUNT = 4;
 
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>().
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp:
-//   unicast layout = kFlagsBytes (128) + 5 dirs * SlotCount * SlotBytes.
+//   unicast layout = kFlagsBytes (512) + 5 dirs * SlotCount * SlotBytes.
 // The AllGather variant additionally appends the TBROADCAST (scheme-②) region:
 //   + BcastSlotCount * SlotBytes   (shared payload ring)
 //   + 2 * GroupMax * 4             (per-source ready lanes + free lanes)
 // because each cell broadcasts its own hidden shard concurrently (真·同时 MPSC)
 // and the per-receiver shared ring + per-source lanes live in every window.
 constexpr int FFN_GRID_DIRECTION_COUNT = 5;
-constexpr int FFN_GRID_FLAGS_BYTES = 128;
+constexpr int FFN_GRID_FLAGS_BYTES = 512;
 constexpr int FFN_GRID_UNICAST_WINDOW_BYTES =
     FFN_GRID_FLAGS_BYTES + FFN_GRID_DIRECTION_COUNT * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
 #ifdef CONFIG_FFN_GRID_ALLGATHER
@@ -297,7 +297,7 @@ constexpr int FFN_NCUT_Y_SHARD_BYTES = FFN_NCUT_T * FFN_NCUT_H_SHARD * 4;      /
 // scoreboard pair and no per-direction ring.  Window =
 // flags(128) + SlotCount*SlotStride + 2*GroupMax*kBcastLaneStride, matching
 // pto::a2a3_grid::WindowBytes<GridGroupPipe<...>>() in grid_pipe_runtime.hpp.
-constexpr int FFN_NCUT_GRID_FLAGS_BYTES = 128;
+constexpr int FFN_NCUT_GRID_FLAGS_BYTES = 512;
 constexpr int FFN_NCUT_SLOT_BYTES_P1 = FFN_NCUT_HIDDEN_SHARD_BYTES;
 constexpr int FFN_NCUT_SLOT_BYTES_P2 = FFN_NCUT_ROW_BLOCK_BYTES;
 constexpr int FFN_NCUT_GROUP_P1 = FFN_NCUT_COLS; // 8 (ROW group)

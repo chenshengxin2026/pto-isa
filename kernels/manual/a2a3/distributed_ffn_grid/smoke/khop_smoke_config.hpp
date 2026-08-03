@@ -55,11 +55,11 @@ constexpr int KHOP_SLOT_BYTES = KHOP_TILE_BYTES;
 constexpr int KHOP_SLOT_COUNT = 2;
 
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>():
-//   layout = kFlagsBytes (128) + SlotCount * SlotStride.
+//   layout = kFlagsBytes (512) + SlotCount * SlotStride.
 // One pipe is one channel with one ring, and this smoke declares a single
 // EAST-bound pipe, so that is the whole window.
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int KHOP_GRID_FLAGS_BYTES = 128;
+constexpr int KHOP_GRID_FLAGS_BYTES = 512;
 constexpr int KHOP_WINDOW_BYTES = KHOP_GRID_FLAGS_BYTES + KHOP_SLOT_COUNT * KHOP_SLOT_BYTES;
 
 #endif // KHOP_SMOKE_CONFIG_HPP

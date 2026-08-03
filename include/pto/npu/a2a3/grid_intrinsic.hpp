@@ -594,14 +594,37 @@ struct GridSlotRing {
 // downstream.  They are separate structs because they are separate registers
 // bound to separate peers -- exactly a5 TPipe's `prod` / `cons` pair.
 // ---------------------------------------------------------------------------
+// `installScb` / `openScb` are the 接力计数 (relay-counting) handoff DOORBELLS and
+// `batonL1` the relayed prod_idx itself; all three are idle in steady state and
+// touched only by THANDOFF (see GridTHandoff.hpp).  The doorbells follow the SAME
+// ownership rule as free/ready -- a producer-side word is written by its consumer
+// peer and a consumer-side one by its producer peer, so every word keeps a single
+// external writer (C1).
+//
+// `batonL1` is the 接力棒 -- the one value a handoff has to physically carry from
+// the retiring channel to its successor: the prod_idx the incoming producer must
+// start counting from.  Everything else the successor needs is already in place
+// (the ring and its contents never move, and free credit is an ordinary scoreboard
+// store), so this single word IS the handoff's payload.
+//
+// Note what it is NOT: an L1/SRAM word, not an IPC_SCB, and with no slot number.  A
+// scoreboard is a thing you WAIT on (WAIT_SPR compares inside the instruction); the
+// baton is a thing you MOVE -- out of the retiring channel's ready_scb by MOV_SPR2X,
+// across by ST_HSCB, and into the successor's prod_idx GPR by MOV_L12X.  Keeping it
+// out of the scoreboard file is also what holds the handoff's IPC_SCB budget down to
+// the two doorbells.
 struct GridProducerSem {
-    __gm__ uint32_t* freeScb = nullptr; // IPC_SCB (SPR): free credit, written by the consumer peer
-    uint32_t prodIndex = 0;             // GPR: absolute count of tiles pushed
-    GridPayloadWindow window{};         // sub-window this side moves (a5: Producer::entryOffset)
+    __gm__ uint32_t* freeScb = nullptr;    // IPC_SCB (SPR): free credit, written by the consumer peer
+    __gm__ uint32_t* installScb = nullptr; // IPC_SCB (SPR): INSTALL_BASE doorbell (handoff generation), ditto
+    __gm__ uint32_t* batonL1 = nullptr;    // L1 word: prod_idx baseline DELIVERED here by the consumer's ST_HSCB
+    uint32_t prodIndex = 0;                // GPR: absolute count of tiles pushed
+    GridPayloadWindow window{};            // sub-window this side moves (a5: Producer::entryOffset)
 };
 
 struct GridConsumerSem {
     __gm__ uint32_t* readyScb = nullptr; // IPC_SCB (SPR): ready count, written by the producer peer
+    __gm__ uint32_t* openScb = nullptr;  // IPC_SCB (SPR): OPEN_ACK (handoff generation), written by the producer peer
+    __gm__ uint32_t* batonL1 = nullptr;  // L1 word: MOV_SPR2X drops the outgoing baton here for ST_HSCB to forward
     uint32_t consIndex = 0;              // GPR: absolute count of tiles popped
     GridPayloadWindow window{};          // sub-window this side moves (a5: Consumer::entryOffset)
 };
@@ -646,6 +669,14 @@ struct GridGroupConsumerSem {
 // direction"; two pipes that share a direction on one core must be given
 // distinct ids.  The A2/A3 mock reads the GM word and ignores the slot number;
 // native WAIT_SPR uses it.
+//
+// A pipe that takes part in a 接力计数 producer handoff (THANDOFF) additionally
+// occupies ScbId+2..ScbId+3 -- the install / open doorbells below.  Those slots
+// are idle in steady state, so the budget is charged where it is spent: the
+// static_assert here still only requires ScbId+1 < 16, and GridTHandoff.hpp
+// asserts ScbId+3 < 16 for the pipes actually handed off.  The two pipes on
+// either side of a handoff are one physical channel, so they must be declared
+// with the SAME explicit ScbId (the 2*Dir default differs per direction).
 // ---------------------------------------------------------------------------
 template <
     typename TileT_, GridDirection Dir_, int SlotStride_, int SlotCount_, int Dist_ = 1,
@@ -669,6 +700,11 @@ struct GridPipe {
     // IPC_SCB slot pair (native WAIT_SPR operand; ignored by the GM mock).
     static constexpr uint32_t ReadyScbSlot = static_cast<uint32_t>(ScbId_);
     static constexpr uint32_t FreeScbSlot = static_cast<uint32_t>(ScbId_) + 1;
+    // 接力计数 handoff doorbells -- reserved only for pipes that take part in a
+    // THANDOFF (see the ScbId note above).  The relayed prod_idx itself needs no
+    // slot: it travels through L1 (GridProducerSem::batonL1).
+    static constexpr uint32_t InstallScbSlot = static_cast<uint32_t>(ScbId_) + 2;
+    static constexpr uint32_t OpenScbSlot = static_cast<uint32_t>(ScbId_) + 3;
 
     GridPipeCtx ctx{};      // (1) how to address the peer
     Ring slots{};           // (2) payload ring
@@ -693,6 +729,13 @@ struct GridPipe {
     AICORE void ResetPushWindow() { prod.window = GridPayloadWindow{}; }
     AICORE void ResetPopWindow() { cons.window = GridPayloadWindow{}; }
 };
+
+// 接力计数 (relay counting) across a time-division producer handoff is spelled out
+// in GridTHandoff.hpp; the state it needs is already here.  There is deliberately
+// no baton STRUCT: the two counters it would hold are `cons.readyScb` (which
+// already holds E, the retiring producer's final prod_idx, put there by its last
+// SYNC_HSCB(READY)) and `cons.consIndex` -- both live values of the pipe being
+// retired, so wrapping them in a side structure would only duplicate them.
 
 // ---------------------------------------------------------------------------
 // GridGroupPipe<TileT, Group, SlotStride, SlotCount, GroupMax>
@@ -811,13 +854,24 @@ inline constexpr uint32_t kDefaultWfeMaxSpins = PTO_GRID_MOCK_WFE_MAX_SPINS;
 // that lane's own cache line.
 inline constexpr uint32_t kFaultFlagWordOffset = 10;
 
-// TBROADCAST per-source ready/free lane stride.  Each lane occupies a FULL
-// cache line (64 B) so that concurrent producers -- each writing its own lane
-// word -- never land on the same cache line.  Packing all GroupMax lanes into
-// one 64 B line (the old 4 B stride) let producers' write-back (line-granular)
-// stores clobber each other's words (lost-update / word-tearing), which
-// silently dropped doorbell writes and caused spurious "wait ready timeout".
-inline constexpr uint32_t kBcastLaneStride = 64;                                     // bytes; one lane per cache line
+// ONE CACHE LINE PER INDEPENDENTLY-WRITTEN SCOREBOARD.
+//
+// AICORE caches are not coherent between cores and the mock's sync_hscb store
+// commits through a line-granular dcci write-back, so a core that stores into
+// one word of a line writes back the WHOLE line from its own (possibly stale)
+// copy.  Two DIFFERENT cores storing into two words of the SAME line therefore
+// lose each other's updates: the doorbell simply never appears, and the peer
+// blocks forever on a threshold that was already met.
+//
+// So every word with its own external writer gets its own cache line.  This was
+// first hit on the TBROADCAST per-source lanes (GroupMax doorbells packed into
+// one 64 B line, "wait ready timeout"), and it applies verbatim to the unicast
+// window's scoreboards: ready is written by the producer peer, free / base /
+// install by the consumer peer, open by the (new) producer peer -- up to four
+// distinct writers into what used to be a single line.
+inline constexpr uint32_t kScbLineStride = 64;                                       // bytes; one scoreboard per line
+inline constexpr uint32_t kScbLineStrideU32 = kScbLineStride / sizeof(uint32_t);     // == 16 (u32 step per scoreboard)
+inline constexpr uint32_t kBcastLaneStride = kScbLineStride;                         // TBROADCAST lanes: same rule
 inline constexpr uint32_t kBcastLaneStrideU32 = kBcastLaneStride / sizeof(uint32_t); // == 16 (u32 step per lane)
 
 // The SYNC_HSCB / WAIT_SPR mocks that used to live here are now the GM-mock
@@ -883,6 +937,20 @@ inline constexpr uint32_t kFaultWaitFreeTimeout = 0x302;
 inline constexpr uint32_t kFaultPushPayloadRange = 0x401;
 inline constexpr uint32_t kFaultPopPayloadRange = 0x402;
 inline constexpr uint32_t kFaultBcastPayloadRange = 0x403;
+
+// 接力计数 producer handoff (THANDOFF, GridTHandoff.hpp) faults.
+//
+// kFaultHandoffWindowMismatch is the one that catches a genuine design error
+// rather than a hang: handing off between two pipes wired to DIFFERENT windows
+// relays counters that describe a ring the successor will never touch, and the
+// successor then writes from a bogus baseline into a ring whose real occupancy it
+// has not been told about.  The two pipes must be declared over one window (one
+// physical channel, two producer bindings), so a mismatch is trapped instead of
+// silently producing a corrupt relay.
+inline constexpr uint32_t kFaultHandoffRetireTimeout = 0x501;  // retiring producer's last READY never landed
+inline constexpr uint32_t kFaultHandoffInstallTimeout = 0x502; // INSTALL_BASE doorbell never arrived
+inline constexpr uint32_t kFaultHandoffOpenTimeout = 0x503;    // OPEN_ACK never arrived (rebase branch)
+inline constexpr uint32_t kFaultHandoffWindowMismatch = 0x504; // old/new pipe are not the same physical channel
 
 // Direction-keyed fault code lookup.  Explicit switch avoids relying on the
 // numeric layout of GridDirection so renumbering the enum cannot silently
