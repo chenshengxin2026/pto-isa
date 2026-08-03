@@ -2714,6 +2714,44 @@ PTO_INST RecordEvent TREDUCE(Pipe& pipe, TileAcc& acc, TileRecv& recv, WaitEvent
 }
 
 // ---------------------------------------------------------------------------
+// GridGroup TREDUCE overload: the N->1 group fan-in shape of the same reduce.
+// The caller IS the sink: it reads every member's resolved contribution out of a
+// uniform-stride arena and folds them with `Op` into `acc`, which lowers to ONE
+// mov_ubuf_group(op = SUM/MAX/MIN) rather than the hop-by-hop relay the pipe
+// overload above expands to (GridTReduce.hpp section "GRID_TREDUCE_GROUP_IMPL").
+//
+// It takes no pipe: a fan-in reads the arena directly, so there is no ring, no
+// scoreboard pair and no per-hop handshake to bind.  That is also why the two
+// TREDUCE overloads cannot be confused -- this one's first template argument is a
+// pto::GridGroup and the relay's is a pto::comm::ReduceOp, so each is discarded
+// during substitution into the other.
+//
+// `scratch` is the in-core combine scratch (one member's worth of UB, required by
+// the A3 mock's core-local adder).  `groupSlotBase` / `memberStride` /
+// `memberCount` describe the contribution arena; `rect` names the member set for
+// SUBRECT (ROW/COL ignore it).  Members fold in ascending index order, so an SPMD
+// row/col fan-in matches the relay's accumulation bit-for-bit.
+// ---------------------------------------------------------------------------
+template <
+    pto::GridGroup Group, pto::comm::ReduceOp Op, typename T, typename TileAcc, typename TileScratch,
+    typename... WaitEvents>
+PTO_INST RecordEvent TREDUCE(
+    TileAcc& acc, TileScratch& scratch, __gm__ const T* groupSlotBase, uint32_t bytes, uint32_t memberCount,
+    pto::GridRect rect = {}, uint32_t memberStride = 0, WaitEvents&... events)
+{
+#if defined(PTO_NPU_ARCH_A2A3)
+    TSYNC(events...);
+    GRID_TREDUCE_GROUP_IMPL<Group, Op, T, TileAcc, TileScratch>(
+        acc, scratch, groupSlotBase, bytes, memberCount, rect, memberStride);
+#else
+    static_assert(
+        sizeof(T) == 0, "GridGroup TREDUCE not supported on this target profile "
+                        "(design doc section 5.4 forbids silent GM fallback).");
+#endif
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // GridGroupPipe TBROADCAST overload: 真·同时 MPSC group broadcast (design doc
 // Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移).  The participant set
 // -- the GridGroup (ROW/COL/SUBRECT) -- is bound to the PIPE, because switching

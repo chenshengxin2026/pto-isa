@@ -148,6 +148,10 @@ GridGroupPipe<Tile, GridGroup::ROW, SlotStride, SlotCount, GroupMax>
 
 于是 `TPUSH(pipe, tile)` / `TPOP(pipe, tile)` / `TREDUCE<Op>(pipe, acc, recv)` / `TBROADCAST(pipe, tile)` / `TPOP(pipe, tile, srcRank)` 都不再带方向或 group 模板参数——**换生产者或换消费者 ⇒ 定义新的 pipe**。双向中继因此是两个 pipe（前向一个、后向一个），reduce 的 EAST 相与 SOUTH 相也是两个 pipe，各自占用 window 的一段（`FFN_NCUT_TPUSH_PIPE_WIN_P*` / `FFN_RS_REDUCE_PIPE_WIN`）。两段必须互不重叠：否则第二相会从第一相留下的 ready/free 计数开始。
 
+四个 demo 与两个 smoke **一律调用上面这层 PTO 指令**，而不是 A2/A3 后端的 `GRID_*_IMPL` / `GRID_TRY_*_IMPL` 入口，这样跑一遍就同时验证了指令面本身（重载选择、`SOURCE` 的 `static_assert`、非 A2A3 profile 的 target-profile 拦截），而不只是下译逻辑。代价是指令不带自旋上限——它们像硬件 `WAIT_SPR` 一样一直阻塞——所以握手接错会表现为挂死，而不是 `kFaultWaitReadyTimeout` 哨兵。这在本 demo 里是安全的：host 把每个中继组／group 整体排进同一个 wave（见 `main_*.cpp` 的 `LaunchWave`）。调试时若要恢复超时哨兵，直接改调对应的 `GRID_TRY_*_IMPL(..., maxSpins)`。
+
+`TREDUCE` 有两个重载，对应两种**不同形状**的归约：`TREDUCE<Op>(pipe, acc, recv)` 是逐跳中继（第一个模板参数是 `comm::ReduceOp`），`TREDUCE<Group, Op, T>(acc, scratch, base, bytes, memberCount, rect, memberStride)` 是 N→1 组扇入（第一个模板参数是 `GridGroup`，落到单条 `mov_ubuf_group`）。后者不带 pipe——扇入直接读贡献 arena，没有环、没有计分板、没有逐跳握手要绑。两者互不干扰：各自的首个模板实参代入对方模板时都会推导失败而被丢弃。
+
 pipe 内部按三类信息分组，与硬件一一对应：
 
 | 成员 | 内容 | 硬件对应 |
@@ -190,7 +194,7 @@ GridPipe 的 ready/free 同步走 V8 IPC_SCB 计分板路线。握手 intrinsic 
 
 - `copy_ubuf_to_neighbor_ubuf(dstNeighborSlot, src, bytes)`（V8 `COPY_UBUF_TO_NBR`，G1——唯一新增机器指令 / HW-DEP-0）：把本核 UB payload 写入解析出的邻居 L1/SRAM slot。不自同步，data-ready 由随后的 `sync_hscb(READY)` 通告。
 - `sync_hscb(peerScb, absCount)`（V8 `SYNC_HSCB`/`ST_HSCB`，G2——复用 HSCB store + 邻居 IPC_SCB 寻址 / HW-DEP-1）：把本核新的单调绝对计数 store 进对端的 `ready_scb`/`free_scb`（IPC_SCB）。`(kind, dir, dist)` 机器操作数由调用方的 `RemoteScbPtr` 运行时 helper 解析折进 `peerScb`，门面直接操作解析后的目标。
-- `wait_ipc_scb(localScb, threshold, slot)`（V8 `WAIT_SPR`，G3——复用 IPC_SCB 阻塞等待）：读+阻塞合**一条**指令——入口读本核 IPC_SCB，已 `≥ threshold` 即放行，否则阻塞当前 pipe 至对端 `sync_hscb` store 唤醒。V8 去掉了 V7 的 `MOV_SPR2X` 非阻塞 peek，无单独读步。demo 实际调 `wait_ipc_scb_sim(..., maxSpins)` 这层 mock 包装——加自旋超时哨兵，使握手死锁能以 fault 暴露而非挂死测试；文档化的硬件接口仍是上面的 void `wait_ipc_scb`。
+- `wait_ipc_scb(localScb, threshold, slot)`（V8 `WAIT_SPR`，G3——复用 IPC_SCB 阻塞等待）：读+阻塞合**一条**指令——入口读本核 IPC_SCB，已 `≥ threshold` 即放行，否则阻塞当前 pipe 至对端 `sync_hscb` store 唤醒。V8 去掉了 V7 的 `MOV_SPR2X` 非阻塞 peek，无单独读步。GridPipe 的握手序列走的是 `wait_ipc_scb_sim(..., maxSpins)` 这层 mock 包装（`maxSpins > 0` 时加自旋超时哨兵，使握手死锁能以 fault 暴露而非挂死测试）；PTO 指令下译时传 `maxSpins = 0`，即和硬件 `WAIT_SPR` 一样永久阻塞，只有直接调 `GRID_TRY_*_IMPL` 才拿得到超时哨兵。文档化的硬件接口仍是上面的 void `wait_ipc_scb`。
 
 payload 的远端地址解析（把本地 slot / 计分板字解析为对端 GM window 中同字节偏移）是 demo `gridpipe_payload_inl.hpp` 中的普通运行时 helper（`ResolvePeerSlotAddr` / `RemoteScbPtr`），非 intrinsic。TPOP 的本地 drain 复用现成本地 `copy_gm_to_ubuf`——NoC 只写，故刻意**无跨核读** payload——并用 `GmSramArena` 段校验 `PopSlotIsLocal` 守卫，使误连的跨段读被拒绝而非悄悄服务。
 

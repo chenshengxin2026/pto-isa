@@ -80,13 +80,16 @@ constexpr int kRowBlock = FFN_NCUT_ROW_BLOCK; // 768 (Phase-1 gather output widt
 constexpr int kIfull = FFN_NCUT_I;            // 3072 (full intermediate / down K)
 constexpr int kHfull = FFN_NCUT_H;            // 7168 (gate/up K)
 
-// DEBUG: bound the gather handshake spin so a mis-wire surfaces as a fault
-// sentinel instead of an infinite hang.  Generous enough that a correct (us-
-// latency) gather never trips it.  Set 0 to restore block-forever behaviour.
-#ifndef FFN_NCUT_GATHER_MAX_SPINS
-#define FFN_NCUT_GATHER_MAX_SPINS 100000000u
-#endif
-constexpr uint32_t kGatherMaxSpins = FFN_NCUT_GATHER_MAX_SPINS;
+// The gather is spelled with the PTO instructions TBROADCAST / TPOP<srcRank>,
+// not the A2/A3 backend's GRID_TRY_*_IMPL entry points, so this demo exercises
+// the ISA surface itself (the is_grid_group_pipe_v overload selection against the
+// unicast TPUSH/TPOP, the target-profile guard) and not just the lowering.  The
+// instructions carry no spin bound -- they block like the hardware WAIT_SPR -- so
+// a handshake mis-wire shows up as a hang rather than a kFaultWaitReadyTimeout
+// sentinel.  That is safe here because the host waves each group wholly into one
+// launch (see main_tbroadcast_allgather).  To bound the spin while debugging,
+// build with -DPTO_GRID_MOCK_WFE_MAX_SPINS=N and call GRID_TRY_TBROADCAST_IMPL /
+// GRID_TRY_TBPOP_IMPL directly.
 
 // fp32 partials carried cube->vec through the C2V TPipe (phase A).
 using GatePipe = TPipe<0, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
@@ -348,7 +351,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
 #endif
 
             // 真·同时 MPSC: every cell TBROADCASTs its own shard concurrently.
-            (void)GRID_TRY_TBROADCAST_IMPL(gatherPipe, shardOwn, kGatherMaxSpins);
+            TBROADCAST(gatherPipe, shardOwn);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
@@ -360,7 +363,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
                 if (srcCol == col) {
                     continue; // own shard already placed
                 }
-                (void)GRID_TRY_TBPOP_IMPL(gatherPipe, shardRecv, srcCol, kGatherMaxSpins);
+                TPOP(gatherPipe, shardRecv, srcCol);
 #ifndef __PTO_AUTO__
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -425,7 +428,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             pipe_barrier(PIPE_V);
 #endif
-            (void)GRID_TRY_TBROADCAST_IMPL(gatherPipe, blockOwn, kGatherMaxSpins);
+            TBROADCAST(gatherPipe, blockOwn);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
@@ -437,7 +440,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
                 if (srcRow == row) {
                     continue; // own block already placed
                 }
-                (void)GRID_TRY_TBPOP_IMPL(gatherPipe, blockRecv, srcRow, kGatherMaxSpins);
+                TPOP(gatherPipe, blockRecv, srcRow);
 #ifndef __PTO_AUTO__
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);

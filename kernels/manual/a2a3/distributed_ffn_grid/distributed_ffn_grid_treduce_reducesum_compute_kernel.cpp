@@ -73,11 +73,14 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-// No pipe type here: this variant reduces through GRID_TREDUCE_GROUP_IMPL, which
-// reads each member's contribution in place out of partialBuf (bytes and
-// memberStride are independent runtime operands) and so binds no channel, holds
-// no semaphore and needs no slot ring.  `reduceWindow` is allocated by the host
-// for layout parity with the TPUSH relay variant and is deliberately unused.
+// No pipe type here: this variant reduces through the group fan-in overload of
+// TREDUCE (TREDUCE<Group, Op, T>(acc, scratch, base, ...), which lowers to
+// GRID_TREDUCE_GROUP_IMPL).  It reads each member's contribution in place out of
+// partialBuf (bytes and memberStride are independent runtime operands) and so
+// binds no channel, holds no semaphore and needs no slot ring -- which is also
+// why it takes no pipe argument, unlike the relay overload TREDUCE<Op>(pipe, acc,
+// recv).  `reduceWindow` is allocated by the host for layout parity with the
+// TPUSH relay variant and is deliberately unused.
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
 
@@ -378,7 +381,7 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
                         reinterpret_cast<__gm__ const float*>(
                             partialBuf + static_cast<int64_t>(row) * gridCols * FFN_RS_PARTIAL_BYTES) +
                         hSegOff;
-                    GRID_TREDUCE_GROUP_IMPL<GridGroup::ROW, ReduceOp::Sum, float>(
+                    TREDUCE<GridGroup::ROW, ReduceOp::Sum, float>(
                         seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridCols, GridRect{}, FFN_RS_PARTIAL_BYTES);
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -418,7 +421,7 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
                     const int hSegOff = h * (kT * kHBase); // segment-major offset into rowPartialBuf
                     const int hStridedOff = h * kHBase;    // strided column offset into yFull [T,H]
                     __gm__ const float* base = reinterpret_cast<__gm__ const float*>(rowPartialBuf) + hSegOff;
-                    GRID_TREDUCE_GROUP_IMPL<GridGroup::COL, ReduceOp::Sum, float>(
+                    TREDUCE<GridGroup::COL, ReduceOp::Sum, float>(
                         seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridRows, GridRect{}, FFN_RS_ROW_PARTIAL_BYTES);
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

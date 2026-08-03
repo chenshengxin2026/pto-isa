@@ -86,13 +86,15 @@ constexpr int kRowBlock = FFN_NCUT_ROW_BLOCK; // 768 (Phase-1 relay tile width)
 constexpr int kIfull = FFN_NCUT_I;            // 3072 (full intermediate / down K)
 constexpr int kHfull = FFN_NCUT_H;            // 7168 (gate/up K)
 
-// DEBUG: bound the relay spin so a mis-wire surfaces as a fault sentinel instead
-// of an infinite hang.  Generous enough that a correct (us-latency) relay never
-// trips it.  Set 0 to restore block-forever behaviour.
-#ifndef FFN_NCUT_GATHER_MAX_SPINS
-#define FFN_NCUT_GATHER_MAX_SPINS 100000000u
-#endif
-constexpr uint32_t kGatherMaxSpins = FFN_NCUT_GATHER_MAX_SPINS;
+// The relay is spelled with the PTO instructions TPUSH / TPOP, not the A2/A3
+// backend's GRID_TRY_*_IMPL entry points, so this demo exercises the ISA surface
+// itself (overload resolution, the SOURCE static_assert, the target-profile
+// guard) and not just the lowering.  The instructions carry no spin bound -- they
+// block like the hardware WAIT_SPR -- so a handshake mis-wire shows up as a hang
+// rather than a kFaultWaitReadyTimeout sentinel.  That is safe here because the
+// host waves each relay group wholly into one launch (see main_tpush_allgather).
+// To bound the spin while debugging, build with -DPTO_GRID_MOCK_WFE_MAX_SPINS=N
+// and call GRID_TRY_TPUSH_IMPL / GRID_TRY_TPOP_IMPL directly.
 
 // fp32 partials carried cube->vec through the C2V TPipe (phase A).
 using GatePipe = TPipe<0, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
@@ -133,8 +135,8 @@ using DownAccTile = TileAcc<float, kBaseM, kHShard, kT, kHShard>;
 // Drain every pipe between relay steps.  The relay reuses one UB tile across a
 // TPOP (MTE2) -> TINSERT (V) -> TPUSH (MTE3) sequence, so a full barrier between
 // steps is the conservative correctness-first fence (matches this kernel's
-// simulation role).  Each GRID_TRY_TPOP_IMPL/GRID_TRY_TPUSH_IMPL also carries its
-// own data-before-ready publish fence internally.
+// simulation role).  Each TPOP/TPUSH also carries its own data-before-ready
+// publish fence internally.
 AICORE inline void FfnRelayDrain()
 {
 #ifndef __PTO_AUTO__
@@ -263,16 +265,16 @@ AICORE inline void FfnRelayGather(
     if (isFwdSource) {
         TINSERT(relayTile, ownTile, 0, ownOff); // V: seed with own contribution
     } else {
-        fwdPipe.SetPopWindow(fwdPopWin);                                   // drain only what upstream sent
-        (void)pto::GRID_TRY_TPOP_IMPL(fwdPipe, recvTile, kGatherMaxSpins); // MTE2 -> recvTile
-        FfnRelayDrain();                                                   // MTE2 (async DMA) drain
-        TINSERT(relayTile, recvTile, 0, 0);                                // V: recvTile -> relayTile
-        TINSERT(relayTile, ownTile, 0, ownOff);                            // V: add own contribution
+        fwdPipe.SetPopWindow(fwdPopWin);        // drain only what upstream sent
+        TPOP(fwdPipe, recvTile);                // MTE2 -> recvTile
+        FfnRelayDrain();                        // MTE2 (async DMA) drain
+        TINSERT(relayTile, recvTile, 0, 0);     // V: recvTile -> relayTile
+        TINSERT(relayTile, ownTile, 0, ownOff); // V: add own contribution
     }
     FfnRelayDrain(); // V before MTE3 push
     if (!isFwdSink) {
-        fwdPipe.SetPushWindow(fwdPushWin);                                   // ship only the valid column prefix
-        (void)pto::GRID_TRY_TPUSH_IMPL(fwdPipe, relayTile, kGatherMaxSpins); // MTE3 <- relayTile
+        fwdPipe.SetPushWindow(fwdPushWin); // ship only the valid column prefix
+        TPUSH(fwdPipe, relayTile);         // MTE3 <- relayTile
         FfnRelayDrain();
     }
 
@@ -281,15 +283,15 @@ AICORE inline void FfnRelayGather(
     // its windows start disabled (whole slot), which is exactly what we want.
     bwdPipe.ResetPopWindow();
     bwdPipe.ResetPushWindow();
-    if (!isBwdSource) { // not the fwd sink -> receive the complete tile
-        (void)pto::GRID_TRY_TPOP_IMPL(bwdPipe, recvTile, kGatherMaxSpins); // MTE2 -> recvTile
+    if (!isBwdSource) {          // not the fwd sink -> receive the complete tile
+        TPOP(bwdPipe, recvTile); // MTE2 -> recvTile
         FfnRelayDrain();
         TINSERT(relayTile, recvTile, 0, 0); // V: recvTile -> relayTile
     }
     // (bwd source == fwd sink: relayTile already holds the complete fwd result)
-    if (!isBwdSink) {                                                        // not the scatter end -> forward it on
-        FfnRelayDrain();                                                     // relayTile (V) settled before MTE3 push
-        (void)pto::GRID_TRY_TPUSH_IMPL(bwdPipe, relayTile, kGatherMaxSpins); // MTE3 <- relayTile
+    if (!isBwdSink) {              // not the scatter end -> forward it on
+        FfnRelayDrain();           // relayTile (V) settled before MTE3 push
+        TPUSH(bwdPipe, relayTile); // MTE3 <- relayTile
         FfnRelayDrain();
     }
     // every cell now holds the complete tile in relayTile
