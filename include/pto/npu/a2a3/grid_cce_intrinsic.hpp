@@ -271,6 +271,10 @@ AICORE inline void sync_hscb(__gm__ uint32_t* peerScb, uint32_t absCount)
 {
 #if defined(PTO_GRID_CCE_NATIVE)
     __sync_hscb(peerScb, absCount); // -> __builtin_cce___sync_hscb; exact operand encoding per ISA manual
+#elif defined(__CPU_SIM)
+    if (peerScb != nullptr) {
+        __atomic_store_n(reinterpret_cast<uint32_t*>(peerScb), absCount, __ATOMIC_RELEASE);
+    }
 #else
     if (peerScb != nullptr) {
         // A3 mock: cross-core GM store + cache maintenance.  AICORE caches are not
@@ -293,12 +297,13 @@ AICORE inline void sync_hscb(__gm__ uint32_t* peerScb, uint32_t absCount)
 // ---------------------------------------------------------------------------
 // (2b) ATOM_ADD_HSCB -- atomically add `delta` to a resolved peer IPC_SCB.
 //
-// Ordinary TPUSH has exactly one external writer per active scoreboard and can
-// therefore publish an absolute count with sync_hscb.  Group TBROADCAST and
-// TREDUCE are MPSC: several group members can ring the SAME receiver ready/close
-// scoreboard, and several receivers can return credit to the SAME producer free
-// scoreboard.  An overwrite store would lose updates, so all three fan-in edges
-// use this atomic-add form.
+// TPUSH and the channelised collectives have exactly one active forward writer
+// per READY/CLOSE scoreboard, so those dependencies publish absolute counts with
+// sync_hscb.  A TBROADCAST ownership handoff, however, collects reverse FREE
+// credit from several receivers into the next source's one scoreboard.  That
+// reverse fan-in edge would lose credits with overwrite stores and is the reason
+// this atomic-add form remains in the protocol.  Group TREDUCE uses the same
+// reverse primitive for consistency even though its sink is a single writer.
 //
 // HW-DEP: CANN exposes __atom_add_hscb, but WSE silicon/compiler support for
 // targeting a peer's WAIT_SPR-visible IPC_SCB (including wakeup and release
@@ -367,11 +372,15 @@ AICORE inline uint32_t read_local_word(__gm__ uint32_t* addr)
     if (addr == nullptr) {
         return 0;
     }
+#if defined(__CPU_SIM)
+    return __atomic_load_n(reinterpret_cast<uint32_t*>(addr), __ATOMIC_ACQUIRE);
+#else
     volatile __gm__ uint32_t* ptr = reinterpret_cast<volatile __gm__ uint32_t*>(addr);
     __asm__ __volatile__("" ::: "memory");
     dcci(reinterpret_cast<__gm__ void*>(const_cast<__gm__ uint32_t*>(ptr)), SINGLE_CACHE_LINE);
     __asm__ __volatile__("" ::: "memory");
     return *ptr;
+#endif
 }
 
 // Shared GM-mock scalar write of a word this core owns.  The trailing dcci writes
@@ -382,12 +391,16 @@ AICORE inline void write_local_word(__gm__ uint32_t* addr, uint32_t value)
     if (addr == nullptr) {
         return;
     }
+#if defined(__CPU_SIM)
+    __atomic_store_n(reinterpret_cast<uint32_t*>(addr), value, __ATOMIC_RELEASE);
+#else
     volatile __gm__ uint32_t* ptr = reinterpret_cast<volatile __gm__ uint32_t*>(addr);
     __asm__ __volatile__("" ::: "memory");
     *ptr = value;
     __asm__ __volatile__("" ::: "memory");
     dcci(reinterpret_cast<__gm__ void*>(const_cast<__gm__ uint32_t*>(ptr)), SINGLE_CACHE_LINE);
     __asm__ __volatile__("" ::: "memory");
+#endif
 }
 
 // Shared GM spin-poll for the mock: return true once *localScb >= threshold.
@@ -401,16 +414,24 @@ AICORE inline bool poll_ipc_scb_ge(__gm__ uint32_t* localScb, uint32_t threshold
     if (localScb == nullptr) {
         return true;
     }
+#if !defined(__CPU_SIM)
     volatile __gm__ uint32_t* p = reinterpret_cast<volatile __gm__ uint32_t*>(localScb);
+#endif
     uint32_t spin = 0;
     constexpr uint32_t kFenceInterval = 64;
     while (true) {
+#if defined(__CPU_SIM)
+        if (__atomic_load_n(reinterpret_cast<uint32_t*>(localScb), __ATOMIC_ACQUIRE) >= threshold) {
+            return true;
+        }
+#else
         __asm__ __volatile__("" ::: "memory");
         dcci(reinterpret_cast<__gm__ void*>(const_cast<__gm__ uint32_t*>(p)), SINGLE_CACHE_LINE);
         __asm__ __volatile__("" ::: "memory");
         if (*p >= threshold) {
             return true;
         }
+#endif
         if (maxSpins != 0 && spin >= maxSpins) {
             return false;
         }

@@ -99,8 +99,8 @@ constexpr uint32_t kGatherMaxSpins = FFN_NCUT_GATHER_MAX_SPINS;
 using GatePipe = TPipe<0, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 
-// GridPipe types for the two relay gather phases.  Unicast-only (GroupMax = 0):
-// no broadcast region, fan-in 1 per direction.  P1 relays the [8,768] row block
+// GridPipe types for the two unicast relay gather phases: fan-in 1 per direction.
+// P1 relays the [8,768] row block
 // (EAST forward + WEST backward); P2 relays the [8,3072] full hidden (SOUTH forward
 // + NORTH backward).  SlotCount = 2 double-buffers the two opposite directions.
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
@@ -110,9 +110,9 @@ using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
 // scatter -- so each pipe binds two channels and the window carries two slot rings.
 constexpr int kFfnRelayChanCount = FFN_NCUT_RELAY_CHAN_COUNT;
 using FfnGatherPipeP1 =
-    GridPipe<RowBlockTile, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnRelayChanCount>;
+    GridPipe<RowBlockTile, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT, kFfnRelayChanCount>;
 using FfnGatherPipeP2 =
-    GridPipe<HiddenFullTile, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnRelayChanCount>;
+    GridPipe<HiddenFullTile, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT, kFfnRelayChanCount>;
 static_assert(
     a2a3_grid::WindowBytes<FfnGatherPipeP1>() == static_cast<uint32_t>(FFN_NCUT_TPUSH_WIN_P1),
     "P1 host/device GridPipe window layout mismatch");

@@ -10,8 +10,8 @@
 # --------------------------------------------------------------------------------
 
 # GridPipe single-source broadcast smoke test.  One source cell TBROADCASTs a
-# stamped fp32 tile to its whole group (batched writes + one publish fence +
-# atomic SPR doorbells); every other cell drains the source slot and stores it.
+# stamped fp32 tile to its whole group (channel-ring writes + one publish fence +
+# absolute READY/CLOSE); every other cell drains the source slot and stores it.
 # Verifies out[cell] == in[group-source] in-process (no data files).
 
 : "${ASCEND_CANN_PATH:=$(ls -1d /usr/local/Ascend/cann-*/set_env.sh 2>/dev/null | sort -V | tail -1)}"

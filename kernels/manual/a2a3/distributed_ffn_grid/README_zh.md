@@ -9,7 +9,7 @@
 | `run_tpush_reducesum.sh` / `distributed_ffn_grid_tpush_reducesum` | **TPUSH** | ReduceSum | 显式 `TPOP(pipe, ..., prodId)` + `TADD` + `TPUSH(pipe, ..., consId, isLastTransfer)` 中继 |
 | `run_tpush_allgather.sh` / `distributed_ffn_grid_tpush_allgather` | **TPUSH** | AllGather | 最近邻 `TPUSH`/`TPOP` 中继 gather（fan-in-1 DAG） |
 | `run_tbroadcast_allgather.sh` / `distributed_ffn_grid_tbroadcast_allgather` | **TBROADCAST** | AllGather | `TBROADCAST<GridGroup>` MPSC 组广播 |
-| `run_treduce_reducesum.sh` / `distributed_ffn_grid_treduce_reducesum` | **TREDUCE** | ReduceSum | 融合 `TREDUCE<GridGroup, Sum>` 的 N→1 组扇入（`mov_ubuf_group`，op=SUM） |
+| `run_treduce_reducesum.sh` / `distributed_ffn_grid_treduce_reducesum` | **TREDUCE** | ReduceSum | 分 channel 的 `TREDUCE<GridGroup, Sum>` N→1 扇入（4+3 源分批） |
 
 每个例子都用 `1e-3` 容差把 `[T, H]` 输出与 `golden.bin` 比对。四个例子在 NPU 上全部 **位精确通过**（`max diff = 0`，用 `-r npu` 运行）；详见 [位精确性说明](#位精确性说明)。
 
@@ -28,7 +28,7 @@ Unicast 在运行期显式传 peer id（TPUSH 的 `consId`、TPOP 的 `prodId`�
 | `ffn_config.hpp` | 编译期网格形状、tile 形状、GridPipe window 字节数、buffer 字节数、SwiGLU clamp 上下界、A3 精度映射表与 Batcher GM arena 字节数。 |
 | `kernel_launch.hpp` | host 侧 mixed kernel launch 接口声明（每个例子一份）。 |
 | `main_treduce_reducesum.cpp` / `main_tpush_reducesum.cpp` | ReduceSum host driver：ACL 初始化、fake HCCL context / 本地 GridPipe windows、工作 buffer、Batcher 加载/分发、kernel launch、golden 比对、资源清理。 |
-| `distributed_ffn_grid_treduce_reducesum_compute_kernel.cpp` | TREDUCE ReduceSum kernel：EAST+SOUTH 归约用融合的 `TREDUCE<GridGroup, Sum>` 组扇入（`mov_ubuf_group`，op=SUM）。 |
+| `distributed_ffn_grid_treduce_reducesum_compute_kernel.cpp` | TREDUCE ReduceSum kernel：EAST+SOUTH 扇入复用 C 个 TPUSH ring、前向绝对计数和反向原子 FREE 接力。 |
 | `distributed_ffn_grid_tpush_reducesum_compute_kernel.cpp` | TPUSH ReduceSum kernel：EAST 与 SOUTH 跨 launch 共用一个 channel，以显式 TPOP + TADD + TPUSH 覆盖 close 与接力计数重绑定。 |
 | `main_tbroadcast_allgather.cpp` / `main_tpush_allgather.cpp` | AllGather host driver。 |
 | `distributed_ffn_grid_tbroadcast_allgather_compute_kernel.cpp` | TBROADCAST AllGather kernel：两个 gather 阶段用 `TBROADCAST<GridGroup>` + `TPOP<GridGroup>`。 |
@@ -37,7 +37,7 @@ Unicast 在运行期显式传 peer id（TPUSH 的 `consId`、TPOP 的 `prodId`�
 | `tpipe_tmov_inl.hpp` | 把 Cube↔Vec 的 C2V/V2C 搬运封装成方向化 `TMOV` 重载，内部转发到现有 `TPUSH`/`TPOP`，使 kernel 正文不再出现该 handshake。 |
 | `gridpipe_payload_inl.hpp` | 本地 GridPipe payload 钩子与 fake-window 适配器：peer slot/SCB 解析、tile 到 producer L1 staging、producer L1 到对端 ring 的拷贝、本地接收 ring drain，以及 TPOP 本地性守卫。 |
 | `smoke/` | Vec-only GridPipe 广播冒烟测试（`bcast_smoke_*` + `run_bcast_smoke.sh`）。 |
-| `../../../../include/pto/npu/a2a3/grid_cce_intrinsic.hpp` | Grid CCE 门面：统一 L1 搬运、绝对值 `sync_hscb`、MPSC `atom_add_hscb`、阻塞 `wait_ipc_scb` 与组 `mov_ubuf_group`。A3 mock 用 GM window 表示 L1 地址段。 |
+| `../../../../include/pto/npu/a2a3/grid_cce_intrinsic.hpp` | Grid CCE 门面：统一 L1 搬运、绝对值 `sync_hscb`、反向扇入 `atom_add_hscb` 与阻塞 `wait_ipc_scb`。A3 mock 用 GM window 表示 L1 地址段。 |
 | `../../../../include/pto/npu/a2a3/grid_intrinsic.hpp` | GridPipe A2/A3 数据模型 + mock 支持：每 channel 的 ready/free/close SCB、生产者/消费者绑定、每消费者三态 FSM、持久化接力计数、mesh/group 解析器、fault 哨兵，以及 `GmSramArena` 的 TPOP 读本地性守卫。 |
 | `scripts/gen_data.py` | 生成 Batcher 消费的全量 fp16 X/weight 张量（`x_full`、`w_gate_full`、`w_up_full`、`w_down_full`）以及 fp32 SwiGLU `golden` 参考结果。四个例子统一用 `--pure-ncut` 产出扁平全量张量。 |
 | `build/` | 被忽略的生成 build 目录。 |
@@ -47,10 +47,10 @@ Unicast 在运行期显式传 peer id（TPUSH 的 `consId`、TPOP 的 `prodId`�
 
 用 `-r npu` 运行（`sim`/`camodel` 模式会在 `aclrtSetDevice` 报 507033）；共享主机上每次运行都要走 `task-submit`。四个例子全部产出 `max diff = 0`（对 `golden.bin`）——位精确，而不只是落在 `1e-3` 容差内。曾经遮住这一点的是两个真实 bug，现都已修复：
 
-- **MPSC SPR 门铃（TBROADCAST/TREDUCE）。** 广播 payload 仍无冲突：源 rank `k` 只写每个接收者的 slot `k`。通知不再用静态 per-source L1 lane，而是从 `GridPipe` 固定 SPR header 中保留 `ready_scb/free_scb/close_scb[CollectiveChan]`。所有生产者向接收者原子累加 READY/CLOSE，所有接收者向生产者原子累加 FREE。若只把旧 lane 替换为普通绝对值 `sync_hscb` store，并发写者会 last-writer-wins，丢计数并死锁。A3 mock 用 s32 UB→GM 原子累加实现 `atom_add_hscb`；native `__atom_add_hscb` 的 peer-SPR 路由仍是显式硬件依赖。
+- **分 channel 的集合通信接力（TBROADCAST/TREDUCE）。** payload 不再按源 rank 分槽。源序号 `s` 使用普通 GridPipe ring `slotBase[s%C]`；任意时刻最多 C 个源并行，既不共享 payload 地址也不共享前向计分板。超过 C 的源只有在前任 CLOSE 且反向 FREE 证明 ring 已 drain 后才复用 channel。READY/CLOSE 用单调绝对值 `sync_hscb`，只有反向 FREE 扇入使用 `atom_add_hscb`。
 - **phase-D 输出 T 步长（两个 AllGather kernel）。** AllGather 的 y-shard `[T, Hc]` 写进**完整** `[T, H]` 输出，所以其行步长必须是完整输出宽度 `kHfull`（= `H` = 7168）。从 `hidden_full` store 复制粘贴时遗留成 `kIfull`（= `I` = 3072），把 y 的第 1–7 行打乱（≈50 % 零输出 / 大漂移）。两个 AllGather kernel 的 `GY` store 各改一行 `kIfull` → `kHfull` 即修复。
 
-`treduce` ReduceSum 还要求其 per-cell partial buffer（`partialBuf` / `rowPartialBuf`）以**段主序（segment-major）**布局——每个 `[T, kHBase]` H 段在偏移 `h*(T*kHBase)` 处连续存放——这样组扇入才能把每个同行成员的段当作一段连续字节读出来；只有最终的 `yFull` 保留 strided `[T, H]` golden 布局。
+`treduce` ReduceSum 还要求其 per-cell partial buffer（`partialBuf` / `rowPartialBuf`）以**段主序（segment-major）**布局——每个 `[T, kHBase]` H 段在偏移 `h*(T*kHBase)` 处连续存放——这样贡献者可把一段连续数据 stage 到所选 channel ring；只有最终的 `yFull` 保留 strided `[T, H]` golden 布局。
 
 32 个 block 的 launch 仍然无法在 24 个物理 AICore 上一波跑完——单波 launch 的过载会让 phase C 死锁（COL 组跨满 4 行，首批 cell 自旋等待拿不到核的二批 row-3 门铃）。因此 host 按 `--phys-cores` 切波启动（`rowsPerWave = physCores/cols`、`colsPerWave = physCores/rows` → phase B、C 各 2 波，共 6 次 launch、~5 ms）。有了步长修复之后，分波只是调度问题，不再是可靠性问题。
 
@@ -175,7 +175,7 @@ GridPipe 的 ready/free/close 同步走 V8 IPC_SCB 计分板路线，每个 chan
 
 - `copy_l1_to_neighbor_l1(dstNeighborSlot, srcProducerSlot, transferScratch, bytes)`（G1 / HW-DEP-0）：把独立的本核 producer L1 slot 写入对端接收 ring。`transferScratch` 只是 A3 GM mock 的 DMA 中转 UB，不是体系结构源地址。搬运不自同步，随后由 `sync_hscb(READY)` 发布 data-ready。
 - `sync_hscb(peerScb, absCount)`（V8 `SYNC_HSCB`/`ST_HSCB`，G2——复用 HSCB store + 邻居 IPC_SCB 寻址 / HW-DEP-1）：把绝对计数 store 进对端的 `ready_scb`、`free_scb` 或 `close_scb`；目标种类与 peer 已由 `RemoteScbPtr` 解析进 `peerScb`。
-- `atom_add_hscb(peerScb, delta)`：在 MPSC READY/FREE/CLOSE 扇入中原子累加对端计分板。A3 mock 下译为 s32 原子累加；native 门面映射 `__atom_add_hscb`，最终 WSE ISA 需确认 peer IPC_SCB 定址与唤醒语义。
+- `atom_add_hscb(peerScb, delta)`：只为反向 FREE 扇入原子累加对端计分板；前向 READY/CLOSE 不使用它。A3 mock 下译为 s32 原子累加；native 门面映射 `__atom_add_hscb`，最终 WSE ISA 需确认 peer IPC_SCB 定址与唤醒语义。
 - `wait_ipc_scb(localScb, threshold, slot)`（V8 `WAIT_SPR`，G3——复用 IPC_SCB 阻塞等待）：读+阻塞合**一条**指令——入口读本核 IPC_SCB，已 `≥ threshold` 即放行，否则阻塞当前 pipe 至对端 `sync_hscb` store 唤醒。V8 去掉了 V7 的 `MOV_SPR2X` 非阻塞 peek，无单独读步。demo 实际调 `wait_ipc_scb_sim(..., maxSpins)` 这层 mock 包装——加自旋超时哨兵，使握手死锁能以 fault 暴露而非挂死测试；文档化的硬件接口仍是上面的 void `wait_ipc_scb`。
 
 payload 目标地址解析（把本地接收 ring slot / 计分板字解析为对端 GM window 中同字节偏移）是 `gridpipe_payload_inl.hpp` 中的普通 helper（`ResolvePeerSlotAddr` / `RemoteScbPtr`），非 intrinsic；源地址则独立固定为 `producerSlotBase`。TPOP 只 drain 本核接收 ring，`PopSlotIsLocal` 会拒绝误连的跨段读。
@@ -186,24 +186,21 @@ native lowering 对接真实 CCE HSCB/IPC_SCB 栈。编译器的 copy builtin �
 
 ### 时分 MPSC 接力计数
 
-生产者为每个消费者保存一条 FSM（`UNBOUND`、`ACTIVE`、`CLOSED`），并维护本核生产者 channel 状态（`UNBOUND`、`ACTIVE`、生产者 `CLOSED`）。`ACTIVE` 直接走常规 TPUSH 快路径；对 `UNBOUND` 或 `CLOSED` 消费者，生产者先在本地选择未使用或生产者 `CLOSED` 的 channel，没有资源就等待。随后通过消费者的 bind-request L1 line 发送 `[生产者 block id，本地生产者 channel]`，生产者端资源不再由消费者分配。
+生产者为每个消费者保存一条 FSM（`UNBOUND`、`ACTIVE`、`CLOSED`），并维护本核生产者 channel 状态（`UNBOUND`、`ACTIVE`、生产者 `CLOSED`）。`ACTIVE` 直接走常规 TPUSH 快路径；对 `UNBOUND` 或 `CLOSED` 消费者，生产者先在本地选择未使用或生产者 `CLOSED` 的 channel，没有资源就等待。随后把 `[生产者 block id，本地生产者 channel，代次 token]` 入队到消费者按源编号索引的 bind-request 区；生产者端资源不再由消费者分配。
 
-消费者独立遍历自己的接收 channel：优先从未使用的 channel，否则要求 `close_scb > closeBaseline` 且 `cons_idx >= close_scb`，即旧生产者已 close 且最后一项已 drain。绑定后通过生产者的 response L1 line 回传 `[ready_scb 基线，消费者 channel，completion]`，同时把本核 `cons_idx` 写入生产者的 `free_scb[生产者 channel]`。`completion` 最后写入；生产者只轮询这个显式完成字段，看到完成后再 MOV ready 基线到 `prod_idx` GPR，并记录“本地生产者 channel ↔ 对端消费者 channel”映射。各计数均为绝对值覆盖，不是累加；换生产者时接力延续，不清 ring，也不复位 SCB。
+请求区为每个逻辑生产者保留一条独立 cache line（覆盖 runtime 最多 64 个逻辑 window），因此多个生产者同时到达时拥有不同的远端 writer，不会在线粒度 cache writeback 中互相覆盖。消费者以 round-robin 选择 pending 项（显式 TPOP 指定的生产者优先），完整处理一个 bind 及其回复后才选择下一项；回复写到生产者按消费者编号索引的 response 区。持久化的代次 token 可防止迟到回复误完成后续请求。
 
-A2/A3 公共接口为 `TPUSH(pipe, tile, consId, isLastTransfer, events...)`；省略布尔参数等价于 `isLastTransfer == false`。只在当前生产者→消费者时段的最后一块上设为 `true`。最后一次 TPUSH 在 payload 与 READY 之后把同一绝对计数发布到对端消费者 channel 的 `close_scb`，再把该消费者 FSM 和本地生产者 channel 都置为 `CLOSED`。这是时分 MPSC：同一消费者任意时刻只允许一条 bind request 在途。
+对选中的请求，消费者独立遍历自己的接收 channel：优先从未使用的 channel，否则只要求 `close_scb > closeBaseline`，不再要求 `cons_idx >= close_scb`。尚未 drain 的 turn 会把生产者身份和结束边界保存在持久记录中；bind 把旧结束值作为新 `prod_idx` 基线，并把当前 `cons_idx` 作为绝对 FREE 基线回传，因此常规 ring 背压会阻止新生产者覆盖旧 payload。请求和回复都最后写 commit 字；计数跨生产者单调接力，不清 ring，也不复位 SCB。
+
+A2/A3 公共接口为 `TPUSH(pipe, tile, consId, isLastTransfer, events...)`；省略布尔参数等价于 `isLastTransfer == false`。只在当前生产者→消费者时段的最后一块上设为 `true`。最后一次 TPUSH 在 payload 与 READY 之后把同一绝对计数发布到对端消费者 channel 的 `close_scb`，再把该消费者 FSM 和本地生产者 channel 都置为 `CLOSED`。payload 所有权仍是时分 MPSC，但现在允许多条 bind request 并发 pending，由消费者串行处理。
 
 ### 组广播与归约数据搬运
 
-组 COPY 与 reduce 仍共用 native group opcode，但门面分开表达本地地址合约：
-
-- `copy_l1_to_group(srcProducerSlot, groupSlot, transferScratch, ...)` 是广播路径，从独立 producer L1 扇出；A3 mock 按成员展开，native 仍发射一条 group COPY。
-- `mov_ubuf_group(..., op=SUM/MAX/MIN, ...)` 是当前组归约路径，sink 按升序 block id 折叠成员贡献，保持与 relay 相同的累加顺序。
-
-`GRID_TBROADCAST` 只 stage 一次：group arena 对 block id 仿射时调 `copy_l1_to_group`，否则按成员调 `copy_l1_to_neighbor_l1`；在读任一 rank slot 前先等完声明的全部生产者 READY/CLOSE。组 `TREDUCE` 由每个成员调用：贡献核原子发布 READY/CLOSE，sink 等齐 `N-1` 后以 `mov_ubuf_group` 归约，再原子返回 FREE。
+`GRID_TBROADCAST` 只 stage 一次：group arena 对 block id 仿射时把所选 channel/slot 交给 `copy_l1_to_group`，否则按成员调 `copy_l1_to_neighbor_l1`。每个接收者等待该 channel 的绝对 READY/CLOSE，做本地 drain，再以原子 FREE 放行下一位 owner。组 `TREDUCE` 由每个成员调用：最多 C 个贡献核写入 sink 的不同 ring，sink 按源序归约，并用反向原子 FREE 放行各 channel 的下一源。
 
 ### fp32 归约
 
-归约 slot 携带 fp32 `[T, H]`，所以 `FFN_SLOT_BYTES = T * H * 4`。这让 `downPartial`、`yOutput` 和 `golden.bin` 都保持 fp32，host 可直接做容差比较。ReduceSum 按 H 分段（`kHSegs` = 7）：`treduce` 在专用的聚合 SPR 握手下读取每核对称的 segment 存储，`tpush` 则用 peer-id TPOP + TADD + TPUSH 逐跳中继。Phase B/C 在持久化 window 中继续单调接力 collective 计数，不会重置 SCB。
+归约 slot 携带 fp32 `[T, H]`，所以 `FFN_SLOT_BYTES = T * H * 4`。这让 `downPartial`、`yOutput` 和 `golden.bin` 都保持 fp32，host 可直接做容差比较。ReduceSum 按 H 分段（`kHSegs` = 7）：`treduce` 把每段 stage 到分配的 sink ring，`tpush` 则用 peer-id TPOP + TADD + TPUSH 逐跳中继。ROW/COL 复用同一 window；跨阶段生产者身份变化由固定 channel bind 接力绝对 READY/FREE 基线。
 
 ### Peer-id unicast
 
@@ -211,9 +208,9 @@ Unicast 的方向由调度推导，不编码进指令类型。TPUSH 接收目标
 
 ### 并发组广播（TBROADCAST）
 
-`TBROADCAST<GridGroup>`（`ROW`/`COL`/`SUBRECT`）把本 cell 的 tile 一次性广播给其它组成员：逐目标写入 rank-indexed slot，整个广播只付一次 publish fence，随后原子累加聚合 ready/close SPR。它不是按跳展开的 `TPUSH` 循环。
+`TBROADCAST<GridGroup>`（`ROW`/`COL`/`SUBRECT`）把源序号 `s` 映射到 channel `s%C`，并写普通 GridPipe ring 的 `(sequence%SlotCount)`。整次扇出只付一次 publish fence，随后源以 `sequence+1` 绝对覆盖该 channel 的 READY/CLOSE；它不是按跳展开的 `TPUSH` 循环。
 
-组内每个成员可同时调用 `TBROADCAST`。`BcastSlotCount >= GroupMax` 保证每源 payload slot 互不重叠；但信号确实写同一接收者 SPR，因此必须原子累加。接收前调用 `pipe.SetBcastExpectedProducerCount(K)`（AllGather 为 `groupSize-1`，单源 smoke 为 `1`）；本轮每次 TPOP 都等同一个“全部源已到” READY/CLOSE 栅栏，读一个不同的源 slot，再向该源原子返回 FREE。组内所有参与核必须在同一 hardware wave 常驻；否则 `WAIT_SPR` 等待的生产者未被调度，会死锁。
+任意时刻最多 C 个源真实并发。源数超过 C 时，各 channel 的源按 owner 顺序分批。旧源 CLOSE 后下一源即可 bind；bind 将旧结束绝对序列和当前消费序号接力给下一源，反向 FREE 原子信用阻止其覆盖尚未消费的槽位。源集合就是实际调用 TBROADCAST 的 rank，不再需要额外的源范围配置。8 路行 AllGather 实际执行 4+4，4 路列 gather 一批完成；一批需要的成员必须在同一 hardware wave 常驻。
 
 ### GridPipe 冒烟测试
 

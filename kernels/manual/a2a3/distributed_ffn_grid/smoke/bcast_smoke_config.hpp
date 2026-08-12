@@ -11,10 +11,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // Compile-time config for the GridPipe TBROADCAST smoke kernel.
 //
 // One source cell broadcasts a stamped fp32 tile to every other cell on its
-// group over the 真·同时 MPSC channel (design doc §4 方案②·前缀偏移): batched
-// writes into each receiver's shared ring + ONE publish fence + atomic GridPipe
-// ready/close SPR increments.  Each receiver drains the source's shard with TPOP<GridGroup>(pipe,
-// tile, src).  Three group flavours, all single-source (one root sends, every
+// group through one ordinary GridPipe channel ring: batched writes into each
+// receiver's channel slot + one publish fence + absolute READY/CLOSE stores.
+// Each receiver drains the source's shard with TPOP<GridGroup>(pipe, tile, src).
+// Three group flavours, all single-source (one root sends, every
 // other member receives):
 //   * TBROADCAST<ROW> = the whole row      (CONFIG_BCAST_SPAN_COL=0, default)
 //   * TBROADCAST<COL> = the whole column   (CONFIG_BCAST_SPAN_COL=1, Rx1 grid)
@@ -104,42 +104,32 @@ constexpr int BCAST_TILE_BYTES = BCAST_TILE_ELEMS * 4; // fp32 payload tile
 constexpr int BCAST_SLOT_BYTES = BCAST_TILE_BYTES;
 constexpr int BCAST_SLOT_COUNT = 2;
 
-// TBROADCAST (scheme-②) region sizing: the group is the sub-rectangle extent
-// (SUBRECT) or the larger of the row/col extent (ROW/COL); the shared ring
-// carries one slot per group member.  The default (SUBRECT=0) path keeps the
-// pre-SUBRECT window byte count unchanged.
-constexpr int BCAST_GROUP_MAX = (BCAST_SUBRECT != 0) ?
-                                    ((BCAST_RECT_R1 - BCAST_RECT_R0) * (BCAST_RECT_C1 - BCAST_RECT_C0)) :
-                                    ((BCAST_ROWS > BCAST_COLS) ? BCAST_ROWS : BCAST_COLS);
-constexpr int BCAST_BCAST_SLOT_COUNT = BCAST_GROUP_MAX;
-
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>():
-//   unicast layout = kSlotRegionOffset + ChanCount * SlotCount * SlotStride;
-//                    this smoke is pure broadcast, so ChanCount = 0 and the
-//                    unicast slot region is empty.
-//   + TBROADCAST region: BcastSlotCount * SlotStride (shared ring); ready/free/
-//                        close reuse the fixed SPR triplet at CollectiveChan
+//   channel layout = kSlotRegionOffset + ChanCount * SlotCount * SlotStride
 //   + SlotStride (isolated local producer L1 staging slot)
 // The fixed header is kFlagsBytes = 3 * kGridChanCount * kScbLineStride
-// (ready/free/close, one cache line each), two bind-control L1 lines, and the
-// LOCAL pipe record (binding table + consumer FSM and persistent counters).
+// (ready/free/close, one cache line each), three C-lane collective-control arrays,
+// two 64-line dynamic-bind queues, and the LOCAL pipe record (binding table +
+// consumer FSM and persistent counters).
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int BCAST_GRID_CHAN_COUNT = 0;       // pure broadcast: no unicast rings
-constexpr int BCAST_GRID_CHAN_MAX = 4;         // pto::kGridChanCount
+constexpr int BCAST_GRID_CHAN_MAX = 4; // pto::kGridChanCount
+constexpr int BCAST_GRID_CHAN_COUNT = BCAST_GRID_CHAN_MAX;
 constexpr int BCAST_GRID_CONS_HIST_MAX = 8;    // pto::kGridConsHistMax
+constexpr int BCAST_GRID_BIND_QUEUE_DEPTH = 64; // pto::kGridBindQueueDepth
 constexpr int BCAST_GRID_SCB_LINE_STRIDE = 64; // pto::grid_mock::kScbLineStride
 constexpr int BCAST_ACTIVE_VECTOR_SUBBLOCK_ID = 0;
 constexpr int BCAST_GRID_FLAGS_BYTES = 3 * BCAST_GRID_CHAN_MAX * BCAST_GRID_SCB_LINE_STRIDE; // 768
-constexpr int BCAST_GRID_CONTROL_BYTES = 2 * BCAST_GRID_SCB_LINE_STRIDE;
-constexpr int BCAST_GRID_RECORD_WORDS = 4 + 8 * BCAST_GRID_CHAN_MAX + 4 * BCAST_GRID_CONS_HIST_MAX + 2; // 70
+constexpr int BCAST_GRID_CONTROL_BYTES =
+    (3 * BCAST_GRID_CHAN_MAX + 2 * BCAST_GRID_BIND_QUEUE_DEPTH) * BCAST_GRID_SCB_LINE_STRIDE; // 8960
+constexpr int BCAST_GRID_RECORD_WORDS = 4 + 10 * BCAST_GRID_CHAN_MAX + 4 * BCAST_GRID_CONS_HIST_MAX +
+                                        2 * BCAST_GRID_CHAN_MAX * BCAST_GRID_CONS_HIST_MAX + 3; // 143
 constexpr int BCAST_GRID_RECORD_BYTES =
     ((BCAST_GRID_RECORD_WORDS * 4 + BCAST_GRID_SCB_LINE_STRIDE - 1) / BCAST_GRID_SCB_LINE_STRIDE) *
-    BCAST_GRID_SCB_LINE_STRIDE; // 320
+    BCAST_GRID_SCB_LINE_STRIDE; // 576
 constexpr int BCAST_GRID_SLOT_REGION_OFFSET =
-    BCAST_GRID_FLAGS_BYTES + BCAST_GRID_CONTROL_BYTES + BCAST_GRID_RECORD_BYTES; // 1216
-constexpr int BCAST_UNICAST_WINDOW_BYTES =
+    BCAST_GRID_FLAGS_BYTES + BCAST_GRID_CONTROL_BYTES + BCAST_GRID_RECORD_BYTES; // 10304
+constexpr int BCAST_CHANNEL_WINDOW_BYTES =
     BCAST_GRID_SLOT_REGION_OFFSET + BCAST_GRID_CHAN_COUNT * BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
-constexpr int BCAST_BCAST_REGION_BYTES = BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
-constexpr int BCAST_WINDOW_BYTES = BCAST_UNICAST_WINDOW_BYTES + BCAST_BCAST_REGION_BYTES + BCAST_SLOT_BYTES;
+constexpr int BCAST_WINDOW_BYTES = BCAST_CHANNEL_WINDOW_BYTES + BCAST_SLOT_BYTES;
 
 #endif // BCAST_SMOKE_CONFIG_HPP

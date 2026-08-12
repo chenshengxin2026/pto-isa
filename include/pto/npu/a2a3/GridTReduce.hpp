@@ -111,127 +111,219 @@ AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv, uint32_t
     }
 }
 
-// Forward declaration: TileUbPtr is provided by the demo's
-// gridpipe_payload_inl.hpp (same pluggable payload-hook contract as the other
-// a2a3_grid_payload helpers).  Kept out-of-line so this group-reduce facade
-// stays tile-agnostic (it hands the mov_ubuf_group intrinsic raw UB ptrs).
-namespace a2a3_grid_payload {
-template <typename TileT>
-__tf__ AICORE __ubuf__ void* TileUbPtr(TileT& tile);
-} // namespace a2a3_grid_payload
+// ===========================================================================
+// GRID_TREDUCE_GROUP_IMPL: channelised N->1 group fan-in.
+//
+// EVERY member calls this function with the same group and sinkBlockId.  The
+// N-1 contributors are assigned to C GridPipe payload rings by sourceOrdinal%C.
+// At most C contributors therefore publish concurrently, each with its own ring
+// and ready/close scoreboards.  Later contributors on a channel wait for the
+// sink's reverse FREE credit before reusing the channel, continuing its absolute
+// sequence exactly like a TPUSH producer handoff.
+//
+// Forward READY/CLOSE stores are absolute overwrites: a channel has one active
+// source during a turn.  The reverse edge uses atomic add, and its target is the
+// NEXT source assigned to that channel.  Consequently the sink's consume event
+// is also the ownership baton; no per-source payload slot, aggregate forward
+// counter, or separate handoff lane is required.
+// ===========================================================================
+namespace grid_reduce_detail {
 
-// ===========================================================================
-// GRID_TREDUCE_GROUP_IMPL: SPR-notified N->1 group fan-in.
-//
-// EVERY member calls this function with the same group and sinkBlockId.  A
-// contributor's payload already lives at its symmetric `groupSlot`; it waits for
-// the prior free credit, publishes that memory, then atomically increments the
-// sink's ready and close SPRs.  The sink waits for all N-1 increments, performs
-// one mov_ubuf_group reduction, and atomically returns one free credit to every
-// contributor.  The dedicated triplet is
-// readyScb/freeScb/closeScb[Pipe::CollectiveChan], i.e. the first fixed GridPipe
-// SPR triplet beyond its active unicast channel pool.
-//
-// Atomic accumulation is essential at the sink: N-1 producers target the same
-// ready/close words concurrently.  Backpressure prevents any contributor from
-// publishing round r+1 before the sink has consumed its round-r contribution.
-// The payload itself is symmetric per-block storage and therefore has one writer
-// per block; only the notification path is MPSC.
-// ===========================================================================
+AICORE inline __gm__ uint32_t* FaultWord(__gm__ uint32_t* scb)
+{
+    return scb != nullptr ? scb + grid_mock::kFaultFlagWordOffset : nullptr;
+}
+
+AICORE inline int MemberOrdinal(pto::GridBlockRect group, uint32_t blockId)
+{
+    const uint32_t memberCount = pto::GridBlockRectSize(group);
+    for (uint32_t i = 0; i < memberCount; ++i) {
+        if (pto::GridBlockRectMember(group, i) == blockId) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+AICORE inline uint32_t ContributorOrdinal(uint32_t memberOrdinal, uint32_t sinkMemberOrdinal)
+{
+    return memberOrdinal < sinkMemberOrdinal ? memberOrdinal : memberOrdinal - 1;
+}
+
+AICORE inline uint32_t ContributorBlockId(
+    pto::GridBlockRect group, uint32_t sinkMemberOrdinal, uint32_t contributorOrdinal)
+{
+    const uint32_t memberOrdinal = contributorOrdinal < sinkMemberOrdinal ? contributorOrdinal : contributorOrdinal + 1;
+    return pto::GridBlockRectMember(group, memberOrdinal);
+}
+
+AICORE inline bool ProducerSequenceIsValid(uint32_t sequence, uint32_t ownerPosition, uint32_t ownerCount)
+{
+    return ownerCount > 0 && sequence >= ownerPosition && (sequence - ownerPosition) % ownerCount == 0;
+}
+
+} // namespace grid_reduce_detail
+
 template <pto::comm::ReduceOp Op, typename T, typename Pipe, typename TileAcc, typename TileScratch>
 AICORE bool GRID_TRY_TREDUCE_GROUP_IMPL(
     Pipe& pipe, TileAcc& acc, TileScratch& scratch, __gm__ const T* groupSlot, uint32_t bytes, pto::GridBlockRect group,
     uint32_t sinkBlockId, uint32_t blockStride = 0, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
-    static_assert(
-        Pipe::CollectiveChan < kGridChanCount,
-        "group TREDUCE requires a dedicated GridPipe ready/free/close SPR triplet beyond the unicast channels");
-    constexpr int kCollectiveChan = Pipe::CollectiveChan;
+    static_assert(Pipe::ChanCount > 0, "group TREDUCE requires at least one GridPipe payload channel");
+    (void)blockStride; // kept in the public ABI; channel rings no longer use a symmetric group stride.
+
     const uint32_t selfBlockId = static_cast<uint32_t>(pto::BlockIdFromCoord(pipe.coord, pipe.shape));
     const uint32_t memberCount = pto::GridBlockRectSize(group);
-    __gm__ uint32_t* localReady = pipe.readyScb[kCollectiveChan];
-
+    __gm__ uint32_t* faultScb = pipe.readyScb[0];
     if (memberCount == 0 || !pto::GridBlockRectContains(group, selfBlockId) ||
-        !pto::GridBlockRectContains(group, sinkBlockId)) {
-        __gm__ uint32_t* protocolFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(protocolFault, grid_mock::kFaultBindProtocol);
+        !pto::GridBlockRectContains(group, sinkBlockId) || groupSlot == nullptr || bytes == 0 ||
+        bytes > static_cast<uint32_t>(Pipe::SlotStride)) {
+        grid_mock::MockSetFault(grid_reduce_detail::FaultWord(faultScb), grid_mock::kFaultBindProtocol);
         return false;
     }
 
-    if (selfBlockId != sinkBlockId) {
-        // Contributor: one free credit per completed prior round.  Round zero
-        // waits for threshold zero and therefore proceeds immediately.
-        const uint32_t round = pipe.prodIndex[kCollectiveChan];
-        __gm__ uint32_t* localFree = pipe.freeScb[kCollectiveChan];
-        if (!wait_ipc_scb_sim(localFree, round, static_cast<uint32_t>(kGridChanCount + kCollectiveChan), maxSpins)) {
-            __gm__ uint32_t* freeFault = localFree ? localFree + grid_mock::kFaultFlagWordOffset : nullptr;
-            grid_mock::MockSetFault(freeFault, grid_mock::kFaultWaitFreeTimeout);
-            return false;
-        }
+    const int sinkMemberOrdinalInt = grid_reduce_detail::MemberOrdinal(group, sinkBlockId);
+    const int selfMemberOrdinalInt = grid_reduce_detail::MemberOrdinal(group, selfBlockId);
+    if (sinkMemberOrdinalInt < 0 || selfMemberOrdinalInt < 0) {
+        grid_mock::MockSetFault(grid_reduce_detail::FaultWord(faultScb), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+    const uint32_t sinkMemberOrdinal = static_cast<uint32_t>(sinkMemberOrdinalInt);
+    const uint32_t sourceCount = memberCount - 1;
 
-        // The contribution was written before this call.  Publish it before the
-        // ready increment so the sink cannot observe a doorbell before payload.
-#ifndef __PTO_AUTO__
-        pipe_barrier(PIPE_ALL);
-#endif
-        dsb(DSB_DDR);
-        __gm__ uint32_t* sinkReady =
-            a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, localReady, static_cast<int>(sinkBlockId));
-        atom_add_hscb(sinkReady, 1);
-#ifndef __PTO_AUTO__
-        pipe_barrier(PIPE_ALL);
-#endif
-        dsb(DSB_DDR);
-        __gm__ uint32_t* sinkClose = a2a3_grid_payload::RemoteScbPtr(
-            pipe.runtimeCtx, pipe.closeScb[kCollectiveChan], static_cast<int>(sinkBlockId));
-        atom_add_hscb(sinkClose, 1);
-        pipe.prodIndex[kCollectiveChan] = round + 1;
-        pipe.PersistProdIndex(kCollectiveChan);
+    // Degenerate one-member reduce: the sink's local contribution is already the
+    // complete result and no channel state advances.
+    if (sourceCount == 0) {
+        a2a3_grid_payload::CopyLocalSlotToTile<TileAcc>(
+            acc, reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ T*>(groupSlot)), static_cast<int>(bytes));
         return true;
     }
 
-    // Sink: ready and close are aggregate counters.  Waiting for N-1 new values
-    // on both proves that every contributor published and ended this round.
-    const uint32_t peerCount = memberCount - 1;
-    const uint32_t threshold = pipe.consIndex[kCollectiveChan] + peerCount;
-    if (!wait_ipc_scb_sim(localReady, threshold, static_cast<uint32_t>(kCollectiveChan), maxSpins)) {
-        __gm__ uint32_t* readyFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(readyFault, grid_mock::kFaultWaitReadyTimeout);
-        return false;
-    }
-    __gm__ uint32_t* localClose = pipe.closeScb[kCollectiveChan];
-    if (!wait_ipc_scb_sim(
-            localClose, threshold, static_cast<uint32_t>(2 * kGridChanCount + kCollectiveChan), maxSpins)) {
-        __gm__ uint32_t* closeFault = localClose ? localClose + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(closeFault, grid_mock::kFaultWaitReadyTimeout);
-        return false;
+    const uint32_t channelCount = GridCollectiveChannelCount(sourceCount, static_cast<uint32_t>(Pipe::ChanCount));
+
+    if (selfBlockId != sinkBlockId) {
+        const uint32_t sourceOrdinal =
+            grid_reduce_detail::ContributorOrdinal(static_cast<uint32_t>(selfMemberOrdinalInt), sinkMemberOrdinal);
+        const int channel = static_cast<int>(GridCollectiveChannel(sourceOrdinal, channelCount));
+        const uint32_t ownerPosition = GridCollectiveOwnerPosition(sourceOrdinal, channelCount);
+        // A later owner waits for the sink's mailbox permit.  Owner zero skips it
+        // only on the very first use of a pristine producer channel; subsequent
+        // reduce segments receive the wrap permit from the preceding last owner.
+        const bool waitPermit = ownerPosition != 0 || pipe.prodChanState[channel] != GridProducerChannelState::UNBOUND;
+        if (grid_detail::OpenFixedOutgoingBinding(pipe, sinkBlockId, channel, waitPermit, maxSpins) ==
+            kGridInvalidChan) {
+            return false;
+        }
+
+        auto* sourceBytes = reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ T*>(groupSlot));
+        a2a3_grid_payload::CopyLocalSlotToTile<TileScratch>(scratch, sourceBytes, static_cast<int>(bytes));
+#ifndef __PTO_AUTO__
+        pipe_barrier(PIPE_ALL);
+#endif
+        dsb(DSB_DDR);
+
+        const uint32_t idx = pipe.prodIndex[channel];
+        if (idx >= static_cast<uint32_t>(Pipe::SlotCount)) {
+            const uint32_t freeThreshold = idx + 1u - static_cast<uint32_t>(Pipe::SlotCount);
+            if (!wait_ipc_scb_sim(
+                    pipe.freeScb[channel], freeThreshold,
+                    static_cast<uint32_t>(kGridChanCount) + static_cast<uint32_t>(channel), maxSpins)) {
+                grid_mock::MockSetFault(
+                    grid_reduce_detail::FaultWord(pipe.freeScb[channel]), grid_mock::kFaultWaitFreeTimeout);
+                return false;
+            }
+        }
+        a2a3_grid_payload::StageTileToProducerSramSlot<TileScratch>(
+            pipe.producerSlotBase, scratch, static_cast<int>(bytes));
+        grid_detail::GridPublishFence();
+        const uint32_t slotOffset =
+            (idx % static_cast<uint32_t>(Pipe::SlotCount)) * static_cast<uint32_t>(Pipe::SlotStride);
+        __gm__ uint8_t* sinkRingSlot = a2a3_grid_payload::ResolvePeerSlotAddr(
+            pipe.runtimeCtx, pipe.slotBase[channel] + slotOffset, static_cast<int>(sinkBlockId));
+        a2a3_grid_payload::CopyProducerSramToNeighborSlot<TileScratch>(
+            sinkRingSlot, pipe.producerSlotBase, scratch, static_cast<int>(bytes));
+        grid_detail::GridPublishFence();
+        const int sinkConsChan = pipe.consumers.PeerConsumerChannelOf(sinkBlockId);
+        __gm__ uint32_t* sinkReady = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.readyScb[sinkConsChan], static_cast<int>(sinkBlockId));
+        sync_hscb(sinkReady, idx + 1u);
+        grid_detail::GridPublishFence();
+        __gm__ uint32_t* sinkClose = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.closeScb[sinkConsChan], static_cast<int>(sinkBlockId));
+        sync_hscb(sinkClose, idx + 1u);
+        pipe.prodIndex[channel] = idx + 1u;
+        pipe.PersistProdIndex(channel);
+        if (!pipe.CloseConsumer(sinkBlockId)) {
+            grid_mock::MockSetFault(grid_reduce_detail::FaultWord(sinkClose), grid_mock::kFaultBindProtocol);
+            return false;
+        }
+        return true;
     }
 
-    __ubuf__ T* dst = reinterpret_cast<__ubuf__ T*>(a2a3_grid_payload::TileUbPtr<TileAcc>(acc));
-    __ubuf__ T* scr = reinterpret_cast<__ubuf__ T*>(a2a3_grid_payload::TileUbPtr<TileScratch>(scratch));
-    pto::mov_ubuf_group(
-        reinterpret_cast<__ubuf__ void*>(dst), reinterpret_cast<__gm__ void*>(const_cast<__gm__ T*>(groupSlot)), bytes,
-        blockStride, static_cast<pto::GridCollOp>(static_cast<uint32_t>(Op) + 1), static_cast<uint32_t>(sizeof(T)),
-        group, sinkBlockId, reinterpret_cast<__ubuf__ void*>(scr));
-
-    // Do not let a contributor overwrite its symmetric slot until the group read
-    // above has retired.  Each target free SPR can itself have multiple writers
-    // across overlapping collectives, so retain atomic-add semantics here too.
+    // Sink starts from its own contribution.  It accepts C fixed-channel binds,
+    // then for each channel accepts the next owner immediately after CLOSE and
+    // before draining the retired payload.  That is the no-drain handoff under
+    // test: the next producer is awake but its inherited FREE baseline keeps it
+    // blocked from overwriting the live ring entry.
+    a2a3_grid_payload::CopyLocalSlotToTile<TileAcc>(
+        acc, reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ T*>(groupSlot)), static_cast<int>(bytes));
 #ifndef __PTO_AUTO__
     pipe_barrier(PIPE_ALL);
 #endif
     dsb(DSB_DDR);
-    for (uint32_t r = 0; r < memberCount; ++r) {
-        const uint32_t peerBlockId = pto::GridBlockRectMember(group, r);
-        if (peerBlockId == selfBlockId) {
-            continue;
+
+    for (uint32_t channel = 0; channel < channelCount; ++channel) {
+        const uint32_t sourceId = grid_reduce_detail::ContributorBlockId(group, sinkMemberOrdinal, channel);
+        if (grid_detail::WaitAndAcceptFixedBinding(pipe, sourceId, static_cast<int>(channel), maxSpins) ==
+            kGridInvalidChan) {
+            return false;
         }
-        __gm__ uint32_t* peerFree = a2a3_grid_payload::RemoteScbPtr(
-            pipe.runtimeCtx, pipe.freeScb[kCollectiveChan], static_cast<int>(peerBlockId));
-        atom_add_hscb(peerFree, 1);
     }
-    pipe.consIndex[kCollectiveChan] = threshold;
-    pipe.PersistConsIndex(kCollectiveChan);
+
+    const uint32_t batchCount = GridCollectiveBatchCount(sourceCount, channelCount);
+    for (uint32_t batch = 0; batch < batchCount; ++batch) {
+        for (uint32_t channel = 0; channel < channelCount; ++channel) {
+            const uint32_t sourceOrdinal = batch * channelCount + channel;
+            if (sourceOrdinal >= sourceCount) {
+                continue;
+            }
+            const uint32_t sourceId = grid_reduce_detail::ContributorBlockId(group, sinkMemberOrdinal, sourceOrdinal);
+            const uint32_t closeThreshold = pipe.consIndex[channel] + 1u;
+            if (!wait_ipc_scb_sim(
+                    pipe.closeScb[channel], closeThreshold, 2U * static_cast<uint32_t>(kGridChanCount) + channel,
+                    maxSpins)) {
+                grid_mock::MockSetFault(
+                    grid_reduce_detail::FaultWord(pipe.closeScb[channel]), grid_mock::kFaultWaitReadyTimeout);
+                return false;
+            }
+
+            const uint32_t nextOrdinal = sourceOrdinal + channelCount;
+            if (nextOrdinal < sourceCount) {
+                const uint32_t nextSourceId =
+                    grid_reduce_detail::ContributorBlockId(group, sinkMemberOrdinal, nextOrdinal);
+                grid_detail::SendFixedBindPermit(pipe, nextSourceId, static_cast<int>(channel));
+                if (grid_detail::WaitAndAcceptFixedBinding(pipe, nextSourceId, static_cast<int>(channel), maxSpins) ==
+                    kGridInvalidChan) {
+                    return false;
+                }
+            } else {
+                // Permit owner zero for the next reduce segment.  Its request is
+                // accepted at the beginning of the next collective invocation.
+                const uint32_t firstSourceId =
+                    grid_reduce_detail::ContributorBlockId(group, sinkMemberOrdinal, channel);
+                grid_detail::SendFixedBindPermit(pipe, firstSourceId, static_cast<int>(channel));
+            }
+
+            if (!GRID_TRY_TPOP_IMPL<Pipe, TileScratch>(pipe, scratch, sourceId, maxSpins, /*atomicFree=*/true)) {
+                return false;
+            }
+#ifndef __PTO_AUTO__
+            pipe_barrier(PIPE_ALL);
+#endif
+            dsb(DSB_DDR);
+            GridReduceCombine<Op, TileAcc, TileScratch>(acc, scratch);
+        }
+    }
     return true;
 }
 

@@ -2710,10 +2710,11 @@ TREDUCE(Pipe& pipe, TileAcc& acc, TileRecv& recv, uint32_t prodId, uint32_t cons
 }
 
 // GridPipe group TREDUCE overload: every member of `Group` calls the same
-// operation.  Non-sink members publish their symmetric `groupSlot` contribution
-// through the pipe's dedicated ready/close SPRs; `sinkBlockId` waits for all of
-// them, performs the N->1 combine, and returns free credits.  MPSC scoreboard
-// updates are atomic, while per-block payload addresses remain disjoint.
+// operation.  Contributors are mapped onto the pipe's C ordinary channel rings;
+// at most C publish concurrently and sources beyond C reuse a channel only after
+// its reverse FREE relay credit arrives.  READY/CLOSE are absolute per-channel
+// stores.  The sink returns reverse FREE with atomic add and combines the rings in
+// deterministic source order.
 template <
     pto::GridGroup Group, pto::comm::ReduceOp Op, typename T, typename Pipe, typename TileAcc, typename TileScratch,
     std::enable_if_t<is_grid_pipe_v<Pipe>, int> = 0, typename... WaitEvents>
@@ -2735,26 +2736,24 @@ PTO_INST RecordEvent TREDUCE(
 }
 
 // ---------------------------------------------------------------------------
-// GridPipe TBROADCAST overload: 真·同时 MPSC group broadcast (design doc
-// Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移).  The first explicit
+// GridPipe TBROADCAST overload: channelised group broadcast.  The first explicit
 // template argument is a GridGroup (ROW/COL) -- the participant set -- which
 // also selects this overload against the unicast TPUSH above (a GridGroup
 // template argument cannot bind the unicast form's leading `typename Pipe`, so
 // resolution is unambiguous and folds at compile time).
 //
-// Unlike the old single-source TPUSH<GridSpan> multicast (fan-in 1, forbidding
-// concurrent senders), TBROADCAST is safe to call from EVERY member of the group
-// at the same instant: each source writes its own prefix-offset slot in every
-// receiver's shared ring, then atomically adds to the receiver's dedicated
-// ready/close SPRs.  Receivers atomically return free credits to each producer,
-// so K concurrent senders do not lose shared-counter updates.  This is what
-// makes an AllGather-of-shards -- "every AICORE broadcasts its own shard" --
-// correct.
+// Source ordinal s uses channel s%C and its normal TPUSH-compatible payload ring.
+// Up to C sources may publish simultaneously because their rings and forward
+// scoreboards are disjoint.  More than C sources execute in batches: the next
+// owner of a channel binds after the previous owner CLOSEs and inherits its
+// absolute sequence plus current FREE baseline.  It may wake before old payload
+// drains; ordinary ring backpressure prevents overwrite.
 //
 // Receivers drain member `srcRank`'s shard with the TPOP<GridGroup> overload
-// below.  The pipe's bcastExpectedProducerCount must name the complete remote
-// source set for the round before the first drain.  See GRID_TBROADCAST_IMPL /
-// GRID_TBPOP_IMPL for the prefix-slot + aggregate-SPR handshake.
+// below.  The ranks that actually call TBROADCAST are the source set; no separate
+// source-range configuration exists.  When the source count exceeds C, callers
+// issue batches in per-channel owner order.  See GRID_TBROADCAST_IMPL /
+// GRID_TBPOP_IMPL for the bind-relay protocol.
 // ---------------------------------------------------------------------------
 template <
     pto::GridGroup Group, typename Pipe, typename TileProd, std::enable_if_t<is_grid_pipe_v<Pipe>, int> = 0,
@@ -2773,11 +2772,11 @@ PTO_INST RecordEvent TBROADCAST(Pipe& pipe, TileProd& tile, WaitEvents&... event
 }
 
 // GridPipe TPOP<GridGroup> overload: drain ONE shard that source `srcRank`
-// broadcast into this receiver's shared ring (the receive half of TBROADCAST).
+// broadcast into this receiver's assigned channel ring.
 // The GridGroup first template argument selects this overload against the
 // unicast TPOP above.  `srcRank` is the broadcasting
-// member's rank-in-group (its prefix-offset index).  Callers drain exactly the
-// declared number of distinct remote sources per round; order is unrestricted.
+// member's rank-in-group.  Sources sharing a channel must be drained in owner
+// order; different channels may be interleaved.
 template <
     pto::GridGroup Group, typename Pipe, typename TileCons, std::enable_if_t<is_grid_pipe_v<Pipe>, int> = 0,
     typename... WaitEvents>

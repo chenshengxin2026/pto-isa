@@ -74,15 +74,13 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-// Group TREDUCE reads each member's contribution in place from partialBuf and
-// uses the first fixed SPR triplet after this one-channel unicast pool for its
-// ready/free/close MPSC handshake.  The unicast ring remains allocated only to
-// keep this demo's existing host window ABI stable.
-constexpr int kFfnReduceChanCount = FFN_RS_REDUCE_CHAN_COUNT;
-using FfnReducePipe =
-    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceChanCount>;
+// Group TREDUCE moves each contribution into one of C TPUSH-compatible channel
+// rings at the sink.  Up to C sources publish concurrently; additional row
+// contributors reuse the same channels in a second relay-counted batch.
+constexpr int kFfnReduceChanCount = FFN_RS_TREDUCE_CHAN_COUNT;
+using FfnReducePipe = GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_TREDUCE_SLOT_COUNT, kFfnReduceChanCount>;
 static_assert(
-    a2a3_grid::WindowBytes<FfnReducePipe>() == static_cast<uint32_t>(FFN_RS_REDUCE_WIN),
+    a2a3_grid::WindowBytes<FfnReducePipe>() == static_cast<uint32_t>(FFN_RS_TREDUCE_WIN),
     "TREDUCE host/device GridPipe window layout mismatch");
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
@@ -241,9 +239,9 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
                 Stride<kDownKBase * kH, kDownKBase * kH, kDownKBase * kH, kH, 1>>;
             // partialBuf holds each cell's [T,H] down partial in SEGMENT-MAJOR form:
             // segment nTile ([T,kHBase]) is stored CONTIGUOUSLY (T-stride kHBase) at
-            // offset nTile*(T*kHBase), so the phase-B group fan-in
-            // (mov_ubuf_group, op=SUM) can read every row-mate's segment as one
-            // contiguous byte range.  partialBuf / rowPartialBuf are INTERMEDIATE;
+            // offset nTile*(T*kHBase), so each contributor can load one segment
+            // and push it through its selected TREDUCE channel ring.  partialBuf /
+            // rowPartialBuf are INTERMEDIATE;
             // only the final y output keeps the strided [T,H] golden layout below.
             using GPartialSeg = GlobalTensor<
                 float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kHBase, kT * kHBase, kT * kHBase, kHBase, 1>>;
@@ -371,16 +369,15 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     }
 
     // =========================== phase B: EAST 8-way reduce (row, H-chunked) ===========================
-    // Every row member participates.  Contributors publish their symmetric
-    // partialBuf segment by atomically adding the row sink's ready/close SPRs;
-    // the sink waits for all seven, performs mov_ubuf_group, then returns free
-    // credits before the next H segment can be published.
+    // Every row member participates.  Seven contributors publish through four
+    // channel rings as a 4+3 schedule; READY/CLOSE are absolute per-channel
+    // counts and reverse FREE atomic credits relay ownership between batches.
     if (phase == 1) {
         if constexpr (DAV_VEC) {
             FfnReducePipe reducePipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
-            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
+            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_TREDUCE_WIN;
             a2a3_grid::InitGridPipeFromWindow(
                 reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
 
@@ -418,15 +415,14 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     }
 
     // =========================== phase C: SOUTH 4-way reduce (col 7, H-chunked) ===========================
-    // All four row sinks in column 7 participate.  Three contributors atomically
-    // publish into the bottom sink's dedicated SPRs; the bottom sink reduces and
-    // returns free credit for each H segment.
+    // All four row sinks in column 7 participate.  Three contributors occupy
+    // three independent channels and can publish simultaneously.
     if (phase == 2) {
         if constexpr (DAV_VEC) {
             FfnReducePipe reducePipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
-            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
+            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_TREDUCE_WIN;
             a2a3_grid::InitGridPipeFromWindow(
                 reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
 

@@ -199,7 +199,7 @@ static bool InitAcl(int device_id)
 
 static bool InitGridPipeContext(DeviceResources& r)
 {
-    r.reduceWindowsBytes = static_cast<size_t>(r.cells) * FFN_RS_REDUCE_WIN;
+    r.reduceWindowsBytes = static_cast<size_t>(r.cells) * FFN_RS_TREDUCE_WIN;
     if (aclrtMalloc(&r.reduce_windows_dev, r.reduceWindowsBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
         std::cerr << "[ERROR] aclrtMalloc(reduce_windows) failed" << std::endl;
         return false;
@@ -209,10 +209,10 @@ static bool InitGridPipeContext(DeviceResources& r)
     CommDeviceContext hostCtx{};
     hostCtx.rankId = 0;
     hostCtx.rankNum = static_cast<uint32_t>(r.cells);
-    hostCtx.winSize = static_cast<uint64_t>(FFN_RS_REDUCE_WIN);
+    hostCtx.winSize = static_cast<uint64_t>(FFN_RS_TREDUCE_WIN);
     uint64_t base = reinterpret_cast<uint64_t>(r.reduce_windows_dev);
     for (int i = 0; i < r.cells && i < HCCL_MAX_RANK_NUM; ++i) {
-        hostCtx.windowsIn[i] = base + static_cast<uint64_t>(i) * FFN_RS_REDUCE_WIN;
+        hostCtx.windowsIn[i] = base + static_cast<uint64_t>(i) * FFN_RS_TREDUCE_WIN;
         hostCtx.windowsOut[i] = hostCtx.windowsIn[i];
     }
     if (aclrtMalloc(&r.hccl_ctx_dev, sizeof(CommDeviceContext), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
@@ -338,30 +338,40 @@ static bool CheckGridPipeFaults(DeviceResources& r)
     constexpr size_t kScbLineWords = 64 / sizeof(uint32_t); // grid_mock::kScbLineStrideU32
     constexpr size_t kFaultWordInLine = 10;                 // grid_mock::kFaultFlagWordOffset
     constexpr size_t kScbLines = kFlagWords / kScbLineWords;
-    std::vector<uint32_t> flags(static_cast<size_t>(r.cells) * kFlagWords, 0);
+    constexpr int kCollectivePhases = 1;
+    std::vector<uint32_t> flags(static_cast<size_t>(r.cells) * kCollectivePhases * kFlagWords, 0);
     for (int cell = 0; cell < r.cells; ++cell) {
-        auto* src = reinterpret_cast<uint8_t*>(r.reduce_windows_dev) + static_cast<size_t>(cell) * FFN_RS_REDUCE_WIN;
-        auto* dst = flags.data() + static_cast<size_t>(cell) * kFlagWords;
-        if (aclrtMemcpy(
-                dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t), ACL_MEMCPY_DEVICE_TO_HOST) !=
-            ACL_SUCCESS) {
-            std::cerr << "[ERROR] GridPipe flag D2H failed (cell " << cell << ")" << std::endl;
-            return false;
+        for (int phase = 0; phase < kCollectivePhases; ++phase) {
+            auto* src =
+                reinterpret_cast<uint8_t*>(r.reduce_windows_dev) + static_cast<size_t>(cell) * FFN_RS_TREDUCE_WIN;
+            auto* dst = flags.data() +
+                        (static_cast<size_t>(cell) * kCollectivePhases + static_cast<size_t>(phase)) * kFlagWords;
+            if (aclrtMemcpy(
+                    dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t),
+                    ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+                std::cerr << "[ERROR] GridPipe flag D2H failed (cell " << cell << ", phase " << phase << ")"
+                          << std::endl;
+                return false;
+            }
         }
     }
     bool ok = true;
     for (int cell = 0; cell < r.cells; ++cell) {
         int row = cell / r.cols;
         int col = cell - row * r.cols;
-        const uint32_t* cellFlags = flags.data() + static_cast<size_t>(cell) * kFlagWords;
-        for (size_t line = 0; line < kScbLines; ++line) {
-            const size_t i = line * kScbLineWords + kFaultWordInLine;
-            uint32_t value = cellFlags[i];
-            if (value >= 0x100U) {
-                std::cerr << "[ERROR] GridPipe fault cell=" << cell << " row=" << row << " col=" << col << " word=" << i
-                          << " code=0x" << std::hex << value << std::dec << " (" << GridPipeFaultName(value) << ")"
-                          << std::endl;
-                ok = false;
+        for (int phase = 0; phase < kCollectivePhases; ++phase) {
+            const uint32_t* cellFlags =
+                flags.data() +
+                (static_cast<size_t>(cell) * kCollectivePhases + static_cast<size_t>(phase)) * kFlagWords;
+            for (size_t line = 0; line < kScbLines; ++line) {
+                const size_t i = line * kScbLineWords + kFaultWordInLine;
+                uint32_t value = cellFlags[i];
+                if (value >= 0x100U) {
+                    std::cerr << "[ERROR] GridPipe fault cell=" << cell << " row=" << row << " col=" << col
+                              << " phase=" << phase << " word=" << i << " code=0x" << std::hex << value << std::dec
+                              << " (" << GridPipeFaultName(value) << ")" << std::endl;
+                    ok = false;
+                }
             }
         }
     }

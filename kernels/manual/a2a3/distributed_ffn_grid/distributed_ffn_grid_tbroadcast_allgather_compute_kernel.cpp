@@ -99,15 +99,11 @@ using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
 using RowBlockTile = Tile<TileType::Vec, half, kT, kRowBlock, BLayout::RowMajor>;
 using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
-// ChanCount = 0: both phases move their payload through the broadcast ring only
-// (TBROADCAST + TPOP<GridGroup>), never unicast TPUSH/TPOP, so the concurrency
-// array allocates no slot rings at all.
-using FfnGatherPipeP1 = GridPipe<
-    HiddenShardTile, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1,
-    /*ChanCount=*/0>;
-using FfnGatherPipeP2 = GridPipe<
-    RowBlockTile, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2,
-    /*ChanCount=*/0>;
+// Both phases use C ordinary GridPipe channel rings.  A row has eight sources,
+// so P1 runs two four-source batches; a column has four and fits in one batch.
+using FfnGatherPipeP1 =
+    GridPipe<HiddenShardTile, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_CHAN_COUNT>;
+using FfnGatherPipeP2 = GridPipe<RowBlockTile, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_CHAN_COUNT>;
 static_assert(
     a2a3_grid::WindowBytes<FfnGatherPipeP1>() == static_cast<uint32_t>(FFN_NCUT_WIN_P1),
     "P1 host/device GridPipe window layout mismatch");
@@ -358,9 +354,8 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             __gm__ uint8_t* window = p1Window + cell * FFN_NCUT_WIN_P1;
             a2a3_grid::InitGridPipeFromWindow(
                 gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p1CtxRaw), /*pipeId=*/0);
-            // Every row member publishes; this receiver drains the other K-1
-            // rank-indexed slots after the aggregate ready/close SPR barrier.
-            gatherPipe.SetBcastExpectedProducerCount(static_cast<uint32_t>(gridCols - 1));
+            // Every row member publishes.  Source ordinal maps to channel
+            // ordinal%C; eight row sources therefore execute as two batches.
             using pto::GridGroup;
 
             // Place own shard into its column slot of the row block, then broadcast.
@@ -371,28 +366,40 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             pipe_barrier(PIPE_V);
 #endif
 
-            // 真·同时 MPSC: every cell TBROADCASTs its own shard concurrently.
-            (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::ROW>(gatherPipe, shardOwn, kGatherMaxSpins);
-#ifndef __PTO_AUTO__
-            pipe_barrier(PIPE_ALL);
-#endif
-            dsb(DSB_DDR);
+            const uint32_t p1SourceCount = static_cast<uint32_t>(gridCols);
+            const uint32_t p1ChannelCount =
+                GridCollectiveChannelCount(p1SourceCount, static_cast<uint32_t>(FfnGatherPipeP1::ChanCount));
+            const uint32_t p1BatchCount = GridCollectiveBatchCount(p1SourceCount, p1ChannelCount);
+            for (uint32_t batch = 0; batch < p1BatchCount; ++batch) {
+                const uint32_t first = batch * p1ChannelCount;
+                const uint32_t end = first + p1ChannelCount < p1SourceCount ? first + p1ChannelCount : p1SourceCount;
 
-            // Drain the other 7 row-mates' shards (ascending srcCol) and insert each
-            // into its matching column slot, rebuilding the [8,768] row block.
-            for (int srcCol = 0; srcCol < gridCols; ++srcCol) {
-                if (srcCol == col) {
-                    continue; // own shard already placed
+                // At most one source per channel publishes in this batch.  A
+                // later batch's source blocks on reverse relay credits until all
+                // receivers have drained this channel's previous payload.
+                if (static_cast<uint32_t>(col) >= first && static_cast<uint32_t>(col) < end) {
+                    (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::ROW>(gatherPipe, shardOwn, kGatherMaxSpins);
                 }
-                (void)GRID_TRY_TBPOP_IMPL<GridGroup::ROW>(gatherPipe, shardRecv, srcCol, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                pipe_barrier(PIPE_ALL);
 #endif
-                TINSERT(rowBlock, shardRecv, 0, static_cast<uint16_t>(srcCol * kIShard));
+                dsb(DSB_DDR);
+
+                for (uint32_t srcCol = first; srcCol < end; ++srcCol) {
+                    if (srcCol == static_cast<uint32_t>(col)) {
+                        continue; // TBROADCAST advanced the logical self-consumer.
+                    }
+                    (void)GRID_TRY_TBPOP_IMPL<GridGroup::ROW>(
+                        gatherPipe, shardRecv, static_cast<int>(srcCol), kGatherMaxSpins);
 #ifndef __PTO_AUTO__
-                pipe_barrier(PIPE_V);
+                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 #endif
+                    TINSERT(rowBlock, shardRecv, 0, static_cast<uint16_t>(srcCol * kIShard));
+#ifndef __PTO_AUTO__
+                    pipe_barrier(PIPE_V);
+#endif
+                }
             }
 
 #ifndef __PTO_AUTO__
@@ -440,7 +447,6 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             __gm__ uint8_t* window = p2Window + cell * FFN_NCUT_WIN_P2;
             a2a3_grid::InitGridPipeFromWindow(
                 gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p2CtxRaw), /*pipeId=*/0);
-            gatherPipe.SetBcastExpectedProducerCount(static_cast<uint32_t>(gridRows - 1));
             using pto::GridGroup;
 
             // Place own row block at its row slot of the full hidden, then broadcast.
@@ -451,27 +457,36 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             pipe_barrier(PIPE_V);
 #endif
-            (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::COL>(gatherPipe, blockOwn, kGatherMaxSpins);
-#ifndef __PTO_AUTO__
-            pipe_barrier(PIPE_ALL);
-#endif
-            dsb(DSB_DDR);
-
-            // Drain the other 3 col-mates' row blocks (ascending srcRow) and insert
-            // each at its row slot, rebuilding the full hidden [8,3072].
-            for (int srcRow = 0; srcRow < gridRows; ++srcRow) {
-                if (srcRow == row) {
-                    continue; // own block already placed
+            const uint32_t p2SourceCount = static_cast<uint32_t>(gridRows);
+            const uint32_t p2ChannelCount =
+                GridCollectiveChannelCount(p2SourceCount, static_cast<uint32_t>(FfnGatherPipeP2::ChanCount));
+            const uint32_t p2BatchCount = GridCollectiveBatchCount(p2SourceCount, p2ChannelCount);
+            for (uint32_t batch = 0; batch < p2BatchCount; ++batch) {
+                const uint32_t first = batch * p2ChannelCount;
+                const uint32_t end = first + p2ChannelCount < p2SourceCount ? first + p2ChannelCount : p2SourceCount;
+                if (static_cast<uint32_t>(row) >= first && static_cast<uint32_t>(row) < end) {
+                    (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::COL>(gatherPipe, blockOwn, kGatherMaxSpins);
                 }
-                (void)GRID_TRY_TBPOP_IMPL<GridGroup::COL>(gatherPipe, blockRecv, srcRow, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                pipe_barrier(PIPE_ALL);
 #endif
-                TINSERT(hiddenFull, blockRecv, 0, static_cast<uint16_t>(srcRow * kRowBlock));
+                dsb(DSB_DDR);
+
+                for (uint32_t srcRow = first; srcRow < end; ++srcRow) {
+                    if (srcRow == static_cast<uint32_t>(row)) {
+                        continue;
+                    }
+                    (void)GRID_TRY_TBPOP_IMPL<GridGroup::COL>(
+                        gatherPipe, blockRecv, static_cast<int>(srcRow), kGatherMaxSpins);
 #ifndef __PTO_AUTO__
-                pipe_barrier(PIPE_V);
+                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 #endif
+                    TINSERT(hiddenFull, blockRecv, 0, static_cast<uint16_t>(srcRow * kRowBlock));
+#ifndef __PTO_AUTO__
+                    pipe_barrier(PIPE_V);
+#endif
+                }
             }
 
 #ifndef __PTO_AUTO__

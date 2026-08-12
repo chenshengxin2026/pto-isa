@@ -391,29 +391,29 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char
     return ok;
 }
 
-// DEBUG: dump the dedicated aggregate ready/free/close SPR triplet used by the
-// pure-broadcast pipe.  ChanCount=0, so CollectiveChan is fixed channel 0.
+// DEBUG: dump the per-channel READY/FREE/CLOSE state used by TBROADCAST.
 static void DumpArenaCollectiveScbs(void* arenaDev, int winBytes, int dumpCells, const char* arenaName)
 {
     constexpr int kScbStride = 64;
-    constexpr int kCollectiveChan = FFN_NCUT_BCAST_CHAN_COUNT;
-    constexpr int kReadyOff = kCollectiveChan * kScbStride;
-    constexpr int kFreeOff = (FFN_GRID_CHAN_MAX + kCollectiveChan) * kScbStride;
-    constexpr int kCloseOff = (2 * FFN_GRID_CHAN_MAX + kCollectiveChan) * kScbStride;
-    std::cout << "[DEBUG] " << arenaName << " collective SPRs (ready/free/close offsets=" << kReadyOff << "/"
-              << kFreeOff << "/" << kCloseOff << "):" << std::endl;
+    std::cout << "[DEBUG] " << arenaName << " collective channel SPRs:" << std::endl;
     for (int cell = 0; cell < dumpCells; ++cell) {
         auto* base = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes;
-        uint32_t ready = 0;
-        uint32_t freeCount = 0;
-        uint32_t close = 0;
-        aclrtMemcpy(&ready, sizeof(ready), base + kReadyOff, sizeof(ready), ACL_MEMCPY_DEVICE_TO_HOST);
-        aclrtMemcpy(&freeCount, sizeof(freeCount), base + kFreeOff, sizeof(freeCount), ACL_MEMCPY_DEVICE_TO_HOST);
-        aclrtMemcpy(&close, sizeof(close), base + kCloseOff, sizeof(close), ACL_MEMCPY_DEVICE_TO_HOST);
         int row = cell / FFN_NCUT_COLS;
         int col = cell - row * FFN_NCUT_COLS;
-        std::cout << "  cell=" << cell << " (r" << row << "c" << col << ") ready=" << ready << " free=" << freeCount
-                  << " close=" << close << std::endl;
+        std::cout << "  cell=" << cell << " (r" << row << "c" << col << ")";
+        for (int channel = 0; channel < FFN_NCUT_BCAST_CHAN_COUNT; ++channel) {
+            const int readyOff = channel * kScbStride;
+            const int freeOff = (FFN_GRID_CHAN_MAX + channel) * kScbStride;
+            const int closeOff = (2 * FFN_GRID_CHAN_MAX + channel) * kScbStride;
+            uint32_t ready = 0;
+            uint32_t freeCount = 0;
+            uint32_t close = 0;
+            aclrtMemcpy(&ready, sizeof(ready), base + readyOff, sizeof(ready), ACL_MEMCPY_DEVICE_TO_HOST);
+            aclrtMemcpy(&freeCount, sizeof(freeCount), base + freeOff, sizeof(freeCount), ACL_MEMCPY_DEVICE_TO_HOST);
+            aclrtMemcpy(&close, sizeof(close), base + closeOff, sizeof(close), ACL_MEMCPY_DEVICE_TO_HOST);
+            std::cout << " ch" << channel << "=" << ready << "/" << freeCount << "/" << close;
+        }
+        std::cout << std::endl;
     }
 }
 

@@ -8,38 +8,40 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// A2/A3 backend for GridPipe TBROADCAST<GridGroup>: a true concurrent MPSC
-// broadcast collective.
+// A2/A3 backend for channelised GridPipe TBROADCAST<GridGroup>.
 //
-// Payload and notification solve different collision problems:
+// The collective deliberately uses the same physical resources as TPUSH/TPOP:
 //
-//   * Every source owns the rank-indexed slot in each receiver's shared ring.
-//     BcastSlotCount >= GroupMax makes simultaneous payload writes disjoint.
-//   * Notification uses GridPipe's dedicated ready/free/close SPR triplet at
-//     CollectiveChan, exactly like TPUSH.  Because every edge is MPSC, producers
-//     atomically add ready and close at each receiver, and receivers atomically
-//     add free at the producer.  Ordinary absolute sync_hscb stores are forbidden
-//     here: concurrent last-writer-wins stores would lose credits and deadlock.
-//   * One aggregate ready/close counter does not identify which source arrived.
-//     A receiver therefore waits for the complete declared producer set before
-//     draining any rank-indexed slot.  SetBcastExpectedProducerCount(K) declares
-//     that set size (K=groupSize-1 for all-gather, K=1 for a single source).
+//   payload  = slotBase[channel] + (absoluteSequence % SlotCount) * SlotStride
+//   forward  = sync_hscb(ready/close[channel], absoluteSequence + 1)
+//   reverse  = atom_add_hscb(free[channel], 1)
 //
-// A producer waits until every receiver returned the prior round's free credit
-// before reusing its rank-indexed slot.  Thus one payload slot per possible source
-// is sufficient across any number of rounds, with no static L1 signal lanes.
+// Source ordinal s is assigned to channel s%C.  Up to C sources therefore write
+// truly concurrently without sharing either a ring or a forward scoreboard.  If
+// there are more than C sources, owner s+C may bind as soon as owner s CLOSEs;
+// it inherits the absolute sequence and current consumer baselines, then waits
+// for any still-missing FREE credits before overwriting the ring.  This is the
+// TPUSH close/bind/relay-count protocol applied to a collective schedule; no
+// per-source payload slots or per-source signal lanes exist.
+//
+// Reverse FREE credit is consumer-driven.  A receiver that has already consumed
+// the retired turn credits the incoming owner while accepting bind; otherwise
+// its later TPOP credits the owner then installed on that channel.  The incoming
+// source itself is excluded (its prior TPOP returned before this call), leaving
+// exactly groupSize-1 atomic writers on the reverse fan-in edge.
 
 #ifndef PTO_A2A3_GRID_TBROADCAST_HPP
 #define PTO_A2A3_GRID_TBROADCAST_HPP
 
 #include <cstdint>
 
+#include <pto/npu/a2a3/GridTPush.hpp>
 #include <pto/npu/a2a3/grid_intrinsic.hpp>
 #include <pto/npu/a2a3/grid_pipe_runtime.hpp>
 
-// Forward declaration: provided by the demo's gridpipe_payload_inl.hpp (same
-// pluggable payload hook contract as GridTPush.hpp / GridTPop.hpp).  Kept
-// out-of-line so GridPipe is not tied to a specific tile shape.
+// Payload hooks supplied by the GridPipe runtime adaptor.  They are kept out of
+// this public header so GridPipe remains independent of a concrete tile shape or
+// peer-window implementation.
 namespace pto {
 namespace a2a3_grid_payload {
 
@@ -61,63 +63,201 @@ __tf__ AICORE void CopyProducerSramToNeighborSlot2D(
 template <typename TileT>
 __tf__ AICORE void CopyLocalSlotToTile(TileT& tile, __gm__ uint8_t* localSlot, int slotBytes);
 template <typename TileT>
+__tf__ AICORE void CopyLocalSlotToTile2D(
+    TileT& tile, __gm__ uint8_t* localSlot, uint32_t rowBytes, uint32_t rowCount, uint32_t slotStride,
+    uint32_t tileStride);
+template <typename TileT>
 __tf__ AICORE __ubuf__ void* TileUbPtr(TileT& tile);
 
 } // namespace a2a3_grid_payload
 } // namespace pto
 
 namespace pto {
+namespace grid_broadcast_detail {
 
-// ===========================================================================
-// TBROADCAST send: broadcast THIS core's `tile` to every OTHER member of its
-// group, writing into each receiver's shared ring at THIS source's prefix-offset
-// slot, then atomically ringing each receiver's shared ready/close SPRs.  Safe to
-// call from every group member concurrently -- that is the whole point.
-// ===========================================================================
+AICORE inline __gm__ uint32_t* FaultWord(__gm__ uint32_t* scb)
+{
+    return scb != nullptr ? scb + grid_mock::kFaultFlagWordOffset : nullptr;
+}
+
+AICORE inline bool ProducerSequenceIsValid(uint32_t sequence, uint32_t ownerPosition, uint32_t ownerCount)
+{
+    return ownerCount > 0 && sequence >= ownerPosition && (sequence - ownerPosition) % ownerCount == 0;
+}
+
+template <pto::GridGroup Group, typename Pipe>
+AICORE inline bool TryServiceBindLane(Pipe& pipe, int lane)
+{
+    const uint32_t requestWord = mov_x_to_gpr(pipe.bindRequestProdIdL1[lane]);
+    if (requestWord == kGridBindPending) {
+        return false;
+    }
+    const uint32_t sourceId = GridRecUnpackId(requestWord);
+    const uint32_t prodChanWord = mov_x_to_gpr(pipe.bindRequestProdChanL1[lane]);
+    const uint32_t consChanWord = mov_x_to_gpr(pipe.bindRequestConsChanL1[lane]);
+    const uint32_t mode = mov_x_to_gpr(pipe.bindRequestModeL1[lane]);
+    if (!GridBlockIdValid(sourceId, pipe.shape) || prodChanWord != static_cast<uint32_t>(lane) + 1u ||
+        consChanWord != static_cast<uint32_t>(lane) + 1u || mode != kGridBindModeBroadcast) {
+        grid_mock::MockSetFault(FaultWord(pipe.closeScb[lane]), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+    // An early request is normal.  Leave it committed until CLOSE makes this
+    // channel rebindable; payload drain is deliberately not part of this gate.
+    if (pipe.consChanBindCnt[lane] != 0 && !pipe.ConsumerChannelIsRebindable(lane)) {
+        return false;
+    }
+
+    const uint32_t oldLogicalBase = pipe.ConsumerReadyBase(lane);
+    uint32_t readyBase = 0;
+    bool priorAlreadyConsumed = false;
+    if (!pipe.InstallIncomingBinding(lane, sourceId, lane, readyBase, priorAlreadyConsumed)) {
+        grid_mock::MockSetFault(FaultWord(pipe.closeScb[lane]), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+    grid_cce_detail::write_local_word(pipe.bindRequestProdChanL1[lane], kGridBindPending);
+    grid_cce_detail::write_local_word(pipe.bindRequestConsChanL1[lane], kGridBindPending);
+    grid_cce_detail::write_local_word(pipe.bindRequestModeL1[lane], kGridBindPending);
+    grid_cce_detail::write_local_word(pipe.bindRequestProdIdL1[lane], kGridBindPending);
+
+    const GridCoord sourceCoord{
+        static_cast<int>(sourceId / static_cast<uint32_t>(pipe.shape.gridCols)),
+        static_cast<int>(sourceId % static_cast<uint32_t>(pipe.shape.gridCols))};
+    const int sourceRank = RankInGroup(Group, sourceCoord, pipe.groupRect);
+    const int selfRank = RankInGroup(Group, pipe.coord, pipe.groupRect);
+    const int groupSize = GridGroupSize(Group, pipe.shape, pipe.groupRect);
+    if (sourceRank < 0 || selfRank < 0 || groupSize <= 0) {
+        grid_mock::MockSetFault(FaultWord(pipe.closeScb[lane]), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+    // Exactly one receiver publishes the absolute baseline; every receiver
+    // atomically contributes one completion and, when safe, one reverse credit.
+    if (selfRank == (sourceRank + 1) % groupSize) {
+        __gm__ uint32_t* peerReady = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.bindResponseReadyL1[lane], static_cast<int>(sourceId));
+        __gm__ uint32_t* peerChan = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.bindResponseConsChanL1[lane], static_cast<int>(sourceId));
+        sync_hscb(peerReady, readyBase);
+        sync_hscb(peerChan, static_cast<uint32_t>(lane) + 1u);
+    }
+    if (oldLogicalBase != 0 && priorAlreadyConsumed) {
+        __gm__ uint32_t* peerFree =
+            a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.freeScb[lane], static_cast<int>(sourceId));
+        atom_add_hscb(peerFree, 1);
+    }
+    grid_detail::GridPublishFence();
+    __gm__ uint32_t* peerComplete =
+        a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.bindResponseCompleteL1[lane], static_cast<int>(sourceId));
+    atom_add_hscb(peerComplete, 1);
+    return true;
+}
+
+template <pto::GridGroup Group, typename Pipe>
+AICORE inline void ServiceAllBindLanes(Pipe& pipe)
+{
+    for (int lane = 0; lane < Pipe::ChanCount; ++lane) {
+        (void)TryServiceBindLane<Group>(pipe, lane);
+    }
+}
+
+} // namespace grid_broadcast_detail
+
+// Broadcast this core's tile.  Source rank maps directly to rank%C; the call site
+// chooses which ranks are sources simply by which ranks invoke this send half.
+// No source-range side configuration participates in the protocol.
 template <pto::GridGroup Group, typename Pipe, typename TileProd>
 AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
-    static_assert(Pipe::GroupMax > 0, "TBROADCAST requires a GridPipe opted into broadcast (GroupMax > 0)");
-    static_assert(Pipe::BcastSlotCount > 0, "TBROADCAST requires BcastSlotCount > 0");
-    static_assert(
-        Pipe::CollectiveChan < kGridChanCount,
-        "TBROADCAST requires a dedicated GridPipe ready/free/close SPR triplet beyond the unicast channels");
+    static_assert(Pipe::ChanCount > 0, "TBROADCAST requires at least one GridPipe payload channel");
 
-    const int myRank = pto::RankInGroup(Group, pipe.coord, pipe.groupRect); // prefix-offset base, count_k = 1
-    const int groupSize = pto::GridGroupSize(Group, pipe.shape, pipe.groupRect);
-    const uint32_t gidx = static_cast<uint32_t>(myRank); // this source's single global index
-    constexpr int kCollectiveChan = Pipe::CollectiveChan;
-    __gm__ uint32_t* localReady = pipe.readyScb[kCollectiveChan];
-
-    // Payload sub-window inside the ring slot (see GridTPush.hpp).  Disabled =
-    // whole slot, which is what this path always did.
-    const GridPayloadWindow win = pipe.bcastWindow;
-    const uint32_t payloadBytes = GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride));
-    if (myRank < 0 || groupSize <= 0 || groupSize > Pipe::GroupMax ||
-        payloadBytes > static_cast<uint32_t>(Pipe::SlotStride)) {
-        __gm__ uint32_t* rangeFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultBcastPayloadRange);
-        return false;
-    }
-    const uint32_t slotOff =
-        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) +
-        win.entryOffset;
-
-    // Before reusing this source's rank-indexed slot for another round, wait for
-    // one free credit from every remote receiver of all prior rounds.
-    const uint32_t freeThreshold = pipe.prodIndex[kCollectiveChan];
-    __gm__ uint32_t* localFree = pipe.freeScb[kCollectiveChan];
-    if (!wait_ipc_scb_sim(
-            localFree, freeThreshold, static_cast<uint32_t>(kGridChanCount + kCollectiveChan), maxSpins)) {
-        __gm__ uint32_t* freeFault = localFree ? localFree + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(freeFault, grid_mock::kFaultWaitFreeTimeout);
+    const int groupSizeInt = pto::GridGroupSize(Group, pipe.shape, pipe.groupRect);
+    const int myRankInt = pto::RankInGroup(Group, pipe.coord, pipe.groupRect);
+    __gm__ uint32_t* faultScb = pipe.readyScb[0];
+    if (groupSizeInt <= 0 || myRankInt < 0) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBcastPayloadRange);
         return false;
     }
 
-    // Materialise the broadcast source in this pipe's isolated producer L1
-    // range before addressing any receiver ring.  Real WSE has unified L1 SRAM,
-    // not a separate vector UB mapping; the tile pointer below is retained only
-    // as the A3 mock's DMA scratch.
+    const uint32_t groupSize = static_cast<uint32_t>(groupSizeInt);
+    const uint32_t myRank = static_cast<uint32_t>(myRankInt);
+    const uint32_t channelCount = GridCollectiveChannelCount(groupSize, static_cast<uint32_t>(Pipe::ChanCount));
+    const uint32_t channel = GridCollectiveChannel(myRank, channelCount);
+    faultScb = pipe.readyScb[channel];
+    grid_cce_detail::write_local_word(pipe.bindResponseReadyL1[channel], kGridBindPending);
+    grid_cce_detail::write_local_word(pipe.bindResponseConsChanL1[channel], kGridBindPending);
+    grid_cce_detail::write_local_word(pipe.bindResponseCompleteL1[channel], kGridBindPending);
+    grid_detail::GridPublishFence();
+
+    const pto::GridBlockRect group = pto::GridBlockRectOfGroup(Group, pipe.coord, pipe.shape, pipe.groupRect);
+    const uint32_t selfBlockId = static_cast<uint32_t>(pto::BlockIdFromCoord(pipe.coord, pipe.shape));
+    for (uint32_t m = 0; m < groupSize; ++m) {
+        if (m == myRank) {
+            continue;
+        }
+        const uint32_t peerId = pto::GridBlockRectMember(group, m);
+        __gm__ uint32_t* peerProdChan = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.bindRequestProdChanL1[channel], static_cast<int>(peerId));
+        __gm__ uint32_t* peerConsChan = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.bindRequestConsChanL1[channel], static_cast<int>(peerId));
+        __gm__ uint32_t* peerMode =
+            a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.bindRequestModeL1[channel], static_cast<int>(peerId));
+        __gm__ uint32_t* peerProdId = a2a3_grid_payload::RemoteScbPtr(
+            pipe.runtimeCtx, pipe.bindRequestProdIdL1[channel], static_cast<int>(peerId));
+        sync_hscb(peerProdChan, channel + 1u);
+        sync_hscb(peerConsChan, channel + 1u);
+        sync_hscb(peerMode, kGridBindModeBroadcast);
+        grid_detail::GridPublishFence();
+        sync_hscb(peerProdId, GridRecPackId(selfBlockId));
+    }
+
+    uint32_t spin = 0;
+    constexpr uint32_t kFenceInterval = 64;
+    const uint32_t reverseWriters = groupSize - 1;
+    while (mov_x_to_gpr(pipe.bindResponseCompleteL1[channel]) < reverseWriters) {
+        grid_broadcast_detail::ServiceAllBindLanes<Group>(pipe);
+        if (maxSpins != 0 && spin >= maxSpins) {
+            grid_mock::MockSetFault(
+                grid_broadcast_detail::FaultWord(pipe.closeScb[channel]), grid_mock::kFaultBindResponseTimeout);
+            return false;
+        }
+        if ((++spin % kFenceInterval) == 0) {
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+    uint32_t sequence = pipe.consIndex[channel];
+    if (reverseWriters != 0) {
+        sequence = mov_x_to_gpr(pipe.bindResponseReadyL1[channel]);
+        const uint32_t responseChan = mov_x_to_gpr(pipe.bindResponseConsChanL1[channel]);
+        if (responseChan != channel + 1u) {
+            grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBindProtocol);
+            return false;
+        }
+    }
+    if (pipe.consIndex[channel] != sequence) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+    pipe.prodIndex[channel] = sequence;
+    pipe.PersistProdIndex(static_cast<int>(channel));
+    if (sequence != 0) {
+        pipe.bcastFreeThreshold[channel] += reverseWriters;
+        pipe.StoreRecord();
+    }
+    const uint32_t freeThreshold = pipe.bcastFreeThreshold[channel];
+    __gm__ uint32_t* localFree = pipe.freeScb[channel];
+    if (!wait_ipc_scb_sim(localFree, freeThreshold, static_cast<uint32_t>(kGridChanCount) + channel, maxSpins)) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(localFree), grid_mock::kFaultWaitFreeTimeout);
+        return false;
+    }
+
+    const GridPayloadWindow win = pipe.pushWindow[channel];
+    if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBcastPayloadRange);
+        return false;
+    }
+    const uint32_t slotOffset =
+        (sequence % static_cast<uint32_t>(Pipe::SlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) + win.entryOffset;
+
+    // Stage once in this core's isolated producer L1 slot.
     __gm__ uint8_t* localProducerSlot = pipe.producerSlotBase + win.entryOffset;
     if (win.rowCount == 0) {
         a2a3_grid_payload::StageTileToProducerSramSlot<TileProd>(
@@ -132,30 +272,16 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
 #endif
     dsb(DSB_DDR);
 
-    // Phase 1: payload fan-out.  Each peer receives the tile directly in its OWN
-    // shared ring at slot gidx%SC -- the disjoint prefix-offset assignment
-    // guarantees no two sources write the same slot of the same receiver, so the
-    // payloads never collide.
-    //
-    // The fan-out collapses to ONE copy_l1_to_group intrinsic (the COPY mode of
-    // the group-collective CCE instruction in grid_cce_intrinsic.hpp).  That
-    // instruction names the group by its two CORNER BLOCK IDS and addresses member
-    // b's copy of the ring slot as myRingSlot + (b - selfBlockId)*blockStride, so a
-    // multi-row SUBRECT is no longer a special case: the row-boundary jump is a jump
-    // in block id, which the instruction does itself.  What it does need is that the
-    // windows the resolver hands back be AFFINE in the block id.  They are in this
-    // mock (the host lays the per-cell windows out contiguously), but measure it
-    // rather than assume it -- a layout that is not affine takes the per-member
-    // copy_l1_to_neighbor_l1 loop below.
-    __gm__ uint8_t* myRingSlot = pipe.bcastRingBase + slotOff; // offset is identical in every window
-    const pto::GridBlockRect group = pto::GridBlockRectOfGroup(Group, pipe.coord, pipe.shape, pipe.groupRect);
-    const uint32_t selfBlockId = static_cast<uint32_t>(pto::BlockIdFromCoord(pipe.coord, pipe.shape));
+    // The selected TPUSH-compatible channel/slot has the same offset in every
+    // member window.  Use one group COPY when that arena is affine, otherwise
+    // fall back to one neighbour write per remote receiver.
+    __gm__ uint8_t* myRingSlot = pipe.slotBase[channel] + slotOffset;
     uint32_t blockStride = 0;
-    bool uniformArena = (groupSize > 1);
-    for (int m = 0; m < groupSize && uniformArena; ++m) {
-        const uint32_t memberBlockId = pto::GridBlockRectMember(group, static_cast<uint32_t>(m));
+    bool uniformArena = groupSize > 1;
+    for (uint32_t m = 0; m < groupSize && uniformArena; ++m) {
+        const uint32_t memberBlockId = pto::GridBlockRectMember(group, m);
         if (memberBlockId == selfBlockId) {
-            continue; // our own copy is myRingSlot itself -- it measures nothing
+            continue;
         }
         __gm__ uint8_t* slotM =
             a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, myRingSlot, static_cast<int>(memberBlockId));
@@ -164,7 +290,6 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
         const int64_t hops = static_cast<int64_t>(memberBlockId) - static_cast<int64_t>(selfBlockId);
         const int64_t perBlock = (gap % hops == 0) ? (gap / hops) : 0;
         if (perBlock <= 0 || perBlock > static_cast<int64_t>(0xFFFFFFFFu)) {
-            // Not affine in the block id, or a stride the uint32 operand cannot carry.
             uniformArena = false;
         } else if (blockStride == 0) {
             blockStride = static_cast<uint32_t>(perBlock);
@@ -172,25 +297,15 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
             uniformArena = false;
         }
     }
-    uniformArena = uniformArena && (blockStride != 0);
+    uniformArena = uniformArena && blockStride != 0;
+
     __ubuf__ void* transferScratch = a2a3_grid_payload::TileUbPtr<TileProd>(tile);
     auto* scratchBytes = reinterpret_cast<__ubuf__ uint8_t*>(transferScratch);
-    // Normalised window: a disabled window is one row of the whole slot, so the
-    // loops below cover both cases without branching on rowCount per row.
-    const uint32_t rowCount = (win.rowCount == 0) ? 1u : win.rowCount;
-    const uint32_t rowBytes = (win.rowCount == 0) ? static_cast<uint32_t>(Pipe::SlotStride) : win.rowBytes;
-    const uint32_t tileRowStride = (win.rowCount == 0) ? 0u : GridPayloadTileStride(win);
-    const uint32_t slotRowStride = (win.rowCount == 0) ? 0u : GridPayloadSlotStride(win);
+    const uint32_t rowCount = win.rowCount == 0 ? 1U : win.rowCount;
+    const uint32_t rowBytes = win.rowCount == 0 ? static_cast<uint32_t>(Pipe::SlotStride) : win.rowBytes;
+    const uint32_t tileRowStride = win.rowCount == 0 ? 0U : GridPayloadTileStride(win);
+    const uint32_t slotRowStride = win.rowCount == 0 ? 0U : GridPayloadSlotStride(win);
     if (uniformArena) {
-        // One intrinsic fans one ROW out to every member's copy of the slot.  This
-        // includes this source's OWN copy (the member whose block id is ours); that
-        // write is harmless -- a receiver never drains its own shard (srcRank ==
-        // myRank is skipped), and the bytes written are this source's own shard
-        // anyway.  copy_l1_to_group selects the broadcast (replicate-fan-out) NoC
-        // mode, and selfBlockId names this core as the collective's SOURCE the same
-        // way a combine names the caller as its sink.  The group operation moves
-        // a CONTIGUOUS run per member, so a 2-D window costs one intrinsic per row --
-        // still a single batched doorbell pass below.
         for (uint32_t r = 0; r < rowCount; ++r) {
             pto::copy_l1_to_group(
                 reinterpret_cast<__gm__ const void*>(localProducerSlot + r * slotRowStride),
@@ -199,14 +314,12 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
                 selfBlockId);
         }
     } else {
-        // Fallback for a window layout the group instruction cannot address (not
-        // affine in the block id) or a one-member group: one
-        // copy_l1_to_neighbor_l1 per peer.
-        for (int m = 0; m < groupSize; ++m) {
+        for (uint32_t m = 0; m < groupSize; ++m) {
             if (m == myRank) {
-                continue; // do not send to self; this core's own shard stays local.
+                continue;
             }
-            const int peerBlockId = pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, m, pipe.groupRect);
+            const int peerBlockId =
+                pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, static_cast<int>(m), pipe.groupRect);
             __gm__ uint8_t* peerSlot = a2a3_grid_payload::ResolvePeerSlotAddr(pipe.runtimeCtx, myRingSlot, peerBlockId);
             if (win.rowCount == 0) {
                 a2a3_grid_payload::CopyProducerSramToNeighborSlot<TileProd>(
@@ -219,44 +332,50 @@ AICORE bool GRID_TRY_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile, uint32_t maxSpi
         }
     }
 
-    // Single publish fence (data-before-ready, design doc C2) for the ENTIRE
-    // multicast: every per-target MTE3 burst above must commit to the peers'
-    // windows before any ready doorbell fires below.
+    // Payload-before-READY.  One source owns this channel during the turn, so
+    // READY is the same absolute overwrite used by TPUSH, not an atomic add.
 #ifndef __PTO_AUTO__
     pipe_barrier(PIPE_ALL);
 #endif
     dsb(DSB_DDR);
-
-    // Phase 2: MPSC ready fan-out.  Every concurrent source targets the same
-    // ready SPR in a receiver, so each notification MUST be an atomic increment.
-    for (int m = 0; m < groupSize; ++m) {
+    const uint32_t published = sequence + 1;
+    for (uint32_t m = 0; m < groupSize; ++m) {
         if (m == myRank) {
             continue;
         }
-        const int peerBlockId = pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, m, pipe.groupRect);
-        __gm__ uint32_t* peerReady = a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, localReady, peerBlockId);
-        atom_add_hscb(peerReady, 1);
+        const int peerBlockId =
+            pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, static_cast<int>(m), pipe.groupRect);
+        __gm__ uint32_t* peerReady =
+            a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.readyScb[channel], peerBlockId);
+        sync_hscb(peerReady, published);
     }
 
-    // CLOSE is a separate aggregate proof that each producer completed its
-    // round.  Keep it after READY even on a backend whose two atomic DMAs can be
-    // independently scheduled.
+    // CLOSE carries the same absolute end-exclusive count and is ordered after
+    // READY.  A reverse relay credit is emitted only after a receiver observes
+    // both values and drains the payload.
 #ifndef __PTO_AUTO__
     pipe_barrier(PIPE_ALL);
 #endif
     dsb(DSB_DDR);
-    __gm__ uint32_t* localClose = pipe.closeScb[kCollectiveChan];
-    for (int m = 0; m < groupSize; ++m) {
+    for (uint32_t m = 0; m < groupSize; ++m) {
         if (m == myRank) {
             continue;
         }
-        const int peerBlockId = pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, m, pipe.groupRect);
-        __gm__ uint32_t* peerClose = a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, localClose, peerBlockId);
-        atom_add_hscb(peerClose, 1);
+        const int peerBlockId =
+            pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, static_cast<int>(m), pipe.groupRect);
+        __gm__ uint32_t* peerClose =
+            a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.closeScb[channel], peerBlockId);
+        sync_hscb(peerClose, published);
     }
 
-    pipe.prodIndex[kCollectiveChan] += static_cast<uint32_t>(groupSize - 1);
-    pipe.PersistProdIndex(kCollectiveChan);
+    pipe.prodIndex[channel] = published;
+    pipe.PersistProdIndex(static_cast<int>(channel));
+
+    // This source never calls TPOP on itself, but it is still one logical
+    // receiver in the channel sequence.  Advance the local logical consumer
+    // count; a later source's bind will observe it as an already-consumed base.
+    pipe.consIndex[channel] = published;
+    pipe.PersistConsIndex(static_cast<int>(channel));
     return true;
 }
 
@@ -266,72 +385,72 @@ AICORE void GRID_TBROADCAST_IMPL(Pipe& pipe, TileProd& tile)
     (void)GRID_TRY_TBROADCAST_IMPL<Group, Pipe, TileProd>(pipe, tile, 0);
 }
 
-// ===========================================================================
-// TBROADCAST receive (TPOP<GridGroup>): drain the shard that source `srcRank`
-// broadcast into THIS core's shared ring.  The first drain of a round waits until
-// the receiver's aggregate ready AND close SPRs contain the full declared source
-// set, after which every rank-indexed slot in that set is safe to read.  Each
-// drain atomically returns one free credit directly to that source.
-//
-// Callers must drain exactly `bcastExpectedProducerCount` distinct remote source
-// ranks per round.  Source order is unrestricted because payload slots are
-// disjoint; the FFN all-gather uses ascending rank for deterministic assembly.
-// ===========================================================================
+// Drain one remote source from this receiver's channel ring.  Sources on a
+// channel must be drained in owner order; different channels may be interleaved.
+// The batched AllGather examples use ascending source ordinal, which satisfies
+// that rule and exposes C simultaneous writes per batch.
 template <pto::GridGroup Group, typename Pipe, typename TileCons>
 AICORE bool GRID_TRY_TBPOP_IMPL(
-    Pipe& pipe, TileCons& tile, int srcRank, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
+    Pipe& pipe, TileCons& tile, int srcRankInt, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
-    static_assert(Pipe::GroupMax > 0, "TPOP<GridGroup> requires a broadcast GridPipe (GroupMax > 0)");
-    static_assert(Pipe::BcastSlotCount > 0, "TPOP<GridGroup> requires BcastSlotCount > 0");
-    static_assert(
-        Pipe::CollectiveChan < kGridChanCount,
-        "TPOP<GridGroup> requires a dedicated GridPipe ready/free/close SPR triplet");
+    static_assert(Pipe::ChanCount > 0, "TPOP<GridGroup> requires at least one GridPipe payload channel");
 
-    const int groupSize = pto::GridGroupSize(Group, pipe.shape, pipe.groupRect);
-    const int myRank = pto::RankInGroup(Group, pipe.coord, pipe.groupRect);
-    const uint32_t gidx = static_cast<uint32_t>(srcRank);
-    constexpr int kCollectiveChan = Pipe::CollectiveChan;
-    __gm__ uint32_t* localReady = pipe.readyScb[kCollectiveChan];
-    const uint32_t producerCount = pipe.bcastExpectedProducerCount;
-    if (groupSize <= 0 || groupSize > Pipe::GroupMax || srcRank < 0 || srcRank >= groupSize || srcRank == myRank ||
-        producerCount == 0 || producerCount > static_cast<uint32_t>(groupSize - 1)) {
-        __gm__ uint32_t* protocolFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(protocolFault, grid_mock::kFaultBcastPayloadRange);
+    const int groupSizeInt = pto::GridGroupSize(Group, pipe.shape, pipe.groupRect);
+    const int myRankInt = pto::RankInGroup(Group, pipe.coord, pipe.groupRect);
+    __gm__ uint32_t* faultScb = pipe.readyScb[0];
+    if (groupSizeInt <= 0 || myRankInt < 0 || srcRankInt < 0 || srcRankInt >= groupSizeInt || srcRankInt == myRankInt) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBcastPayloadRange);
         return false;
     }
 
-    // consIndex counts drained remote shards.  All drains in the same round wait
-    // for the same aggregate barrier; after the final drain, integer division
-    // advances the threshold to the next round.
-    const uint32_t roundBase = (pipe.consIndex[kCollectiveChan] / producerCount) * producerCount;
-    const uint32_t readyThreshold = roundBase + producerCount;
-    if (!wait_ipc_scb_sim(localReady, readyThreshold, static_cast<uint32_t>(kCollectiveChan), maxSpins)) {
-        __gm__ uint32_t* readyFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(readyFault, grid_mock::kFaultWaitReadyTimeout);
-        return false;
+    const uint32_t groupSize = static_cast<uint32_t>(groupSizeInt);
+    const uint32_t srcRank = static_cast<uint32_t>(srcRankInt);
+    const int sourceBlockId =
+        pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, static_cast<int>(srcRank), pipe.groupRect);
+    uint32_t spin = 0;
+    constexpr uint32_t kFenceInterval = 64;
+    int consChan = pipe.ConsumerChannelForPayloadProducer(static_cast<uint32_t>(sourceBlockId));
+    while (consChan == kGridInvalidChan) {
+        grid_broadcast_detail::ServiceAllBindLanes<Group>(pipe);
+        consChan = pipe.ConsumerChannelForPayloadProducer(static_cast<uint32_t>(sourceBlockId));
+        if (consChan != kGridInvalidChan) {
+            break;
+        }
+        if (maxSpins != 0 && spin >= maxSpins) {
+            grid_mock::MockSetFault(
+                grid_broadcast_detail::FaultWord(pipe.closeScb[0]), grid_mock::kFaultBindRequestTimeout);
+            return false;
+        }
+        if ((++spin % kFenceInterval) == 0) {
+            pipe_barrier(PIPE_ALL);
+        }
     }
-    __gm__ uint32_t* localClose = pipe.closeScb[kCollectiveChan];
-    if (!wait_ipc_scb_sim(
-            localClose, readyThreshold, static_cast<uint32_t>(2 * kGridChanCount + kCollectiveChan), maxSpins)) {
-        __gm__ uint32_t* closeFault = localClose ? localClose + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(closeFault, grid_mock::kFaultWaitReadyTimeout);
-        return false;
-    }
+    const uint32_t channel = static_cast<uint32_t>(consChan);
+    const uint32_t sequence = pipe.consIndex[channel];
+    faultScb = pipe.readyScb[channel];
 
-    // Local read of this receiver's own ring slot (design doc: TPOP reads only
-    // local SRAM -- the payload was pushed here, never read cross-core).  Same
-    // payload window as the send half -- in a group collective both sides move
-    // the same geometry, so one window describes both.
-    const GridPayloadWindow win = pipe.bcastWindow;
+    const uint32_t threshold = sequence + 1;
+    if (!wait_ipc_scb_sim(faultScb, threshold, channel, maxSpins)) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultWaitReadyTimeout);
+        return false;
+    }
+    __gm__ uint32_t* localClose = pipe.closeScb[channel];
+    if (!wait_ipc_scb_sim(localClose, threshold, 2U * static_cast<uint32_t>(kGridChanCount) + channel, maxSpins)) {
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(localClose), grid_mock::kFaultWaitReadyTimeout);
+        return false;
+    }
+    // CLOSE is enough to accept a queued next owner.  Do this before touching
+    // the old payload so the bind path demonstrably has no drain prerequisite.
+    grid_broadcast_detail::ServiceAllBindLanes<Group>(pipe);
+
+    const GridPayloadWindow win = pipe.popWindow[channel];
     if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
-        __gm__ uint32_t* rangeFault = localReady ? localReady + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultBcastPayloadRange);
+        grid_mock::MockSetFault(grid_broadcast_detail::FaultWord(faultScb), grid_mock::kFaultBcastPayloadRange);
         return false;
     }
-    const uint32_t slotOff =
-        (gidx % static_cast<uint32_t>(Pipe::BcastSlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) +
-        win.entryOffset;
-    __gm__ uint8_t* localSlot = pipe.bcastRingBase + slotOff;
+    const uint32_t slotOffset =
+        (sequence % static_cast<uint32_t>(Pipe::SlotCount)) * static_cast<uint32_t>(Pipe::SlotStride) + win.entryOffset;
+    __gm__ uint8_t* localSlot = pipe.slotBase[channel] + slotOffset;
     if (win.rowCount == 0) {
         a2a3_grid_payload::CopyLocalSlotToTile<TileCons>(tile, localSlot, Pipe::SlotStride);
     } else {
@@ -339,21 +458,23 @@ AICORE bool GRID_TRY_TBPOP_IMPL(
             tile, localSlot, win.rowBytes, win.rowCount, GridPayloadSlotStride(win), GridPayloadTileStride(win));
     }
 
-    // consume-before-free fence (design doc C3): the local read above must
-    // complete before we tell the next occupant the slot is free.
+    // Consume-before-FREE.  If CLOSE-only bind already installed a later owner,
+    // credit that owner; it inherited the absolute sequence and is blocked on
+    // this ring entry.  Multiple receivers use atomic add on the reverse edge.
 #ifndef __PTO_AUTO__
     pipe_barrier(PIPE_ALL);
 #endif
     dsb(DSB_DDR);
+    const uint32_t freeOwner = pipe.consChanProdId[channel];
+    __gm__ uint32_t* nextFree = a2a3_grid_payload::RemoteScbPtr(
+        pipe.runtimeCtx, pipe.freeScb[pipe.consChanPeerProdChan[channel]], static_cast<int>(freeOwner));
+    atom_add_hscb(nextFree, 1);
 
-    // Return one credit to the source whose slot was consumed.  Every receiver
-    // targets that producer's same free SPR, so this edge is MPSC as well.
-    const int producerBlockId = pto::GroupMemberBlockId(Group, pipe.coord, pipe.shape, srcRank, pipe.groupRect);
-    __gm__ uint32_t* peerFree =
-        a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.freeScb[kCollectiveChan], producerBlockId);
-    atom_add_hscb(peerFree, 1);
-    pipe.consIndex[kCollectiveChan] += 1;
-    pipe.PersistConsIndex(kCollectiveChan);
+    pipe.consIndex[channel] = threshold;
+    pipe.PersistConsIndex(static_cast<int>(channel));
+    pipe.RetireConsumedTurns(static_cast<int>(channel));
+    // Cover the race where the next request arrived after the pre-drain scan.
+    grid_broadcast_detail::ServiceAllBindLanes<Group>(pipe);
     return true;
 }
 

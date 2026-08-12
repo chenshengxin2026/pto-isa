@@ -59,45 +59,35 @@ constexpr int FFN_SLOT_COUNT = 4;
 // where the fixed header is
 //   kFlagsBytes       = 3 * kGridChanCount * kScbLineStride  (ready/free/close,
 //                       full cache line each -- a different remote writer per word)
-//   kSlotRegionOffset = kFlagsBytes + 2 control lines + kRecordBytes  (the LOCAL pipe record: the
-//                       binding table + consumer history + dual channel maps/states,
-//                       which no peer ever writes, rounded up to a cache line)
-// The AllGather variant additionally appends the TBROADCAST (scheme-②) region:
-//   + BcastSlotCount * SlotBytes   (shared payload ring)
-// because each cell broadcasts its own hidden shard concurrently (真·同时 MPSC)
-// and the per-receiver shared ring lives in every window.  Notification reuses
-// one fixed ready/free/close SPR triplet and adds no payload-region bytes.
-// Every layout finally appends one SlotBytes producer L1 staging slot, after all
-// receive-side regions, so outbound source data cannot alias a payload ring.
+//   kSlotRegionOffset = kFlagsBytes + 3*C collective-control lines
+//                       + 2*64 dynamic-bind queue lines + kRecordBytes
+//                       (the LOCAL pipe record: binding table + consumer history
+//                       + dual channel maps/states, rounded up to a cache line)
+// TPUSH, TBROADCAST, and group TREDUCE all use that same channel-ring region.
+// Every layout finally appends one SlotBytes producer L1 staging slot, after the
+// receive rings, so outbound source data cannot alias a payload ring.
 constexpr int FFN_GRID_CHAN_MAX = 4;         // pto::kGridChanCount
 constexpr int FFN_GRID_CONS_HIST_MAX = 8;    // pto::kGridConsHistMax
+constexpr int FFN_GRID_BIND_QUEUE_DEPTH = 64; // pto::kGridBindQueueDepth
 constexpr int FFN_GRID_SCB_LINE_STRIDE = 64; // pto::grid_mock::kScbLineStride
 constexpr int FFN_ACTIVE_VECTOR_SUBBLOCK_ID = 0;
 constexpr int FFN_GRID_FLAGS_BYTES = 3 * FFN_GRID_CHAN_MAX * FFN_GRID_SCB_LINE_STRIDE; // 768
-constexpr int FFN_GRID_CONTROL_BYTES = 2 * FFN_GRID_SCB_LINE_STRIDE;                   // request + response L1 lines
-// pto::kGridRecordWords = header + 8 channel arrays + 4 consumer-history arrays + current producer channel + scratch.
-constexpr int FFN_GRID_RECORD_WORDS = 4 + 8 * FFN_GRID_CHAN_MAX + 4 * FFN_GRID_CONS_HIST_MAX + 2; // 70
+constexpr int FFN_GRID_CONTROL_BYTES =
+    (3 * FFN_GRID_CHAN_MAX + 2 * FFN_GRID_BIND_QUEUE_DEPTH) * FFN_GRID_SCB_LINE_STRIDE; // 8960
+// Includes retired-turn identity/end queues needed by CLOSE-only (pre-drain) rebind.
+constexpr int FFN_GRID_RECORD_WORDS =
+    4 + 10 * FFN_GRID_CHAN_MAX + 4 * FFN_GRID_CONS_HIST_MAX +
+    2 * FFN_GRID_CHAN_MAX * FFN_GRID_CONS_HIST_MAX + 3; // 143
 constexpr int FFN_GRID_RECORD_BYTES =
     ((FFN_GRID_RECORD_WORDS * 4 + FFN_GRID_SCB_LINE_STRIDE - 1) / FFN_GRID_SCB_LINE_STRIDE) *
-    FFN_GRID_SCB_LINE_STRIDE; // 320
+    FFN_GRID_SCB_LINE_STRIDE; // 576
 constexpr int FFN_GRID_SLOT_REGION_OFFSET =
-    FFN_GRID_FLAGS_BYTES + FFN_GRID_CONTROL_BYTES + FFN_GRID_RECORD_BYTES; // 1216
+    FFN_GRID_FLAGS_BYTES + FFN_GRID_CONTROL_BYTES + FFN_GRID_RECORD_BYTES; // 10304
 constexpr int FFN_GRID_CHAN_COUNT = FFN_GRID_CHAN_MAX;                     // legacy demo pipe: the default full array
 constexpr int FFN_GRID_RECEIVE_REGION_BYTES =
     FFN_GRID_SLOT_REGION_OFFSET + FFN_GRID_CHAN_COUNT * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
 constexpr int FFN_GRID_UNICAST_WINDOW_BYTES = FFN_GRID_RECEIVE_REGION_BYTES + FFN_SLOT_BYTES;
-#ifdef CONFIG_FFN_GRID_ALLGATHER
-// Largest group this grid forms (a row or a column) = max(rows, cols).  Each
-// member owns one prefix-offset slot, so the shared ring carries one slot per
-// member (no reuse ⟹ the directed free path is dormant but correct).
-constexpr int FFN_GRID_GROUP_MAX = (FFN_GRID_ROWS > FFN_GRID_COLS) ? FFN_GRID_ROWS : FFN_GRID_COLS;
-constexpr int FFN_BCAST_SLOT_COUNT = FFN_GRID_GROUP_MAX;
-constexpr int FFN_BCAST_REGION_BYTES =
-    FFN_BCAST_SLOT_COUNT * FFN_SLOT_BYTES + 2 * FFN_GRID_GROUP_MAX * FFN_GRID_SCB_LINE_STRIDE;
-constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_RECEIVE_REGION_BYTES + FFN_BCAST_REGION_BYTES + FFN_SLOT_BYTES;
-#else
 constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_UNICAST_WINDOW_BYTES;
-#endif
 
 // ---------------------------------------------------------------------------
 // Per-cell weight + golden byte sizes.
@@ -310,18 +300,11 @@ constexpr int FFN_NCUT_Y_SHARD_BYTES = FFN_NCUT_T * FFN_NCUT_H_SHARD * 4;      /
 // Two GridPipe arenas (different SlotStride ⟹ different window layouts):
 //   P1 carries the [8,96] hidden shard (Phase-1 row gather, group = a row of 8);
 //   P2 carries the [8,768] row block    (Phase-2 col gather, group = a col of 4).
-// Each carries one tile per source (single-shot, no slot reuse) ⟹ SlotCount = 1
-// and BcastSlotCount = group size.
-//
-// These are PURE-BROADCAST pipes: the payload travels through the broadcast ring
-// (bcastRingBase), and no unicast TPUSH/TPOP ever runs on them.  So their
-// GridPipe ChanCount is 0 and the unicast slot region is ZERO bytes -- it used to
-// be 5*SlotCount*SlotStride of never-touched window.  Window =
-// header(1216) + 0 + BcastSlotCount*SlotStride + one isolated producer
-// staging slot.  Broadcast notification reuses the fixed GridPipe SPR triplet
-// at CollectiveChan; there are no per-source signal lanes.
-// matching the layout in include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int FFN_NCUT_BCAST_CHAN_COUNT = 0; // pure-broadcast pipes: no unicast rings
+// Both use C ordinary channel rings, exactly like TPUSH.  P1's eight row sources
+// execute as two batches of four; P2's four column sources execute in one batch.
+// SlotCount=1 is sufficient because reverse FREE relay prevents the next owner
+// from reusing a channel until every receiver has drained the previous payload.
+constexpr int FFN_NCUT_BCAST_CHAN_COUNT = FFN_GRID_CHAN_MAX;
 constexpr int FFN_NCUT_RELAY_CHAN_COUNT = 2; // a relay runs two flows through each cell
 constexpr int FFN_NCUT_GRID_FLAGS_BYTES = FFN_GRID_FLAGS_BYTES;
 constexpr int FFN_NCUT_GRID_SLOT_REGION_OFFSET = FFN_GRID_SLOT_REGION_OFFSET;
@@ -330,21 +313,19 @@ constexpr int FFN_NCUT_SLOT_BYTES_P1 = FFN_NCUT_HIDDEN_SHARD_BYTES;
 constexpr int FFN_NCUT_SLOT_BYTES_P2 = FFN_NCUT_ROW_BLOCK_BYTES;
 constexpr int FFN_NCUT_GROUP_P1 = FFN_NCUT_COLS; // 8 (ROW group)
 constexpr int FFN_NCUT_GROUP_P2 = FFN_NCUT_ROWS; // 4 (COL group)
-constexpr int FFN_NCUT_BCAST_SLOTS_P1 = FFN_NCUT_GROUP_P1;
-constexpr int FFN_NCUT_BCAST_SLOTS_P2 = FFN_NCUT_GROUP_P2;
 constexpr int FFN_NCUT_WIN_P1 = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
                                 FFN_NCUT_BCAST_CHAN_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P1 +
-                                FFN_NCUT_BCAST_SLOTS_P1 * FFN_NCUT_SLOT_BYTES_P1 + FFN_NCUT_SLOT_BYTES_P1;
+                                FFN_NCUT_SLOT_BYTES_P1;
 constexpr int FFN_NCUT_WIN_P2 = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
                                 FFN_NCUT_BCAST_CHAN_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P2 +
-                                FFN_NCUT_BCAST_SLOTS_P2 * FFN_NCUT_SLOT_BYTES_P2 + FFN_NCUT_SLOT_BYTES_P2;
+                                FFN_NCUT_SLOT_BYTES_P2;
 
 // ---------------------------------------------------------------------------
 // TPUSH-AllGather topology (方案①).  Same pure 1D N-cut 32-cell mesh and shapes
 // as the TBROADCAST variant above, but the two gather phases are driven by the
 // TPUSH/TPOP unicast primitives via a nearest-neighbor relay instead of the
-// TBROADCAST MPSC collective.  The relay is fan-in-1 per direction, so it needs
-// NO broadcast region (GroupMax = 0): the window is the plain unicast layout
+// TBROADCAST collective.  The relay is fan-in-1 per direction and uses the same
+// plain channel-ring layout:
 //   header(1216) + 2 channels * SlotCount * SlotStride + one producer staging slot
 // (mirrors FFN_RS_REDUCE_WIN).  Two channels, not four: a relay runs exactly two
 // flows through a cell -- the forward gather and the backward scatter -- so the
@@ -395,17 +376,23 @@ constexpr int FFN_RS_Y_BYTES = FFN_NCUT_T * FFN_NCUT_H * 4;                  // 
 
 // EAST/SOUTH reduce tile = [T, H_base] fp32 (fits the 192 KB UB with the add acc).
 constexpr int FFN_RS_REDUCE_TILE_BYTES = FFN_NCUT_T * FFN_RS_REDUCE_H_BASE * 4; // 32768 B (32 KB)
-// Retained unicast-ring shape for ABI compatibility with the TPUSH ReduceSum
-// variant.  Group TREDUCE reads symmetric partialBuf storage directly; its
-// cross-segment backpressure is carried by the dedicated collective free SPR.
+// TPUSH ReduceSum retains its seven-slot, one-channel relay pipe.
 constexpr int FFN_RS_REDUCE_SLOT_COUNT = FFN_NCUT_H / FFN_RS_REDUCE_H_BASE; // = kHSegs (7)
-// The reduce runs as TWO launches over ONE persistent window.  One unicast
-// channel remains reserved (and unused here); group TREDUCE therefore takes SPR
-// triplet CollectiveChan=1.  Phase-B and phase-C aggregate counters continue
-// monotonically across the launch boundary without clearing any scoreboard.
 constexpr int FFN_RS_REDUCE_CHAN_COUNT = 1;
 constexpr int FFN_RS_REDUCE_WIN = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
                                   FFN_RS_REDUCE_CHAN_COUNT * FFN_RS_REDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES +
                                   FFN_RS_REDUCE_TILE_BYTES;
+
+// Group TREDUCE uses four TPUSH-compatible channel rings.  ROW reduction has
+// seven contributors and therefore runs 4+3; COL reduction has three and fits
+// in one batch.  Each turn carries one item, so one slot per channel is enough;
+// bind may occur before that item drains and FREE provides overwrite protection.
+// ROW and COL deliberately reuse one window: bind
+// relays the absolute sequence/free baseline when producer identities change.
+constexpr int FFN_RS_TREDUCE_CHAN_COUNT = FFN_GRID_CHAN_MAX;
+constexpr int FFN_RS_TREDUCE_SLOT_COUNT = 1;
+constexpr int FFN_RS_TREDUCE_WIN = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+                                   FFN_RS_TREDUCE_CHAN_COUNT * FFN_RS_TREDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES +
+                                   FFN_RS_REDUCE_TILE_BYTES;
 
 #endif // DISTRIBUTED_FFN_GRID_CONFIG_HPP

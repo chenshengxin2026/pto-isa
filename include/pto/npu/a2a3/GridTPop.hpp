@@ -12,9 +12,9 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // PRODUCER whose flow it is draining and the local consumer channel comes from the
 // binding table.  Its FREE notification uses the independently negotiated producer
 // channel at the peer.
-// TPOP also services a pending producer-id request: it waits for an unused or
-// CLOSE-qualified channel, binds that producer, then relays ready_scb/cons_idx back
-// as the producer's prod_idx/free_scb baselines.  Later pops use the bound channel
+// TPOP also dequeues dynamic producer requests one at a time: it waits for an
+// unused or CLOSE-qualified channel, binds one producer, completes that reply,
+// then considers the next pending source.  Later pops use the bound channel
 // directly until the stream closes and drains.
 
 #ifndef PTO_A2A3_GRID_TPOP_HPP
@@ -32,7 +32,8 @@ namespace pto {
 // core, over the channel this pipe has bound to that producer.
 template <typename Pipe, typename TileCons>
 AICORE bool GRID_TRY_TPOP_IMPL(
-    Pipe& pipe, TileCons& tile, uint32_t prodId, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
+    Pipe& pipe, TileCons& tile, uint32_t prodId, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins,
+    bool atomicFree = false)
 {
     static_assert(Pipe::ChanCount > 0, "GridPipe TPOP needs a pipe with at least one channel (ChanCount > 0)");
 
@@ -111,14 +112,36 @@ AICORE bool GRID_TRY_TPOP_IMPL(
     //   (SYNC_HSCB) store of cons_idx (= idx+1) into ITS free_scb at peerProdChan
     //   (overwrite store of a monotone absolute count).  The remote producer channel
     //   need not equal this core's local consChan.
+    // A CLOSE-only rebind may already have installed the next owner while this
+    // payload still belongs to a retired producer.  FREE follows ownership, not
+    // payload identity: the next owner inherited this absolute sequence and is
+    // the producer whose overwrite wait must be released.
+    const uint32_t freeProdId = pipe.consChanProdId[consChan];
+    if (!GridBlockIdValid(freeProdId, pipe.shape)) {
+        grid_mock::MockSetFault(grid_detail::FaultWord(pipe.closeScb[consChan]), grid_mock::kFaultBindProtocol);
+        return false;
+    }
     __gm__ uint32_t* peerFree =
-        a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.freeScb[peerProdChan], static_cast<int>(prodId));
-    sync_hscb(peerFree, idx + 1);
+        a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.freeScb[peerProdChan], static_cast<int>(freeProdId));
+    if (atomicFree) {
+        atom_add_hscb(peerFree, 1);
+    } else {
+        sync_hscb(peerFree, idx + 1);
+    }
 
     // Step 5 (V7 C4): bump the local consumer GPR (drives slot addr / ready
     //   threshold / the absolute count published to the producer).
     pipe.consIndex[consChan] = idx + 1;
     pipe.PersistConsIndex(consChan);
+    pipe.RetireConsumedTurns(consChan);
+    // If another request raced with the pre-pop queue scan, service exactly one
+    // now so a producer is never left asleep merely because this was the last
+    // old-payload TPOP.  A later TPOP services the next queued request.
+    int acceptedChan = kGridInvalidChan;
+    if (grid_detail::ServiceOneDynamicBindQueueRequest(pipe, kGridNoPeer, acceptedChan) ==
+        grid_detail::DynamicBindQueueServiceResult::FAILED) {
+        return false;
+    }
     return true;
 }
 

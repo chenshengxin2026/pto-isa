@@ -74,7 +74,7 @@ using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
 // relay-count bind handshake carry its absolute sequence across the launch boundary.
 constexpr int kFfnReduceChanCount = FFN_RS_REDUCE_CHAN_COUNT;
 using FfnReducePipe =
-    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceChanCount>;
+    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, kFfnReduceChanCount>;
 static_assert(
     a2a3_grid::WindowBytes<FfnReducePipe>() == static_cast<uint32_t>(FFN_RS_REDUCE_WIN),
     "FFN ReduceSum host/device GridPipe window layouts must match");

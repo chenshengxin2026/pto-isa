@@ -34,18 +34,17 @@ namespace a2a3_grid {
 //     + c * kScbLineStride
 //   2 * kGridChanCount * kScbLineStride             close scoreboards, likewise
 //     + c * kScbLineStride
-//   kScbHeaderBytes                                 bind-request L1 line
-//   kScbHeaderBytes + kScbLineStride                bind-response L1 line
+//   kScbHeaderBytes                                 C bind-request L1 lines
+//   kBindResponseOffset                             C bind-response-data lines
+//   kBindResponseCompleteOffset                     C structured-bind response-commit lines
+//   kBindRequestQueueOffset                         64 dynamic-bind request entries
+//   kBindResponseQueueOffset                        64 dynamic-bind response entries
 //   kRecordOffset                                   pipe record: bindings, consumer
 //                                                     FSM/history, both channel maps,
 //                                                     close bases and run counters
-//   kSlotRegionOffset                               slot region, ChanCount rings
+//   kSlotRegionOffset                               payload region, ChanCount rings
 //     + c * SlotCount * SlotStride                    ring of channel c
-//   kSlotRegionOffset + C*SlotCount*SlotStride      TBROADCAST region (GroupMax > 0):
-//     + 0                                             shared payload ring [BcastSlotCount * SlotStride]
-//                                                     (notifications use the dedicated
-//                                                     GridPipe SPR triplet at CollectiveChan)
-//   end of receive rings / broadcast ring            producer staging [SlotStride]
+//   end of channel rings                            producer staging [SlotStride]
 //                                                     local L1 source for every outbound transfer
 //
 // TWO PROPERTIES THE REST OF THE SYSTEM LEANS ON.
@@ -57,8 +56,8 @@ namespace a2a3_grid {
 //     lives.  A line each, because each has a DIFFERENT external writer and the
 //     mock's write-back is line-granular -- see kScbLineStride in
 //     grid_intrinsic.hpp for the lost-update this prevents.  Only the RINGS are
-//     trimmed by ChanCount, so a pure-broadcast pipe (ChanCount = 0) pays the
-//     header and no unicast payload bytes at all.
+//     trimmed by ChanCount.  TPUSH, TBROADCAST, and group TREDUCE all address
+//     the same rings; there is no appended per-source collective region.
 //
 // (2) The pipe record is LOCAL-ONLY -- this core is its sole reader and writer, no
 //     peer ever stores into it -- so its words may share cache lines freely, and it
@@ -79,14 +78,33 @@ namespace a2a3_grid {
 // word.
 inline constexpr uint32_t kScbHeaderBytes = 3U * static_cast<uint32_t>(kGridChanCount) * grid_mock::kScbLineStride;
 
-// Two remotely-written control lines used only when a producer opens/reopens a
-// time-division MPSC binding.  Request = [producer id commit, producer channel];
-// response = [ready baseline, consumer channel, completion commit].  Producer and
-// consumer channels are independent.  Keeping request/response on separate cache
-// lines prevents line-granular mock write-back from clobbering the other mailbox.
+// Three arrays of C remotely-written structured-collective control lines.  Request = [producer-id
+// commit, producer channel, requested consumer channel, mode]; response data =
+// [ready baseline, consumer channel]; response completion is isolated because a
+// broadcast bind has multiple external completion writers.
 inline constexpr uint32_t kBindRequestOffset = kScbHeaderBytes;
-inline constexpr uint32_t kBindResponseOffset = kBindRequestOffset + grid_mock::kScbLineStride;
-inline constexpr uint32_t kControlBytes = 2U * grid_mock::kScbLineStride;
+inline constexpr uint32_t kBindRequestBytes = static_cast<uint32_t>(kGridChanCount) * grid_mock::kScbLineStride;
+inline constexpr uint32_t kBindResponseOffset = kBindRequestOffset + kBindRequestBytes;
+inline constexpr uint32_t kBindResponseBytes = static_cast<uint32_t>(kGridChanCount) * grid_mock::kScbLineStride;
+inline constexpr uint32_t kBindResponseCompleteOffset = kBindResponseOffset + kBindResponseBytes;
+inline constexpr uint32_t kBindResponseCompleteBytes =
+    static_cast<uint32_t>(kGridChanCount) * grid_mock::kScbLineStride;
+
+// Dynamic TPUSH/TPOP bind queues.  Request entry p is written only by logical
+// producer p; response entry c is written only by logical consumer c.  One full
+// line per entry is required because different entries have different external
+// writers and the A3 mock commits a whole cache line on every remote store.
+inline constexpr uint32_t kBindRequestQueueOffset = kBindResponseCompleteOffset + kBindResponseCompleteBytes;
+inline constexpr uint32_t kBindRequestQueueBytes =
+    static_cast<uint32_t>(kGridBindQueueDepth * kGridBindQueueEntryBytes);
+inline constexpr uint32_t kBindResponseQueueOffset = kBindRequestQueueOffset + kBindRequestQueueBytes;
+inline constexpr uint32_t kBindResponseQueueBytes =
+    static_cast<uint32_t>(kGridBindQueueDepth * kGridBindQueueEntryBytes);
+inline constexpr uint32_t kControlBytes = kBindRequestBytes + kBindResponseBytes + kBindResponseCompleteBytes +
+                                          kBindRequestQueueBytes + kBindResponseQueueBytes;
+static_assert(
+    kGridBindQueueEntryBytes == static_cast<int>(grid_mock::kScbLineStride),
+    "GridPipe bind-queue entries must remain isolated cache lines");
 
 // Pipe record: bindings, consumer FSM/history, producer/consumer channel maps and
 // states, close bases, and persistent prod/cons counter mirrors.  It lets a schedule span several kernel
@@ -120,45 +138,16 @@ inline constexpr uint32_t kSlotRegionBytes()
     return static_cast<uint32_t>(ChanCount) * SlotCount * SlotStride;
 }
 
-// TBROADCAST (scheme-②) region offsets/sizes.  No-ops (zero) when GroupMax == 0.
-template <int SlotBytes, int BcastSlotCount>
-inline constexpr uint32_t kBcastRingBytes()
-{
-    return static_cast<uint32_t>(BcastSlotCount) * static_cast<uint32_t>(SlotBytes);
-}
-
-template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax>
-inline constexpr uint32_t kBcastRegionBytes()
-{
-    (void)SlotCount;
-    (void)GroupMax;
-    return kBcastRingBytes<SlotStride, BcastSlotCount>(); // shared payload ring only; signals live in SPRs
-}
-
 template <int SlotStride, int SlotCount, int ChanCount = kGridChanCount>
 inline constexpr uint32_t kProducerRegionOffset()
 {
     return kSlotRegionOffset + kSlotRegionBytes<SlotStride, SlotCount, ChanCount>();
 }
 
-template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int ChanCount = kGridChanCount>
-inline constexpr uint32_t kProducerRegionOffsetWithBcast()
-{
-    return kProducerRegionOffset<SlotStride, SlotCount, ChanCount>() +
-           kBcastRegionBytes<SlotStride, SlotCount, BcastSlotCount, GroupMax>();
-}
-
 template <int SlotStride, int SlotCount, int ChanCount = kGridChanCount>
 inline constexpr uint32_t kWindowBytes()
 {
     return kProducerRegionOffset<SlotStride, SlotCount, ChanCount>() +
-           static_cast<uint32_t>(SlotStride); // isolated local producer staging slot
-}
-
-template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int ChanCount = kGridChanCount>
-inline constexpr uint32_t kWindowBytesWithBcast()
-{
-    return kProducerRegionOffsetWithBcast<SlotStride, SlotCount, BcastSlotCount, GroupMax, ChanCount>() +
            static_cast<uint32_t>(SlotStride); // isolated local producer staging slot
 }
 
@@ -219,30 +208,31 @@ AICORE inline void InitGridPipeFromWindow(
     pipe.consHistFull = false;
     // Binding table + consumer history come from the window, not from zero.
     pipe.LoadRecord(scbs + kRecordOffset / sizeof(uint32_t));
-    pipe.bindRequestProdIdL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindRequestOffset);
-    pipe.bindRequestProdChanL1 = pipe.bindRequestProdIdL1 + 1;
-    pipe.bindResponseReadyL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindResponseOffset);
-    pipe.bindResponseConsChanL1 = pipe.bindResponseReadyL1 + 1;
-    pipe.bindResponseCompleteL1 = pipe.bindResponseReadyL1 + 2;
-    // Do not clear bindRequestProdIdL1 here.  A producer in an earlier hardware wave
-    // may already have deposited a request in this not-yet-scheduled consumer's
-    // window.  The host-zeroed +1 encoding arms the mailbox, and the consumer
-    // clears each request after accepting it.
-    pipe.bcastWindow = GridPayloadWindow{};
-    pipe.bcastExpectedProducerCount = 1;
-
+    for (int c = 0; c < kGridChanCount; ++c) {
+        __gm__ uint32_t* request = reinterpret_cast<__gm__ uint32_t*>(
+            window + kBindRequestOffset + static_cast<uint32_t>(c) * grid_mock::kScbLineStride);
+        __gm__ uint32_t* response = reinterpret_cast<__gm__ uint32_t*>(
+            window + kBindResponseOffset + static_cast<uint32_t>(c) * grid_mock::kScbLineStride);
+        __gm__ uint32_t* complete = reinterpret_cast<__gm__ uint32_t*>(
+            window + kBindResponseCompleteOffset + static_cast<uint32_t>(c) * grid_mock::kScbLineStride);
+        pipe.bindRequestProdIdL1[c] = request;
+        pipe.bindRequestProdChanL1[c] = request + 1;
+        pipe.bindRequestConsChanL1[c] = request + 2;
+        pipe.bindRequestModeL1[c] = request + 3;
+        pipe.bindResponseReadyL1[c] = response;
+        pipe.bindResponseConsChanL1[c] = response + 1;
+        pipe.bindResponseCompleteL1[c] = complete;
+    }
+    pipe.bindRequestQueueBaseL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindRequestQueueOffset);
+    pipe.bindResponseQueueBaseL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindResponseQueueOffset);
+    pipe.bindRequestScanStart = 0;
+    // Do not clear either bind protocol here.  A producer in an earlier hardware
+    // wave may already have deposited a structured request or a dynamic queue
+    // entry.  Host-zeroed commit words arm both protocols, and the consumer clears
+    // a request before publishing its response.
     const uint32_t slotRegionBytes = static_cast<uint32_t>(Pipe::ChanCount) * static_cast<uint32_t>(Pipe::SlotCount) *
                                      static_cast<uint32_t>(Pipe::SlotStride);
-    uint32_t producerOff = kSlotRegionOffset + slotRegionBytes;
-
-    // TBROADCAST payload ring.  The ready/free/close notifications are the fixed
-    // GridPipe SPR triplet at Pipe::CollectiveChan, already wired above; no
-    // per-source L1 lanes are appended to the window.
-    if constexpr (Pipe::GroupMax > 0) {
-        const uint32_t ringOff = kSlotRegionOffset + slotRegionBytes;
-        pipe.bcastRingBase = window + ringOff;
-        producerOff = ringOff + static_cast<uint32_t>(Pipe::BcastSlotCount) * static_cast<uint32_t>(Pipe::SlotStride);
-    }
+    const uint32_t producerOff = kSlotRegionOffset + slotRegionBytes;
 
     // One synchronous outbound transfer uses this slot at a time.  It is appended
     // after all receive-side rings so a producer can never alias a payload
@@ -250,17 +240,12 @@ AICORE inline void InitGridPipeFromWindow(
     pipe.producerSlotBase = window + producerOff;
 }
 
-// Host-side helper: total bytes per rank for a single GridPipe (broadcast
-// region included when the pipe opted in).
+// Host-side helper: total bytes per rank for a single GridPipe.  All operations
+// use the same channel rings, so no operation-specific payload region is added.
 template <typename Pipe>
 inline constexpr uint32_t WindowBytes()
 {
-    if constexpr (Pipe::GroupMax > 0) {
-        return kWindowBytesWithBcast<
-            Pipe::SlotStride, Pipe::SlotCount, Pipe::BcastSlotCount, Pipe::GroupMax, Pipe::ChanCount>();
-    } else {
-        return kWindowBytes<Pipe::SlotStride, Pipe::SlotCount, Pipe::ChanCount>();
-    }
+    return kWindowBytes<Pipe::SlotStride, Pipe::SlotCount, Pipe::ChanCount>();
 }
 
 } // namespace a2a3_grid

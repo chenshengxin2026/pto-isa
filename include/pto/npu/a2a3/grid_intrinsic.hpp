@@ -112,14 +112,13 @@ AICORE constexpr int GridDirectionIndex(GridDirection d) { return static_cast<in
 // ---------------------------------------------------------------------------
 // Broadcast GROUP -- the participant set of a TBROADCAST collective.
 //
-// GROUP replaces the old single-source GridSpan "span" and, with it, the
-// handshake model: a TBROADCAST is no longer one source multicasting to a
-// fan-in-1 span (which forbade concurrent senders).  It is a 真·同时 MPSC
-// channel (see Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移): every
-// member of the GROUP may broadcast its own shard into each receiver's shared
-// ring *concurrently*.  The rank-indexed slot assignment keeps payload writes
-// disjoint; the shared ready/free/close SPR triplet uses atomic accumulation so
-// K concurrent signal writers cannot lose an update.
+// A collective uses the same channelised payload rings and ready/free/close
+// scoreboards as TPUSH/TPOP.  Source ordinal `s` is assigned to channel `s % C`,
+// where C is the number of rings carried by the pipe.  At most C sources are
+// therefore live at once.  Sources beyond C reuse the same channels in later
+// batches, after the previous owner has closed and every receiver has returned
+// its reverse FREE credit.  READY/CLOSE remain single-writer absolute stores;
+// only the reverse fan-in FREE edge uses atomic accumulation.
 //
 //   GridGroup::ROW = every cell on the source's row    (the row is the group)
 //   GridGroup::COL = every cell on the source's column (the column is the group)
@@ -152,11 +151,10 @@ AICORE constexpr GridDirection GroupArmB(GridGroup g)
 }
 
 // ---------------------------------------------------------------------------
-// Scheme-② prefix-offset helpers.  Every member contributes a statically-known
-// count (1 shard for the AllGather demo), so the prefix-offset base of member k
-// is just k (computed locally under SPMD -- variant a, zero atomic).  These
-// helpers map between a member's rank-in-group, its grid coordinate, and the
-// global index space the shared ring is addressed by (slot = gidx % SC).
+// Group-rank helpers.  These map between a member's rank-in-group and its grid
+// coordinate.  Payload placement is deliberately NOT rank-indexed: collectives
+// map source ordinals onto GridPipe channels and then use the normal TPUSH ring
+// address `(sequence % SlotCount) * SlotStride` within that channel.
 // ---------------------------------------------------------------------------
 // Forward declaration: BlockIdFromCoord is defined further down (coordinate
 // bootstrap section); the GroupMemberBlockId helper below needs it visible here.
@@ -212,7 +210,7 @@ AICORE constexpr int GroupMemberBlockId(GridGroup g, GridCoord self, GridShape s
 // why the group intrinsic itself no longer has to know the GridGroup enum at all.
 //
 // Both walk members in the same row-major order RankInGroup ranks them in, so
-// TBROADCAST's rank-indexed payload slots and the group arena stay in step.
+// source ordinals, channel assignment, and the group arena stay in step.
 // ---------------------------------------------------------------------------
 AICORE constexpr GridBlockRect GridBlockRectFromRect(GridRect rect, GridShape s)
 {
@@ -227,6 +225,61 @@ AICORE constexpr GridBlockRect GridBlockRectOfGroup(GridGroup g, GridCoord c, Gr
     return (g == GridGroup::ROW) ? GridBlockRectFromRect(GridRect{c.row, c.row + 1, 0, s.gridCols}, s) :
            (g == GridGroup::COL) ? GridBlockRectFromRect(GridRect{0, s.gridRows, c.col, c.col + 1}, s) :
                                    GridBlockRectFromRect(rect, s);
+}
+
+// ---------------------------------------------------------------------------
+// Structured collective channel schedule.
+//
+// Source ordinal `s` owns channel `s % C` at owner position `s / C`.  The first
+// C ordinals form batch zero, the next C batch one, and so on.  A channel's
+// owners execute serially while different channels remain independent.  These
+// helpers are shared by TBROADCAST and group TREDUCE so both operations use the
+// exact same ring/sequence schedule.
+// ---------------------------------------------------------------------------
+AICORE constexpr uint32_t GridCollectiveChannelCount(uint32_t sourceCount, uint32_t pipeChannelCount)
+{
+    return sourceCount < pipeChannelCount ? sourceCount : pipeChannelCount;
+}
+
+AICORE constexpr uint32_t GridCollectiveBatchCount(uint32_t sourceCount, uint32_t channelCount)
+{
+    return channelCount == 0 ? 0 : (sourceCount + channelCount - 1) / channelCount;
+}
+
+AICORE constexpr uint32_t GridCollectiveChannel(uint32_t sourceOrdinal, uint32_t channelCount)
+{
+    return sourceOrdinal % channelCount;
+}
+
+AICORE constexpr uint32_t GridCollectiveOwnerPosition(uint32_t sourceOrdinal, uint32_t channelCount)
+{
+    return sourceOrdinal / channelCount;
+}
+
+AICORE constexpr uint32_t GridCollectiveOwnerCount(uint32_t sourceCount, uint32_t channelCount, uint32_t channel)
+{
+    return channel >= sourceCount ? 0 : (sourceCount - channel + channelCount - 1) / channelCount;
+}
+
+AICORE constexpr uint32_t GridCollectiveNextSourceOrdinal(
+    uint32_t sourceOrdinal, uint32_t sourceCount, uint32_t channelCount)
+{
+    const uint32_t next = sourceOrdinal + channelCount;
+    return next < sourceCount ? next : GridCollectiveChannel(sourceOrdinal, channelCount);
+}
+
+// `nextProducerSequence` is the persistent prodIndex word.  Zero denotes a
+// fresh producer; a non-zero word is already the absolute sequence relayed to
+// this producer's next turn.  Owner position disambiguates a fresh non-first
+// owner without adding another persistent state word.
+AICORE constexpr uint32_t GridCollectiveProducerSequence(uint32_t nextProducerSequence, uint32_t ownerPosition)
+{
+    return nextProducerSequence == 0 ? ownerPosition : nextProducerSequence;
+}
+
+AICORE constexpr uint32_t GridCollectiveProducerTurn(uint32_t sequence, uint32_t ownerPosition, uint32_t ownerCount)
+{
+    return (sequence - ownerPosition) / ownerCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,13 +340,45 @@ inline constexpr uint32_t kGridNoPeer = 0xFFFFFFFFu;
 // from clearing a request an already-running producer deposited in its window.
 inline constexpr uint32_t kGridBindPending = 0u;
 inline constexpr uint32_t kGridBindHandshakeComplete = 1u;
+inline constexpr uint32_t kGridBindModeDynamic = 1u;
+inline constexpr uint32_t kGridBindModeFixed = 2u;
+inline constexpr uint32_t kGridBindModeBroadcast = 3u;
 inline constexpr int kGridInvalidChan = -1;
+
+// Dynamic TPUSH/TPOP binding uses a source-indexed MPSC pending queue rather
+// than a shared mailbox.  The runtime context used by the A2/A3 GridPipe demos
+// exposes at most 64 logical windows, so one fixed slot per logical peer covers
+// the complete addressable mesh.  A producer may have at most one outstanding
+// request to one consumer (the public bind call is synchronous); different
+// producers use different request lines and therefore never overwrite each
+// other.  Responses are indexed by consumer id for the symmetric reason.
+inline constexpr int kGridBindQueueDepth = 64;
+inline constexpr int kGridBindQueueProdIdWord = 0;
+inline constexpr int kGridBindQueueProdChanWord = 1;
+inline constexpr int kGridBindQueueTokenWord = 2;
+inline constexpr int kGridBindQueueCommitWord = 3;
+inline constexpr int kGridBindQueueResponseTokenWord = 0;
+inline constexpr int kGridBindQueueResponseReadyWord = 1;
+inline constexpr int kGridBindQueueResponseConsChanWord = 2;
+inline constexpr int kGridBindQueueResponseCommitWord = 3;
+inline constexpr int kGridBindQueueEntryBytes = 64;
+inline constexpr int kGridBindQueueEntryWords = kGridBindQueueEntryBytes / static_cast<int>(sizeof(uint32_t));
+static_assert(
+    kGridBindQueueCommitWord < kGridBindQueueEntryWords &&
+        kGridBindQueueResponseCommitWord < kGridBindQueueEntryWords,
+    "each GridPipe bind-queue entry must fit in one cache line");
 
 // Depth of the consumer history (see GridConsumerTable).  Deliberately larger than
 // the channel count: channels are a CONCURRENCY resource, consumers come and go
 // over TIME, and a schedule may rotate through more consumers than it ever has
 // open at once.
 inline constexpr int kGridConsHistMax = 8;
+// A CLOSE-only rebind may install the next producer while payload from one or
+// more retired turns is still resident in the ring.  Keep the source identity
+// and end-exclusive boundary of those turns until consIndex crosses them.  The
+// depth is deliberately the same as the peer history: overflowing it is a
+// protocol error, never a reason to forget ownership of live payload.
+inline constexpr int kGridRetiredTurnMax = kGridConsHistMax;
 
 // ---------------------------------------------------------------------------
 // THE PIPE RECORD -- why the binding table lives in the WINDOW, not in the object.
@@ -344,10 +429,16 @@ inline constexpr int kGridRecConsChanPeerProdChan = kGridRecConsChanConsIndex + 
 inline constexpr int kGridRecProdChanCons = kGridRecConsChanPeerProdChan + kGridChanCount;      // [channels] id + 1
 inline constexpr int kGridRecProdChanState = kGridRecProdChanCons + kGridChanCount;             // [channels]
 inline constexpr int kGridRecCurProdChan = kGridRecProdChanState + kGridChanCount; // current local producer channel + 1
-inline constexpr int kGridRecScbSnapshot = kGridRecCurProdChan + 1;                // local MOV_SPR2X scratch word
+inline constexpr int kGridRecRetiredCount = kGridRecCurProdChan + 1;               // [channels]
+inline constexpr int kGridRecRetiredProd = kGridRecRetiredCount + kGridChanCount;  // [channel][turn] id + 1
+inline constexpr int kGridRecRetiredEnd = kGridRecRetiredProd + kGridChanCount * kGridRetiredTurnMax; // [channel][turn]
+inline constexpr int kGridRecBcastFreeThreshold =
+    kGridRecRetiredEnd + kGridChanCount * kGridRetiredTurnMax;                          // [producer channels]
+inline constexpr int kGridRecBindRequestToken = kGridRecBcastFreeThreshold + kGridChanCount; // next dynamic token
+inline constexpr int kGridRecScbSnapshot = kGridRecBindRequestToken + 1; // local MOV_SPR2X scratch
 inline constexpr int kGridRecordWords = kGridRecScbSnapshot + 1;
 static_assert(
-    kGridRecordWords == 4 + 8 * kGridChanCount + 4 * kGridConsHistMax + 2,
+    kGridRecordWords == 4 + 10 * kGridChanCount + 4 * kGridConsHistMax + 2 * kGridChanCount * kGridRetiredTurnMax + 3,
     "GridPipe record layout changed; update its host-visible mirrors");
 
 // Id <-> stored-word conversion for the +1 bias described above.
@@ -528,8 +619,7 @@ struct GridConsumerTable {
 };
 
 // ---------------------------------------------------------------------------
-// GridPipe<TileT, SlotStride, SlotCount, BcastSlotCount = 0, GroupMax = 0,
-//          ChanCount = kGridChanCount>
+// GridPipe<TileT, SlotStride, SlotCount, ChanCount = kGridChanCount>
 //
 // One instance describes two independent channel pools.  Consumer channels own
 // this core's receive rings, ready/close SCBs and cons_idx; producer channels own
@@ -543,39 +633,26 @@ struct GridConsumerTable {
 // change.  Every grid transfer is still exactly one hop -- there is no hop-count
 // operand anywhere in the family.
 //
-// ChanCount trims the array for pipes that need fewer channels: a pure-broadcast
-// pipe passes 0 and pays no unicast ring bytes at all, a relay that only ever binds
-// two flows can pass 2.  It bounds the BINDING SEARCH as well as the window, so a
+// ChanCount trims the array for pipes that need fewer channels.  It bounds both
+// the BINDING SEARCH and the window, so a
 // pipe never allocates a channel it has no ring for.  The scoreboard header is a
 // fixed kGridChanCount triplets regardless, so window offsets are identical for every
 // pipe in a build -- required, because the peer resolver maps a local address to the
 // SAME byte offset in the peer's window.
 //
-// The BcastSlotCount / GroupMax template params opt the pipe into the concurrent
-// TBROADCAST payload ring appended after the unicast slot rings.  Its MPSC
-// notifications reuse the first fixed scoreboard triplet outside the active
-// unicast pool (`CollectiveChan == ChanCount`), so no static per-source lanes are
-// allocated.  They default to 0, so a plain GridPipe<TileT, SlotBytes, SlotCount>
-// carries no broadcast payload state.
+// TBROADCAST and group TREDUCE do not append a collective payload area.  They use
+// these same ChanCount rings, assigning at most one live source to each channel.
+// A collective pipe must therefore carry at least one channel and must not be
+// interleaved with dynamic TPUSH bindings on the same physical window.
 // ---------------------------------------------------------------------------
-template <
-    typename TileT_, int SlotStride_, int SlotCount_, int BcastSlotCount_ = 0, int GroupMax_ = 0,
-    int ChanCount_ = kGridChanCount>
+template <typename TileT_, int SlotStride_, int SlotCount_, int ChanCount_ = kGridChanCount>
 struct GridPipe {
     static_assert(SlotCount_ > 0, "GridPipe requires SlotCount > 0");
     static_assert(SlotStride_ > 0, "GridPipe requires SlotStride > 0");
-    static_assert(BcastSlotCount_ >= 0, "GridPipe requires BcastSlotCount >= 0");
-    static_assert(GroupMax_ >= 0, "GridPipe requires GroupMax >= 0");
     static_assert(
-        ChanCount_ >= 0 && ChanCount_ <= kGridChanCount,
-        "GridPipe ChanCount must be in [0, kGridChanCount] -- the window header reserves exactly kGridChanCount "
+        ChanCount_ > 0 && ChanCount_ <= kGridChanCount,
+        "GridPipe ChanCount must be in [1, kGridChanCount] -- the window header reserves exactly kGridChanCount "
         "ready/free/close scoreboard triplets, so a pipe cannot ask for more channels than the layout supports.");
-    static_assert(
-        GroupMax_ == 0 || BcastSlotCount_ >= GroupMax_,
-        "concurrent TBROADCAST requires at least one disjoint payload slot per possible source");
-    static_assert(
-        GroupMax_ == 0 || ChanCount_ < kGridChanCount,
-        "TBROADCAST requires one fixed ready/free/close scoreboard triplet beyond the active unicast channels");
 
     using TileType = TileT_;
     // Ring addressing stride.  NOT the transfer length -- that comes from the
@@ -585,12 +662,7 @@ struct GridPipe {
     // many bytes"; kept so existing call sites and window mirrors keep working.
     static constexpr int SlotBytes = SlotStride_;
     static constexpr int SlotCount = SlotCount_;
-    static constexpr int BcastSlotCount = BcastSlotCount_;
-    static constexpr int GroupMax = GroupMax_;
     static constexpr int ChanCount = ChanCount_;
-    // Group collectives reserve the first fixed SPR triplet not used by the
-    // unicast binding/ring pool.  A group operation static-asserts that it exists.
-    static constexpr int CollectiveChan = ChanCount_;
 
     // Shape + coord cached from runtime (design doc 2.1 / 2.2).
     GridShape shape{};
@@ -608,8 +680,8 @@ struct GridPipe {
     // by the independent channel this core selected while acting as a producer.
     //
     // The arrays are sized kGridChanCount, not ChanCount.  Every fixed SPR is
-    // wired; only [0, ChanCount) owns a unicast ring or participates in binding,
-    // while index CollectiveChan may be reserved by a group collective.
+    // wired; only [0, ChanCount) owns a payload ring or participates in binding
+    // or a structured collective.
     __gm__ uint8_t* slotBase[kGridChanCount] = {nullptr};
     __gm__ uint32_t* readyScb[kGridChanCount] = {nullptr};
     __gm__ uint32_t* freeScb[kGridChanCount] = {nullptr};
@@ -622,33 +694,30 @@ struct GridPipe {
     uint32_t consIndex[kGridChanCount] = {0};
     uint32_t consChanCloseBase[kGridChanCount] = {0};
 
-    // Time-division MPSC bind control words.  These are L1 words, not SCBs:
-    // a producer writes [producer id, local producer channel] into the consumer's
-    // request line.  The consumer returns [ready baseline, its independently
-    // selected consumer channel, completion] in the producer's response line.
-    // Completion is written last and is the only field the producer polls.
-    __gm__ uint32_t* bindRequestProdIdL1 = nullptr;
-    __gm__ uint32_t* bindRequestProdChanL1 = nullptr;
-    __gm__ uint32_t* bindResponseReadyL1 = nullptr;
-    __gm__ uint32_t* bindResponseConsChanL1 = nullptr;
-    __gm__ uint32_t* bindResponseCompleteL1 = nullptr;
+    // Structured-collective bind lanes.  These remain channel-indexed because
+    // their owners are derived from the group schedule.  Ordinary dynamic TPUSH
+    // does not use these lanes; it uses the peer-indexed queues below.
+    __gm__ uint32_t* bindRequestProdIdL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindRequestProdChanL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindRequestConsChanL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindRequestModeL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindResponseReadyL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindResponseConsChanL1[kGridChanCount] = {nullptr};
+    __gm__ uint32_t* bindResponseCompleteL1[kGridChanCount] = {nullptr};
 
-    // TBROADCAST payload region (true concurrent MPSC), populated only when
-    // GroupMax > 0.  Every source owns its rank-indexed slot, so payload writes
-    // never alias.  Notification state is NOT stored here: producers atomically
-    // accumulate ready/close and receivers atomically return free credits through
-    // readyScb/freeScb/closeScb[CollectiveChan].
-    __gm__ uint8_t* bcastRingBase = nullptr; // [BcastSlotCount * SlotBytes]
-
-    // Number of distinct remote publishers a receiver drains in one broadcast
-    // round.  One aggregate ready/close counter cannot encode source identity, so
-    // a receiver waits for this full set before reading any rank-indexed slot.
-    // Single-source broadcast is the safe default; all-gather callers set K-1.
-    uint32_t bcastExpectedProducerCount = 1;
+    // Dynamic bind queues.  Each entry occupies a full cache line.  Request
+    // entry p in a consumer window has exactly one remote writer: producer p.
+    // Response entry c in a producer window likewise has exactly one remote
+    // writer: consumer c.  The consumer is the sole dequeuer and advances the
+    // in-object scan cursor only after a request has been fully acknowledged.
+    __gm__ uint32_t* bindRequestQueueBaseL1 = nullptr;
+    __gm__ uint32_t* bindResponseQueueBaseL1 = nullptr;
+    uint32_t bindRequestScanStart = 0;
+    uint32_t bindRequestToken = 0;
 
     // Dedicated outbound staging slot in this core's L1 SRAM.  It is physically
-    // disjoint from slotBase[] and bcastRingBase, which are receive-side payload
-    // rings.  The A2/A3 mock represents both sides with distinct ranges in the
+    // disjoint from slotBase[], which are receive-side payload rings.  The A2/A3
+    // mock represents both sides with distinct ranges in the
     // per-core GM window; native WSE maps the same layout onto unified L1 SRAM.
     __gm__ uint8_t* producerSlotBase = nullptr; // [SlotStride]
 
@@ -665,23 +734,26 @@ struct GridPipe {
     // TPUSH/TPOP they apply to; they persist until reset.
     GridPayloadWindow pushWindow[kGridChanCount] = {};
     GridPayloadWindow popWindow[kGridChanCount] = {};
-    // Same for the broadcast ring.  One window covers both halves of the
-    // collective: a source replicates its own shard and a receiver drains another
-    // source's shard, and in a group collective those are the same geometry.
-    GridPayloadWindow bcastWindow{};
-
     // Consumer-side binding table.  Each local receive channel remembers its
     // upstream producer and that producer's independently selected producer
     // channel, so TPOP returns FREE to the correct remote SCB.
     uint32_t consChanProdId[kGridChanCount] = {};
     uint32_t consChanBindCnt[kGridChanCount] = {0};
     int consChanPeerProdChan[kGridChanCount] = {};
+    uint32_t consChanRetiredCount[kGridChanCount] = {0};
+    uint32_t consChanRetiredProdId[kGridChanCount][kGridRetiredTurnMax] = {};
+    uint32_t consChanRetiredEnd[kGridChanCount][kGridRetiredTurnMax] = {};
 
     // Producer-side channel table.  CLOSED is local producer state: the final
     // TPUSH for the current consumer has been published, so this producer channel
     // may be rebound without consulting the remote consumer's channel allocator.
     uint32_t prodChanConsId[kGridChanCount] = {};
     GridProducerChannelState prodChanState[kGridChanCount] = {};
+    // TBROADCAST's reverse edge is F->1, so it cannot use TPUSH's one-consumer
+    // absolute free baseline.  This persistent threshold counts completed
+    // receiver handoffs while the bind mailbox still relays the absolute READY
+    // sequence and producer identity.
+    uint32_t bcastFreeThreshold[kGridChanCount] = {0};
 
     // The last upstream producer accepted on any local consumer channel.
     uint32_t prevProdId = kGridNoPeer;
@@ -696,6 +768,25 @@ struct GridPipe {
     GridConsumerTable consumers{};
     // Sticky consumer-history overflow flag.
     bool consHistFull = false;
+    AICORE __gm__ uint32_t* BindRequestQueueEntry(uint32_t prodId) const
+    {
+        return bindRequestQueueBaseL1 + prodId * kGridBindQueueEntryWords;
+    }
+    AICORE __gm__ uint32_t* BindResponseQueueEntry(uint32_t consId) const
+    {
+        return bindResponseQueueBaseL1 + consId * kGridBindQueueEntryWords;
+    }
+    AICORE uint32_t AllocateBindRequestToken()
+    {
+        ++bindRequestToken;
+        if (bindRequestToken == kGridBindPending) {
+            ++bindRequestToken;
+        }
+        if (recordBase != nullptr) {
+            grid_cce_detail::write_local_word(recordBase + kGridRecBindRequestToken, bindRequestToken);
+        }
+        return bindRequestToken;
+    }
     AICORE void SetPushWindow(int chan, const GridPayloadWindow& w) { pushWindow[chan] = w; }
     AICORE void SetPopWindow(int chan, const GridPayloadWindow& w) { popWindow[chan] = w; }
     AICORE void ResetPushWindow(int chan) { pushWindow[chan] = GridPayloadWindow{}; }
@@ -714,10 +805,6 @@ struct GridPipe {
     }
     AICORE void ResetAllPushWindows() { SetAllPushWindows(GridPayloadWindow{}); }
     AICORE void ResetAllPopWindows() { SetAllPopWindows(GridPayloadWindow{}); }
-    AICORE void SetBcastWindow(const GridPayloadWindow& w) { bcastWindow = w; }
-    AICORE void ResetBcastWindow() { bcastWindow = GridPayloadWindow{}; }
-    AICORE void SetBcastExpectedProducerCount(uint32_t count) { bcastExpectedProducerCount = count; }
-
     AICORE uint32_t ReadChannelScb(__gm__ uint32_t* scb, uint32_t slot)
     {
         if (recordBase == nullptr) {
@@ -745,17 +832,15 @@ struct GridPipe {
                ReadConsumerCloseCount(consChan) > consChanCloseBase[consChan];
     }
 
-    // CLOSE is published after the final READY, so it proves that no more items
-    // will arrive from the old producer.  Rebinding the ring also requires that
-    // this consumer has drained through that final absolute count; otherwise an
-    // early request could overwrite the old producer/channel routing needed by
-    // the last TPOP.
-    AICORE bool ConsumerChannelIsReusable(int consChan)
+    // CLOSE retires the old writer and is sufficient to transfer channel
+    // ownership.  The ring need not be empty: the new producer receives
+    // {prodIndex=oldEnd, freeScb=consIndex}, so the ordinary TPUSH free threshold
+    // prevents it from overwriting any undrained slot.  Retired source/end records
+    // below preserve payload identity until those older entries are consumed.
+    AICORE bool ConsumerChannelIsRebindable(int consChan)
     {
-        if (!ConsumerChannelHasClosedProducer(consChan)) {
-            return false;
-        }
-        return consIndex[consChan] >= ReadConsumerCloseCount(consChan);
+        return ConsumerChannelHasClosedProducer(consChan) &&
+               consChanRetiredCount[consChan] < static_cast<uint32_t>(kGridRetiredTurnMax);
     }
 
     // Consumer channels prefer the lowest unused index, then the lowest CLOSED
@@ -770,7 +855,7 @@ struct GridPipe {
             }
         }
         for (int c = 0; c < ChanCount; ++c) {
-            if (ConsumerChannelIsReusable(c)) {
+            if (ConsumerChannelIsRebindable(c)) {
                 return c;
             }
         }
@@ -837,6 +922,109 @@ struct GridPipe {
         }
     }
 
+    AICORE uint32_t ConsumerReadyBase(int consChan)
+    {
+        const uint32_t ready = ReadConsumerReadyCount(consChan);
+        return ready > consIndex[consChan] ? ready : consIndex[consChan];
+    }
+
+    AICORE bool EnqueueRetiredTurn(int consChan, uint32_t prodId, uint32_t endExclusive)
+    {
+        if (endExclusive <= consIndex[consChan]) {
+            return true;
+        }
+        const uint32_t count = consChanRetiredCount[consChan];
+        if (prodId == kGridNoPeer || count >= static_cast<uint32_t>(kGridRetiredTurnMax)) {
+            consHistFull = true;
+            return false;
+        }
+        consChanRetiredProdId[consChan][count] = prodId;
+        consChanRetiredEnd[consChan][count] = endExclusive;
+        consChanRetiredCount[consChan] = count + 1;
+        return true;
+    }
+
+    AICORE void RetireConsumedTurns(int consChan)
+    {
+        bool changed = false;
+        while (consChanRetiredCount[consChan] != 0 && consIndex[consChan] >= consChanRetiredEnd[consChan][0]) {
+            const uint32_t count = consChanRetiredCount[consChan];
+            for (uint32_t i = 1; i < count; ++i) {
+                consChanRetiredProdId[consChan][i - 1] = consChanRetiredProdId[consChan][i];
+                consChanRetiredEnd[consChan][i - 1] = consChanRetiredEnd[consChan][i];
+            }
+            consChanRetiredProdId[consChan][count - 1] = kGridNoPeer;
+            consChanRetiredEnd[consChan][count - 1] = 0;
+            consChanRetiredCount[consChan] = count - 1;
+            changed = true;
+        }
+        if (changed) {
+            StoreRecord();
+        }
+    }
+
+    AICORE uint32_t PayloadProducerAtHead(int consChan) const
+    {
+        if (consChan < 0 || consChan >= ChanCount || consChanBindCnt[consChan] == 0) {
+            return kGridNoPeer;
+        }
+        if (consChanRetiredCount[consChan] != 0) {
+            return consChanRetiredProdId[consChan][0];
+        }
+        return consChanProdId[consChan];
+    }
+
+    AICORE int ConsumerChannelForPayloadProducer(uint32_t prodId) const
+    {
+        if (prodId == kGridNoPeer) {
+            return kGridInvalidChan;
+        }
+        for (int c = 0; c < ChanCount; ++c) {
+            if (PayloadProducerAtHead(c) == prodId) {
+                return c;
+            }
+        }
+        return kGridInvalidChan;
+    }
+
+    // Install a new owner after CLOSE, but before optional payload drain.  The
+    // retired boundary keeps TPOP source validation intact; FREE from all later
+    // drains is deliberately routed through consChanPeerProdChan to the newly
+    // installed producer, which inherited the old absolute sequence.
+    AICORE bool InstallIncomingBinding(
+        int consChan, uint32_t prodId, int peerProdChan, uint32_t& readyBase, bool& priorAlreadyConsumed)
+    {
+        if (consChan < 0 || consChan >= ChanCount || peerProdChan < 0 || peerProdChan >= ChanCount) {
+            return false;
+        }
+        priorAlreadyConsumed = true;
+        if (consChanBindCnt[consChan] != 0) {
+            if (!ConsumerChannelHasClosedProducer(consChan)) {
+                return false;
+            }
+            const uint32_t retiredEnd = ReadConsumerCloseCount(consChan);
+            priorAlreadyConsumed = consIndex[consChan] >= retiredEnd;
+            if (!EnqueueRetiredTurn(consChan, consChanProdId[consChan], retiredEnd)) {
+                return false;
+            }
+            readyBase = retiredEnd;
+        } else {
+            // A broadcast source does not bind to itself, but it advances its
+            // local logical consIndex.  max(READY,consIndex) recovers that same
+            // absolute baseline when the next remote owner binds this channel.
+            readyBase = ConsumerReadyBase(consChan);
+            priorAlreadyConsumed = consIndex[consChan] >= readyBase;
+        }
+        consChanProdId[consChan] = prodId;
+        consChanBindCnt[consChan] += 1;
+        consChanCloseBase[consChan] = readyBase;
+        consChanPeerProdChan[consChan] = peerProdChan;
+        curConsChan = consChan;
+        prevProdId = prodId;
+        StoreRecord();
+        return true;
+    }
+
     AICORE int ConsumerChannelOfProducer(uint32_t prodId) const
     {
         if (prodId == kGridNoPeer) {
@@ -870,12 +1058,25 @@ struct GridPipe {
             prodChanState[c] = rawProdState <= static_cast<uint32_t>(GridProducerChannelState::CLOSED) ?
                                    static_cast<GridProducerChannelState>(rawProdState) :
                                    GridProducerChannelState::UNBOUND;
+            consChanRetiredCount[c] = grid_cce_detail::read_local_word(base + kGridRecRetiredCount + c);
+            if (consChanRetiredCount[c] > static_cast<uint32_t>(kGridRetiredTurnMax)) {
+                consChanRetiredCount[c] = kGridRetiredTurnMax;
+                consHistFull = true;
+            }
+            for (int t = 0; t < kGridRetiredTurnMax; ++t) {
+                const int index = c * kGridRetiredTurnMax + t;
+                consChanRetiredProdId[c][t] =
+                    GridRecUnpackId(grid_cce_detail::read_local_word(base + kGridRecRetiredProd + index));
+                consChanRetiredEnd[c][t] = grid_cce_detail::read_local_word(base + kGridRecRetiredEnd + index);
+            }
+            bcastFreeThreshold[c] = grid_cce_detail::read_local_word(base + kGridRecBcastFreeThreshold + c);
         }
         const uint32_t curConsChanWord = grid_cce_detail::read_local_word(base + kGridRecCurConsChan);
         curConsChan = curConsChanWord == 0u ? kGridInvalidChan : static_cast<int>(curConsChanWord - 1u);
         const uint32_t curProdChanWord = grid_cce_detail::read_local_word(base + kGridRecCurProdChan);
         curProdChan = curProdChanWord == 0u ? kGridInvalidChan : static_cast<int>(curProdChanWord - 1u);
         prevProdId = GridRecUnpackId(grid_cce_detail::read_local_word(base + kGridRecPrevProd));
+        bindRequestToken = grid_cce_detail::read_local_word(base + kGridRecBindRequestToken);
         consumers.curConsId = GridRecUnpackId(grid_cce_detail::read_local_word(base + kGridRecConsCur));
         consumers.used = static_cast<int>(grid_cce_detail::read_local_word(base + kGridRecConsUsed));
         if (consumers.used > kGridConsHistMax) {
@@ -914,6 +1115,14 @@ struct GridPipe {
             grid_cce_detail::write_local_word(recordBase + kGridRecProdChanCons + c, GridRecPackId(prodChanConsId[c]));
             grid_cce_detail::write_local_word(
                 recordBase + kGridRecProdChanState + c, static_cast<uint32_t>(prodChanState[c]));
+            grid_cce_detail::write_local_word(recordBase + kGridRecRetiredCount + c, consChanRetiredCount[c]);
+            for (int t = 0; t < kGridRetiredTurnMax; ++t) {
+                const int index = c * kGridRetiredTurnMax + t;
+                grid_cce_detail::write_local_word(
+                    recordBase + kGridRecRetiredProd + index, GridRecPackId(consChanRetiredProdId[c][t]));
+                grid_cce_detail::write_local_word(recordBase + kGridRecRetiredEnd + index, consChanRetiredEnd[c][t]);
+            }
+            grid_cce_detail::write_local_word(recordBase + kGridRecBcastFreeThreshold + c, bcastFreeThreshold[c]);
         }
         grid_cce_detail::write_local_word(
             recordBase + kGridRecCurConsChan,
@@ -922,6 +1131,7 @@ struct GridPipe {
             recordBase + kGridRecCurProdChan,
             curProdChan == kGridInvalidChan ? 0u : static_cast<uint32_t>(curProdChan) + 1u);
         grid_cce_detail::write_local_word(recordBase + kGridRecPrevProd, GridRecPackId(prevProdId));
+        grid_cce_detail::write_local_word(recordBase + kGridRecBindRequestToken, bindRequestToken);
         grid_cce_detail::write_local_word(recordBase + kGridRecConsCur, GridRecPackId(consumers.curConsId));
         grid_cce_detail::write_local_word(recordBase + kGridRecConsUsed, static_cast<uint32_t>(consumers.used));
         for (int e = 0; e < kGridConsHistMax; ++e) {
@@ -946,8 +1156,8 @@ struct GridPipe {
 template <typename T>
 struct is_grid_pipe : std::false_type {};
 
-template <typename TileT, int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int ChanCount>
-struct is_grid_pipe<GridPipe<TileT, SlotStride, SlotCount, BcastSlotCount, GroupMax, ChanCount>> : std::true_type {};
+template <typename TileT, int SlotStride, int SlotCount, int ChanCount>
+struct is_grid_pipe<GridPipe<TileT, SlotStride, SlotCount, ChanCount>> : std::true_type {};
 
 template <typename T>
 inline constexpr bool is_grid_pipe_v = is_grid_pipe<std::remove_reference_t<T>>::value;

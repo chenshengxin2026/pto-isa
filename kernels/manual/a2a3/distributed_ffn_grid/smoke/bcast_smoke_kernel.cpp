@@ -16,18 +16,16 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //     axis for ROW/COL, or BCAST_RECT_SRC inside the rectangle for SUBRECT)
 //     issues ONE TBROADCAST<GridGroup> delivering its tile to every other
 //     cell on its group (row for ROW, column for COL, or an arbitrary
-//     sub-rectangle for SUBRECT) over the 真·同时 MPSC channel (design doc
-//     §4 方案②·前缀偏移): batched writes into each receiver's shared ring, a
-//     single publish fence, then atomic increments of the GridPipe ready/close
-//     SPRs.  This is NOT a per-hop TPUSH loop.
+//     sub-rectangle for SUBRECT) through GridPipe channel zero: batched writes
+//     into each receiver's channel ring, one publish fence, then absolute
+//     READY/CLOSE stores.  This is NOT a per-hop TPUSH loop.
 //   - every other cell drains the source's shard with TPOP<GridGroup>(pipe,
-//     tile, BCAST_SRC) -- it waits the aggregate ready/close barrier, reads the
-//     source's prefix-offset slot, and atomically returns a free credit.
+//     tile, BCAST_SRC) -- it waits that channel's ready/close sequence, reads the
+//     ring slot, and atomically returns a reverse free credit.
 //
 // The host verifies out[cell] == in[source]; the source itself writes nothing.
-// Although only one source is active here, the channel is the full 真·同时 MPSC
-// scheme: a receiver could equally drain every group member's shard (the FFN
-// AllGather does exactly that).
+// Although only one source is active here, the same pipe supports up to C live
+// sources on distinct channels and relay-counted batches beyond C.
 
 #include <cstddef>
 #include <cstdint>
@@ -50,10 +48,9 @@ constexpr bool DAV_VEC = false;
 #endif
 
 using SmokeTile = Tile<TileType::Vec, float, BCAST_T, BCAST_W, BLayout::RowMajor>;
-// Pure broadcast (TBROADCAST + TPOP<GridGroup>), no unicast: ChanCount = 0, so
-// the concurrency array allocates no slot rings and the window carries none.
-using SmokePipe =
-    GridPipe<SmokeTile, BCAST_SLOT_BYTES, BCAST_SLOT_COUNT, BCAST_BCAST_SLOT_COUNT, BCAST_GROUP_MAX, /*ChanCount=*/0>;
+// Broadcast uses the same C channel rings as TPUSH.  This smoke enables all four
+// channels even though this smoke invokes TBROADCAST from only one source.
+using SmokePipe = GridPipe<SmokeTile, BCAST_SLOT_BYTES, BCAST_SLOT_COUNT, BCAST_GRID_CHAN_COUNT>;
 static_assert(
     a2a3_grid::WindowBytes<SmokePipe>() == static_cast<uint32_t>(BCAST_WINDOW_BYTES),
     "broadcast-smoke host/device GridPipe window layouts must match");
@@ -102,7 +99,6 @@ __global__ AICORE void BcastSmokeKernel(
         a2a3_grid::InitGridPipeFromWindow(
             pipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw),
             /*pipeId=*/0);
-        pipe.SetBcastExpectedProducerCount(1); // this smoke deliberately has one publisher per group
 
         // SUBRECT: describe the active group rectangle so TBROADCAST<SUBRECT>
         // addresses every cell inside it, and no-op cells outside it (nobody
@@ -133,16 +129,15 @@ __global__ AICORE void BcastSmokeKernel(
 #endif
             dsb(DSB_DDR);
 
-            // TBROADCAST (scheme-② send): the GridGroup first template argument
-            // selects this overload.  The shard lands at the source's prefix-
-            // offset slot in every receiver's shared ring.
+            // The GridGroup first template argument selects the TBROADCAST
+            // overload.  The source maps directly to srcIdx % channelCount.
             TBROADCAST<kGroup>(pipe, sendTile);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
             dsb(DSB_DDR);
         } else {
-            // Receiver: drain the source's shard from the shared ring.
+            // Receiver: bind and drain the source's channelised shard.
             TPOP<kGroup>(pipe, recvTile, srcIdx);
 #ifndef __PTO_AUTO__
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
