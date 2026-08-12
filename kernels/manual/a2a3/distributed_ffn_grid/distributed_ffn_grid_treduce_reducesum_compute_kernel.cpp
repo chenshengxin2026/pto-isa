@@ -42,6 +42,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "common.hpp"
 #include "ffn_config.hpp"
 #include "gridpipe_payload_inl.hpp"
+#include "single_vector_sync_inl.hpp"
 #include "tpipe_tmov_inl.hpp"
 
 #ifdef __CCE_AICORE__
@@ -73,14 +74,16 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-// No pipe type here: this variant reduces through the group fan-in overload of
-// TREDUCE (TREDUCE<Group, Op, T>(acc, scratch, base, ...), which lowers to
-// GRID_TREDUCE_GROUP_IMPL).  It reads each member's contribution in place out of
-// partialBuf (bytes and memberStride are independent runtime operands) and so
-// binds no channel, holds no semaphore and needs no slot ring -- which is also
-// why it takes no pipe argument, unlike the relay overload TREDUCE<Op>(pipe, acc,
-// recv).  `reduceWindow` is allocated by the host for layout parity with the
-// TPUSH relay variant and is deliberately unused.
+// Group TREDUCE reads each member's contribution in place from partialBuf and
+// uses the first fixed SPR triplet after this one-channel unicast pool for its
+// ready/free/close MPSC handshake.  The unicast ring remains allocated only to
+// keep this demo's existing host window ABI stable.
+constexpr int kFfnReduceChanCount = FFN_RS_REDUCE_CHAN_COUNT;
+using FfnReducePipe =
+    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceChanCount>;
+static_assert(
+    a2a3_grid::WindowBytes<FfnReducePipe>() == static_cast<uint32_t>(FFN_RS_REDUCE_WIN),
+    "TREDUCE host/device GridPipe window layout mismatch");
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
 
@@ -153,8 +156,8 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     if (cell < 0 || cell >= gridRows * gridCols) {
         return;
     }
-
     using pto::GridDirection;
+    using pto::GridGroup;
     using pto::comm::ReduceOp;
 
     // =========================== phase A: gate + up + SwiGLU + down ===========================
@@ -167,6 +170,16 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
         __gm__ uint8_t* gatePartialBlock = gatePartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* upPartialBlock = upPartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* hiddenBlock = hiddenBuf + cell * FFN_NCUT_HIDDEN_SHARD_BYTES;
+
+        if constexpr (DAV_VEC) {
+            if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+                // AIV1 only supplies the mode-2 C2V/V2C control signals. AIV0
+                // alone performs the activation, data movement, and later Grid work.
+                FfnInactiveVectorC2vV2cHandshake<GatePipe, UpPipe, HiddenPipe>(
+                    gatePartialBlock, upPartialBlock, hiddenBlock);
+                return;
+            }
+        }
 
         if constexpr (DAV_CUBE) {
             GateAccTile cGate;
@@ -351,38 +364,43 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
         return;
     }
 
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            return;
+        }
+    }
+
     // =========================== phase B: EAST 8-way reduce (row, H-chunked) ===========================
-    // Group fan-in (mov_ubuf_group, op=SUM).  Each cell wrote its full-H partial to
-    // partialBuf in phase A; the host stream barrier makes every row-mate's
-    // partial visible here.  The row SINK (col == gridCols-1) folds all 8
-    // row-mates' segment-h partials directly out of partialBuf with one
-    // N->1 reduce intrinsic.  Member k == cell (row, k), so members are visited
-    // col0..col7 -- the SAME order the EAST relay accumulated in, hence the FP
-    // sum is bit-identical (IEEE-754 add is commutative).  Non-sink cells have
-    // nothing to do (their partial is already in GM).
+    // Every row member participates.  Contributors publish their symmetric
+    // partialBuf segment by atomically adding the row sink's ready/close SPRs;
+    // the sink waits for all seven, performs mov_ubuf_group, then returns free
+    // credits before the next H segment can be published.
     if (phase == 1) {
         if constexpr (DAV_VEC) {
-            if (col + 1 == gridCols) {
-                __gm__ uint8_t* rowPartialBlock = rowPartialBuf + row * FFN_RS_ROW_PARTIAL_BYTES;
-                ReduceSegTile seg;     // reduce accumulator / result
-                ReduceSegTile scratch; // in-core combine scratch
-                TASSIGN(seg, 0x0000);
-                TASSIGN(scratch, 0x8000);
-                // rowPartialBuf is SEGMENT-MAJOR (matches partialBuf): segment h is a
-                // contiguous [T,kHBase] block at offset h*(T*kHBase), T-stride kHBase.
-                using GSegContig = GlobalTensor<
-                    float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kHBase, kT * kHBase, kT * kHBase, kHBase, 1>>;
-                for (int h = 0; h < kHSegs; ++h) {
-                    const int hSegOff = h * (kT * kHBase); // segment-major offset (floats)
-                    // Contribution arena = cell (row, 0..gridCols-1)'s segment-h
-                    // partials.  Cell (row, k) sits at partialBuf + (row*gridCols+k)*PPB
-                    // + hSegOff; consecutive row members are uniformly spaced by PPB.
-                    __gm__ const float* base =
-                        reinterpret_cast<__gm__ const float*>(
-                            partialBuf + static_cast<int64_t>(row) * gridCols * FFN_RS_PARTIAL_BYTES) +
-                        hSegOff;
-                    TREDUCE<GridGroup::ROW, ReduceOp::Sum, float>(
-                        seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridCols, GridRect{}, FFN_RS_PARTIAL_BYTES);
+            FfnReducePipe reducePipe;
+            GridShape shape{gridRows, gridCols};
+            GridCoord coord{row, col};
+            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
+            a2a3_grid::InitGridPipeFromWindow(
+                reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
+
+            const uint32_t sinkBlockId = static_cast<uint32_t>(row * gridCols + gridCols - 1);
+            const bool isSink = static_cast<uint32_t>(cell) == sinkBlockId;
+            __gm__ uint8_t* rowPartialBlock = rowPartialBuf + cell * FFN_RS_ROW_PARTIAL_BYTES;
+            ReduceSegTile seg;
+            ReduceSegTile scratch;
+            TASSIGN(seg, 0x0000);
+            TASSIGN(scratch, 0x8000);
+            using GSegContig = GlobalTensor<
+                float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kHBase, kT * kHBase, kT * kHBase, kHBase, 1>>;
+            for (int h = 0; h < kHSegs; ++h) {
+                const int hSegOff = h * (kT * kHBase);
+                __gm__ const float* mySeg = reinterpret_cast<__gm__ const float*>(
+                                                partialBuf + static_cast<int64_t>(cell) * FFN_RS_PARTIAL_BYTES) +
+                                            hSegOff;
+                TREDUCE<GridGroup::ROW, ReduceOp::Sum, float>(
+                    reducePipe, seg, scratch, mySeg, FFN_RS_REDUCE_TILE_BYTES, sinkBlockId, FFN_RS_PARTIAL_BYTES);
+                if (isSink) {
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -400,29 +418,34 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     }
 
     // =========================== phase C: SOUTH 4-way reduce (col 7, H-chunked) ===========================
-    // Group fan-in (mov_ubuf_group, op=SUM).  Phase B left one row partial per row
-    // in rowPartialBuf; the column SINK (row == gridRows-1) folds all 4 rows'
-    // segment-h partials out of rowPartialBuf with one N->1 reduce intrinsic.
-    // Member k == row k at rowPartialBuf + k*RPPB (uniform stride RPPB); the
-    // row0..row3 order matches the SOUTH relay accumulation (bit-identical).
+    // All four row sinks in column 7 participate.  Three contributors atomically
+    // publish into the bottom sink's dedicated SPRs; the bottom sink reduces and
+    // returns free credit for each H segment.
     if (phase == 2) {
         if constexpr (DAV_VEC) {
-            if (row + 1 == gridRows) {
-                ReduceSegTile seg;
-                ReduceSegTile scratch;
-                TASSIGN(seg, 0x0000);
-                TASSIGN(scratch, 0x8000);
-                // rowPartialBuf is SEGMENT-MAJOR (segment h contiguous at h*(T*kHBase));
-                // yFull keeps the strided [T,H] golden layout (segment h at column
-                // offset h*kHBase, T-stride H), so the read and the store use different
-                // offsets here.
-                using GYSeg = GlobalTensor<float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kH, kT * kH, kT * kH, kH, 1>>;
-                for (int h = 0; h < kHSegs; ++h) {
-                    const int hSegOff = h * (kT * kHBase); // segment-major offset into rowPartialBuf
-                    const int hStridedOff = h * kHBase;    // strided column offset into yFull [T,H]
-                    __gm__ const float* base = reinterpret_cast<__gm__ const float*>(rowPartialBuf) + hSegOff;
-                    TREDUCE<GridGroup::COL, ReduceOp::Sum, float>(
-                        seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridRows, GridRect{}, FFN_RS_ROW_PARTIAL_BYTES);
+            FfnReducePipe reducePipe;
+            GridShape shape{gridRows, gridCols};
+            GridCoord coord{row, col};
+            __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
+            a2a3_grid::InitGridPipeFromWindow(
+                reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
+
+            const uint32_t sinkBlockId = static_cast<uint32_t>((gridRows - 1) * gridCols + col);
+            const bool isSink = static_cast<uint32_t>(cell) == sinkBlockId;
+            ReduceSegTile seg;
+            ReduceSegTile scratch;
+            TASSIGN(seg, 0x0000);
+            TASSIGN(scratch, 0x8000);
+            using GYSeg = GlobalTensor<float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kH, kT * kH, kT * kH, kH, 1>>;
+            for (int h = 0; h < kHSegs; ++h) {
+                const int hSegOff = h * (kT * kHBase);
+                const int hStridedOff = h * kHBase;
+                __gm__ const float* mySeg = reinterpret_cast<__gm__ const float*>(
+                                                rowPartialBuf + static_cast<int64_t>(cell) * FFN_RS_ROW_PARTIAL_BYTES) +
+                                            hSegOff;
+                TREDUCE<GridGroup::COL, ReduceOp::Sum, float>(
+                    reducePipe, seg, scratch, mySeg, FFN_RS_REDUCE_TILE_BYTES, sinkBlockId, FFN_RS_ROW_PARTIAL_BYTES);
+                if (isSink) {
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -467,10 +490,9 @@ void launchDistributedFfnGridTreduceReduceSumMixedKernel(
     uint8_t* upPartialBuf, uint8_t* hiddenBuf, uint8_t* hcclCtx, int phase, int rowStart, int colStart, int waveCols,
     int gridRows, int gridCols, int blockCount, void* stream)
 {
-    if (blockCount <= 0) {
-        return;
+    if (blockCount > 0) {
+        DistributedFfnGridTreduceReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
+            ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
+            gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
     }
-    DistributedFfnGridTreduceReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
-        ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
-        gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
 }

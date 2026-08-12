@@ -8,61 +8,78 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// A2/A3 backend for GridPipe TPOP.  Mirrors GridTPush.hpp: the channel is the
-// PIPE's (Pipe::Dir / Pipe::Dist), so a TPOP always drains what the pipe's bound
-// producer peer pushed.
+// A2/A3 backend for GridPipe TPOP.  Mirrors GridTPush.hpp: the call names the
+// PRODUCER whose flow it is draining and the local consumer channel comes from the
+// binding table.  Its FREE notification uses the independently negotiated producer
+// channel at the peer.
+// TPOP also services a pending producer-id request: it waits for an unused or
+// CLOSE-qualified channel, binds that producer, then relays ready_scb/cons_idx back
+// as the producer's prod_idx/free_scb baselines.  Later pops use the bound channel
+// directly until the stream closes and drains.
 
 #ifndef PTO_A2A3_GRID_TPOP_HPP
 #define PTO_A2A3_GRID_TPOP_HPP
 
 #include <cstdint>
 
-#include <pto/npu/a2a3/GridTPush.hpp> // for a2a3_grid_payload hooks
+#include <pto/npu/a2a3/GridTPush.hpp> // for a2a3_grid_payload hooks + grid_detail
 #include <pto/npu/a2a3/grid_intrinsic.hpp>
 #include <pto/npu/a2a3/grid_pipe_runtime.hpp>
 
 namespace pto {
 
+// Drain one tile that the core whose LOGICAL BLOCK ID is `prodId` pushed into this
+// core, over the channel this pipe has bound to that producer.
 template <typename Pipe, typename TileCons>
-AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
+AICORE bool GRID_TRY_TPOP_IMPL(
+    Pipe& pipe, TileCons& tile, uint32_t prodId, uint32_t maxSpins = grid_mock::kDefaultWfeMaxSpins)
 {
-    constexpr GridDirection Dir = Pipe::Dir;
+    static_assert(Pipe::ChanCount > 0, "GridPipe TPOP needs a pipe with at least one channel (ChanCount > 0)");
 
-    // SOURCE TPOP is always legal (CanPopK returns true regardless of Dist);
-    // other directions require the K-hop upstream to exist.  Dist == 1 is the
-    // original nearest-neighbor path.
-    if (!pipe.HasProducer()) {
-        grid_mock::MockBoundaryFault(pipe.prod.freeScb, grid_mock::PopFaultCode(Dir));
+    if (grid_detail::ReportPendingBindFault(pipe)) {
         return false;
     }
 
-    // Step 1 (V8 C1): wait for the producer peer's ready signal.  ready threshold =
+    // Boundary check.  A cell with no upstream says so by passing kGridNoPeer.
+    if (!GridBlockIdValid(prodId, pipe.shape)) {
+        grid_mock::MockBoundaryFault(grid_detail::FaultWord(pipe.freeScb[0]), grid_mock::kFaultPopOutOfMesh);
+        return false;
+    }
+
+    const int consChan = grid_detail::EnsureIncomingProducerBinding(pipe, prodId, maxSpins);
+    if (consChan == kGridInvalidChan) {
+        return false;
+    }
+    const int peerProdChan = pipe.consChanPeerProdChan[consChan];
+    if (peerProdChan < 0 || peerProdChan >= Pipe::ChanCount) {
+        grid_mock::MockSetFault(grid_detail::FaultWord(pipe.closeScb[consChan]), grid_mock::kFaultBindProtocol);
+        return false;
+    }
+
+    // Step 1 (V8 C1): wait for the producer's ready signal.  ready threshold =
     //   cons_idx+1.  WAIT_SPR alone reads the local ready_scb and blocks (read+block
-    //   in one instruction; no MOV_SPR2X peek -- V8).  This pipe's ready_scb is
-    //   IPC_SCB slot Pipe::ReadyScbSlot.
-    const uint32_t idx = pipe.cons.consIndex;
+    //   in one instruction; no MOV_SPR2X peek -- V8).  ready_scb of channel c
+    //   occupies IPC_SCB slot c.
+    const uint32_t idx = pipe.consIndex[consChan];
     const uint32_t expectedReady = idx + 1;
-    if (!wait_ipc_scb_sim(pipe.cons.readyScb, expectedReady, Pipe::ReadyScbSlot, maxSpins)) {
-        // Offset the fault-flag word only when the base scb pointer is real: nullptr + offset
-        // is UB and would slip a non-null (but invalid) pointer past MockSetFault's null guard.
-        __gm__ uint32_t* readyFault =
-            pipe.cons.readyScb ? pipe.cons.readyScb + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(readyFault, grid_mock::kFaultWaitReadyTimeout);
+    const uint32_t readySlot = static_cast<uint32_t>(consChan);
+    if (!wait_ipc_scb_sim(pipe.readyScb[consChan], expectedReady, readySlot, maxSpins)) {
+        grid_mock::MockSetFault(grid_detail::FaultWord(pipe.readyScb[consChan]), grid_mock::kFaultWaitReadyTimeout);
         return false;
     }
 
-    // Step 2: compute local SRAM slot address; the producer peer wrote it here.
-    // Mirrors the push side: SlotStride addresses the ring, the consumer's payload
-    // window picks the sub-window this pop drains.  It must describe the SAME
-    // region the producer pushed -- both sides derive it from the topology,
-    // exactly as a5's producer and consumer both derive entryOffset from the tile id.
-    const GridPayloadWindow win = pipe.cons.window;
+    // Step 2: compute local SRAM slot address; the producer wrote it here.  Mirrors
+    // the push side: SlotStride addresses the ring, the payload window picks the
+    // sub-window this pop drains.  It must describe the SAME region the producer
+    // pushed -- both sides derive it from the topology, exactly as a5's producer
+    // and consumer both derive entryOffset from the tile id.
+    const GridPayloadWindow win = pipe.popWindow[consChan];
     if (GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) > static_cast<uint32_t>(Pipe::SlotStride)) {
-        __gm__ uint32_t* rangeFault = pipe.prod.freeScb ? pipe.prod.freeScb + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(rangeFault, grid_mock::kFaultPopPayloadRange);
+        grid_mock::MockSetFault(grid_detail::FaultWord(pipe.freeScb[peerProdChan]), grid_mock::kFaultPopPayloadRange);
         return false;
     }
-    __gm__ uint8_t* localSlot = pipe.slots.Slot(idx) + win.entryOffset;
+    const uint32_t slotOff = (idx % Pipe::SlotCount) * Pipe::SlotStride + win.entryOffset;
+    __gm__ uint8_t* localSlot = pipe.slotBase[consChan] + slotOff;
     // Bytes this pop touches, measured from `localSlot` (the arena guard below and
     // the 1-D drain both want the span, not the whole slot).
     const uint32_t spanBytes = GridPayloadSlotExtent(win, static_cast<uint32_t>(Pipe::SlotStride)) - win.entryOffset;
@@ -73,10 +90,9 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = g
     // mock backs SRAM with a GM-mapped window that can be read at any address, so
     // PopSlotIsLocal validates `localSlot` against this core's GmSramArena segment
     // and traps a cross-segment read as kFaultPopNonLocal instead of servicing it.
-    const int selfRank = pipe.SelfRank();
-    if (!a2a3_grid_payload::PopSlotIsLocal(pipe.ctx.runtimeCtx, localSlot, spanBytes, selfRank)) {
-        __gm__ uint32_t* freeFault = pipe.prod.freeScb ? pipe.prod.freeScb + grid_mock::kFaultFlagWordOffset : nullptr;
-        grid_mock::MockSetFault(freeFault, grid_mock::kFaultPopNonLocal);
+    const int selfBlockId = BlockIdFromCoord(pipe.coord, pipe.shape);
+    if (!a2a3_grid_payload::PopSlotIsLocal(pipe.runtimeCtx, localSlot, spanBytes, selfBlockId)) {
+        grid_mock::MockSetFault(grid_detail::FaultWord(pipe.freeScb[peerProdChan]), grid_mock::kFaultPopNonLocal);
         return false;
     }
 
@@ -91,30 +107,25 @@ AICORE bool GRID_TRY_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t maxSpins = g
             tile, localSlot, win.rowBytes, win.rowCount, GridPayloadSlotStride(win), GridPayloadTileStride(win));
     }
 
-    // Step 4 (V7 C4): notify the producer peer that the slot is free --
-    //   sync_hscb (SYNC_HSCB) store of cons_idx (= idx+1) into that peer's
-    //   free_scb IPC_SCB (overwrite store of a monotone absolute count).  The peer
-    //   declared the same pipe type at the same window offset, so its free scb is
-    //   ours resolved to its rank; natively it is IPC_SCB slot Pipe::FreeScbSlot.
-    //
-    // SOURCE has no upstream rank (it's the launcher); host runtime handles free
-    // credit out-of-band.  Skip the cross-rank store for SOURCE.
-    if constexpr (Dir != GridDirection::SOURCE) {
-        const int peerRank = pipe.ProducerRank();
-        __gm__ uint32_t* peerFree = a2a3_grid_payload::RemoteScbPtr(pipe.ctx.runtimeCtx, pipe.prod.freeScb, peerRank);
-        sync_hscb(peerFree, idx + 1);
-    }
+    // Step 4 (V7 C4): notify the producer that the slot is free -- sync_hscb
+    //   (SYNC_HSCB) store of cons_idx (= idx+1) into ITS free_scb at peerProdChan
+    //   (overwrite store of a monotone absolute count).  The remote producer channel
+    //   need not equal this core's local consChan.
+    __gm__ uint32_t* peerFree =
+        a2a3_grid_payload::RemoteScbPtr(pipe.runtimeCtx, pipe.freeScb[peerProdChan], static_cast<int>(prodId));
+    sync_hscb(peerFree, idx + 1);
 
     // Step 5 (V7 C4): bump the local consumer GPR (drives slot addr / ready
-    //   threshold / the absolute count published to the producer peer).
-    pipe.cons.consIndex = idx + 1;
+    //   threshold / the absolute count published to the producer).
+    pipe.consIndex[consChan] = idx + 1;
+    pipe.PersistConsIndex(consChan);
     return true;
 }
 
 template <typename Pipe, typename TileCons>
-AICORE void GRID_TPOP_IMPL(Pipe& pipe, TileCons& tile)
+AICORE void GRID_TPOP_IMPL(Pipe& pipe, TileCons& tile, uint32_t prodId)
 {
-    (void)GRID_TRY_TPOP_IMPL<Pipe, TileCons>(pipe, tile, 0);
+    (void)GRID_TRY_TPOP_IMPL<Pipe, TileCons>(pipe, tile, prodId, 0);
 }
 
 } // namespace pto

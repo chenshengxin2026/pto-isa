@@ -307,23 +307,13 @@ static const char* GridPipeFaultName(uint32_t code)
 {
     switch (code) {
         case 0x101:
-            return "push north boundary";
-        case 0x102:
-            return "push east boundary";
-        case 0x103:
-            return "push west boundary";
-        case 0x104:
-            return "push south boundary";
-        case 0x105:
-            return "push source boundary";
+            return "push peer outside the mesh";
+        case 0x106:
+            return "push peer has no bound channel";
         case 0x201:
-            return "pop north boundary";
-        case 0x202:
-            return "pop east boundary";
-        case 0x203:
-            return "pop west boundary";
-        case 0x204:
-            return "pop south boundary";
+            return "pop peer outside the mesh";
+        case 0x206:
+            return "pop peer has no bound channel";
         case 0x205:
             return "pop non-local segment";
         case 0x301:
@@ -335,18 +325,42 @@ static const char* GridPipeFaultName(uint32_t code)
         case 0x402:
             return "pop payload window out of slot range";
         case 0x403:
-            return "broadcast payload window out of slot range";
+            return "broadcast payload or participant configuration is invalid";
+        case 0x501:
+            return "consumer binding history full";
+        case 0x502:
+            return "no channel bound on this pipe";
+        case 0x503:
+            return "relay counters unavailable";
+        case 0x504:
+            return "bind request timeout";
+        case 0x505:
+            return "bind response timeout";
+        case 0x506:
+            return "no reusable channel became available";
+        case 0x507:
+            return "invalid bind-handshake state";
+        case 0x508:
+            return "consumer channel received an early duplicate bind";
+        case 0x509:
+            return "no local producer channel became available";
         default:
             return "unknown";
     }
 }
 
-// Scan one arena's per-cell flag header (first 128 B = unicast ready/free scbs +
-// reserved) for fault sentinels (any word >= 0x100).  The slot + broadcast-ring
+// Scan one arena's fixed ready/free/close scoreboard header for fault sentinels.
+// The slot + broadcast-ring
 // payload regions are intentionally NOT scanned -- they hold legitimate tile data.
 static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char* arenaName)
 {
     constexpr size_t kFlagWords = static_cast<size_t>(FFN_NCUT_GRID_FLAGS_BYTES) / sizeof(uint32_t);
+    // Fault sentinels live at word kFaultFlagWordOffset of each scoreboard's own
+    // cache line; the scoreboard word itself holds a monotone count that would read
+    // as a code once a run gets long enough, so scan only the sentinel words.
+    constexpr size_t kScbLineWords = 64 / sizeof(uint32_t); // grid_mock::kScbLineStrideU32
+    constexpr size_t kFaultWordInLine = 10;                 // grid_mock::kFaultFlagWordOffset
+    constexpr size_t kScbLines = kFlagWords / kScbLineWords;
     std::vector<uint32_t> flags(static_cast<size_t>(cells) * kFlagWords, 0);
     for (int cell = 0; cell < cells; ++cell) {
         auto* src = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes;
@@ -363,7 +377,8 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char
         int row = cell / FFN_NCUT_COLS;
         int col = cell - row * FFN_NCUT_COLS;
         const uint32_t* cellFlags = flags.data() + static_cast<size_t>(cell) * kFlagWords;
-        for (size_t i = 0; i < kFlagWords; ++i) {
+        for (size_t line = 0; line < kScbLines; ++line) {
+            const size_t i = line * kScbLineWords + kFaultWordInLine;
             uint32_t value = cellFlags[i];
             if (value >= 0x100U) {
                 std::cerr << "[ERROR] GridPipe fault " << arenaName << " cell=" << cell << " row=" << row
@@ -376,42 +391,29 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char
     return ok;
 }
 
-// DEBUG: dump the broadcast ready/free lanes (per-source counts) for the first
-// `dumpCells` cells of one arena, so a stuck gather shows exactly which source's
-// ready doorbell never fired.  Offsets mirror InitGridPipeFromWindow.
-static void DumpArenaLanes(
-    void* arenaDev, int winBytes, int slotBytes, int bcastSlots, int groupMax, int dumpCells, const char* arenaName)
+// DEBUG: dump the dedicated aggregate ready/free/close SPR triplet used by the
+// pure-broadcast pipe.  ChanCount=0, so CollectiveChan is fixed channel 0.
+static void DumpArenaCollectiveScbs(void* arenaDev, int winBytes, int dumpCells, const char* arenaName)
 {
-    // A group pipe's window is flags + shared ring + ready lanes + free lanes;
-    // there is no unicast ring in front of the lanes.
-    const int readyOff = FFN_NCUT_GRID_FLAGS_BYTES + bcastSlots * slotBytes;
-    const int freeOff = readyOff + groupMax * FFN_NCUT_LANE_STRIDE;
-    std::cout << "[DEBUG] " << arenaName << " lanes (readyOff=" << readyOff << " freeOff=" << freeOff
-              << " stride=" << FFN_NCUT_LANE_STRIDE << "):" << std::endl;
+    constexpr int kScbStride = 64;
+    constexpr int kCollectiveChan = FFN_NCUT_BCAST_CHAN_COUNT;
+    constexpr int kReadyOff = kCollectiveChan * kScbStride;
+    constexpr int kFreeOff = (FFN_GRID_CHAN_MAX + kCollectiveChan) * kScbStride;
+    constexpr int kCloseOff = (2 * FFN_GRID_CHAN_MAX + kCollectiveChan) * kScbStride;
+    std::cout << "[DEBUG] " << arenaName << " collective SPRs (ready/free/close offsets=" << kReadyOff << "/"
+              << kFreeOff << "/" << kCloseOff << "):" << std::endl;
     for (int cell = 0; cell < dumpCells; ++cell) {
         auto* base = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes;
-        std::vector<uint32_t> ready(groupMax, 0);
-        std::vector<uint32_t> freeV(groupMax, 0);
-        // Lanes are strided one-per-cache-line; read each lane's low word individually.
-        for (int g = 0; g < groupMax; ++g) {
-            aclrtMemcpy(
-                &ready[g], sizeof(uint32_t), base + readyOff + g * FFN_NCUT_LANE_STRIDE, sizeof(uint32_t),
-                ACL_MEMCPY_DEVICE_TO_HOST);
-            aclrtMemcpy(
-                &freeV[g], sizeof(uint32_t), base + freeOff + g * FFN_NCUT_LANE_STRIDE, sizeof(uint32_t),
-                ACL_MEMCPY_DEVICE_TO_HOST);
-        }
+        uint32_t ready = 0;
+        uint32_t freeCount = 0;
+        uint32_t close = 0;
+        aclrtMemcpy(&ready, sizeof(ready), base + kReadyOff, sizeof(ready), ACL_MEMCPY_DEVICE_TO_HOST);
+        aclrtMemcpy(&freeCount, sizeof(freeCount), base + kFreeOff, sizeof(freeCount), ACL_MEMCPY_DEVICE_TO_HOST);
+        aclrtMemcpy(&close, sizeof(close), base + kCloseOff, sizeof(close), ACL_MEMCPY_DEVICE_TO_HOST);
         int row = cell / FFN_NCUT_COLS;
         int col = cell - row * FFN_NCUT_COLS;
-        std::cout << "  cell=" << cell << " (r" << row << "c" << col << ") ready=[";
-        for (int v : ready) {
-            std::cout << v << ",";
-        }
-        std::cout << "] free=[";
-        for (int v : freeV) {
-            std::cout << v << ",";
-        }
-        std::cout << "]" << std::endl;
+        std::cout << "  cell=" << cell << " (r" << row << "c" << col << ") ready=" << ready << " free=" << freeCount
+                  << " close=" << close << std::endl;
     }
 }
 
@@ -509,18 +511,14 @@ static bool RunSingleDevice(int physCores)
     }
 
     // Phase B: AllGather Phase 1 (row gather, 8-way).  Wave by WHOLE ROWS so every
-    // row group (8 cells) is wholly present in its wave.  Each ready/free lane now
-    // owns a full cache line (kBcastLaneStride), so concurrent producers no longer
-    // clobber each other's doorbell word -- a wave scales to as many cells as fit
-    // on the device.  Wave size is bounded only by physCores (no oversubscription),
-    // not by the old ~8-poller thrash cap (kCommWaveCap, removed).
+    // row group (8 cells) is wholly present in its wave.  Shared ready/free/close
+    // SPRs use atomic increments, so concurrent producers do not lose doorbell
+    // updates.  Wave size is bounded by physCores (no oversubscription).
     const int rowsPerWave = std::max(1, r.physCores / FFN_NCUT_COLS);
     for (int rs = 0; rs < FFN_NCUT_ROWS; rs += rowsPerWave) {
         int waveRows = std::min(rowsPerWave, FFN_NCUT_ROWS - rs);
         if (!LaunchWave(r, /*phase=*/1, rs, 0, FFN_NCUT_COLS, waveRows * FFN_NCUT_COLS, "B AG-P1 row gather")) {
-            DumpArenaLanes(
-                r.p1_windows_dev, FFN_NCUT_WIN_P1, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1,
-                FFN_NCUT_CELLS, "P1");
+            DumpArenaCollectiveScbs(r.p1_windows_dev, FFN_NCUT_WIN_P1, FFN_NCUT_CELLS, "P1");
             Cleanup(r);
             return false;
         }
@@ -536,9 +534,7 @@ static bool RunSingleDevice(int physCores)
     for (int cs = 0; cs < FFN_NCUT_COLS; cs += colsPerWave) {
         int waveCols = std::min(colsPerWave, FFN_NCUT_COLS - cs);
         if (!LaunchWave(r, /*phase=*/2, 0, cs, waveCols, FFN_NCUT_ROWS * waveCols, "C AG-P2 col gather")) {
-            DumpArenaLanes(
-                r.p2_windows_dev, FFN_NCUT_WIN_P2, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2,
-                FFN_NCUT_CELLS, "P2");
+            DumpArenaCollectiveScbs(r.p2_windows_dev, FFN_NCUT_WIN_P2, FFN_NCUT_CELLS, "P2");
             Cleanup(r);
             return false;
         }

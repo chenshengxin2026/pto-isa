@@ -6,16 +6,16 @@ This demo validates the three distributed-FFN GridPipe collective interfaces —
 
 | Example (run script / executable) | Interface verified | FFN pattern | Cross-cell collective |
 | --- | --- | --- | --- |
-| `run_tpush_reducesum.sh` / `distributed_ffn_grid_tpush_reducesum` | **TPUSH** | ReduceSum | explicit `TPOP` + `TADD` + `TPUSH` (the A3 lowering of `TREDUCE`) |
+| `run_tpush_reducesum.sh` / `distributed_ffn_grid_tpush_reducesum` | **TPUSH** | ReduceSum | explicit `TPOP(pipe, ..., prodId)` + `TADD` + `TPUSH(pipe, ..., consId, isLastTransfer)` relay |
 | `run_tpush_allgather.sh` / `distributed_ffn_grid_tpush_allgather` | **TPUSH** | AllGather | nearest-neighbor `TPUSH`/`TPOP` relay gather (fan-in-1 DAG) |
-| `run_tbroadcast_allgather.sh` / `distributed_ffn_grid_tbroadcast_allgather` | **TBROADCAST** | AllGather | `TBROADCAST` MPSC group broadcast |
+| `run_tbroadcast_allgather.sh` / `distributed_ffn_grid_tbroadcast_allgather` | **TBROADCAST** | AllGather | `TBROADCAST<GridGroup>` MPSC group broadcast |
 | `run_treduce_reducesum.sh` / `distributed_ffn_grid_treduce_reducesum` | **TREDUCE** | ReduceSum | fused `TREDUCE<GridGroup, Sum>` N→1 group fan-in (`mov_ubuf_group`, op=SUM) |
 
 Each example compares its `[T, H]` output with `golden.bin` using a `1e-3` tolerance. All four pass **bit-exact** on the NPU (`max diff = 0`, run with `-r npu`); see [Bit-exactness notes](#bit-exactness-notes).
 
-The cross-cell collectives use the A2/A3 GridPipe mock backend: local SRAM windows backed by GM in the mock, fake `HcclDeviceContext` window pointers, ready/free counters, `dcci/dsb` fences, and spin waits. This validates the programming model and same-device mock path; it is not multi-card communication validation.
+The cross-cell collectives use the A2/A3 GridPipe mock backend: local SRAM windows backed by GM in the mock, fake `HcclDeviceContext` window pointers, per-channel ready/free/close counters, `dcci/dsb` fences, and spin waits. This validates the programming model and same-device mock path; it is not multi-card communication validation.
 
-Beyond these FFN examples, GridPipe also supports routed K-hop unicast (`TPUSH` / `TPOP`) and concurrent group broadcast (`TBROADCAST` / `TPOP`). Each capability has a standalone Vec-only smoke test under `smoke/` (see [Smoke tests](#gridpipe-smoke-tests)).
+Unicast names peers at runtime (`consId` on TPUSH and `prodId` on TPOP), while concurrent group broadcast keeps its `TBROADCAST<GridGroup>` / `TPOP<GridGroup>` interface. The standalone broadcast smoke test lives under `smoke/`.
 
 ## Files
 
@@ -29,16 +29,16 @@ Beyond these FFN examples, GridPipe also supports routed K-hop unicast (`TPUSH` 
 | `kernel_launch.hpp` | Host-side mixed kernel launch declarations (one per example). |
 | `main_treduce_reducesum.cpp` / `main_tpush_reducesum.cpp` | ReduceSum host drivers: ACL setup, fake HCCL context / local GridPipe windows, working buffers, Batcher load/distribute, kernel launch, golden comparison, cleanup. |
 | `distributed_ffn_grid_treduce_reducesum_compute_kernel.cpp` | TREDUCE ReduceSum kernel: the EAST+SOUTH reduce uses the fused `TREDUCE<GridGroup, Sum>` group fan-in (`mov_ubuf_group`, op=SUM) at the sink. |
-| `distributed_ffn_grid_tpush_reducesum_compute_kernel.cpp` | TPUSH ReduceSum kernel: same compute, but the EAST+SOUTH reduce is spelled with explicit `TPOP` + `TADD` + `TPUSH`. |
+| `distributed_ffn_grid_tpush_reducesum_compute_kernel.cpp` | TPUSH ReduceSum kernel: EAST and SOUTH share one channel across launches, exercising close + relay-count rebinding with explicit TPOP + TADD + TPUSH. |
 | `main_tbroadcast_allgather.cpp` / `main_tpush_allgather.cpp` | AllGather host drivers. |
-| `distributed_ffn_grid_tbroadcast_allgather_compute_kernel.cpp` | TBROADCAST AllGather kernel: the two gather phases use `TBROADCAST` + `TPOP`. |
+| `distributed_ffn_grid_tbroadcast_allgather_compute_kernel.cpp` | TBROADCAST AllGather kernel: the two gather phases use `TBROADCAST<GridGroup>` + `TPOP<GridGroup>`. |
 | `distributed_ffn_grid_tpush_allgather_compute_kernel.cpp` | TPUSH AllGather kernel: the two gather phases use a bidirectional `TPUSH`/`TPOP` relay. |
 | `batcher.hpp` | Host-side GM-simulated **Batcher**: owns the full input + the full DRAM-resident weights in GM, splits them column-parallel into per-cell shards, broadcasts x, and exposes the output-collection region. |
 | `tpipe_tmov_inl.hpp` | Directional `TMOV` overloads that lower Cube↔Vec C2V/V2C transfers to the existing `TPUSH`/`TPOP`, so the kernel body never spells out the handshake. |
-| `gridpipe_payload_inl.hpp` | Local GridPipe payload hooks and fake-window remote pointer adapter — peer-slot / scoreboard-word resolution (`ResolvePeerSlotAddr`/`RemoteScbPtr`), the `copy_ubuf_to_neighbor_ubuf`/`copy_gm_to_ubuf` tile adapters (`CopyTileToNeighborSramSlot`/`CopyLocalSlotToTile`), the NoC read-locality guard (`PopSlotIsLocal`), and `TileUbPtr` (extract a tile's `__ubuf__` pointer for the G4 group intrinsic `mov_ubuf_group`, which takes raw UB pointers rather than tile objects). |
-| `smoke/` | Standalone GridPipe feature smoke tests. `khop_smoke_{config,kernel,launch}` + `main_khop_smoke.cpp` + `run_khop_smoke.sh` cover routed K-hop unicast; `bcast_smoke_*` + `run_bcast_smoke.sh` cover single-source row/column broadcast. Both build through the parent `CMakeLists.txt`. |
-| `../../../../include/pto/npu/a2a3/grid_cce_intrinsic.hpp` | V8 GridPipe CCE facade layer: `copy_ubuf_to_neighbor_ubuf` (G1 `COPY_UBUF_TO_NBR`), `sync_hscb` (G2 `SYNC_HSCB`/`ST_HSCB`), `wait_ipc_scb`/`wait_ipc_scb_sim` (G3 `WAIT_SPR`, read+block in one instruction, no `MOV_SPR2X` peek) — plus the unified group-collective `mov_ubuf_group` (G4 `MOV_UBUF_GROUP`, template-free, all runtime parameters). A broadcast and a reduce are *the same action* from the issuing core's view — move a UB tile to/from the resolved group arena — so the NoC collective mode is a runtime `GridCollOp` operand (`COPY` = 1→N replicate fan-out, `SUM`/`MAX`/`MIN` = N→1 element-wise fan-in; datapath direction implied by `op`), not a second instruction. Each forwards 1:1 to a `__builtin_cce_*` under `PTO_GRID_CCE_NATIVE`, else emulates the same semantics — G1–G3 with a GM word + cache maintenance; G4 with chunked UB/GM copies and, for a reduce (`op != COPY`) on the A3 mock, an in-core `vadd`/`vmax`/`vmin` combine over a per-member scratch. (This collapses the former `bcast_ubuf_to_group` G4 `BCAST_UBUF_TO_GROUP` + `reduce_group_to_ubuf<Group,Op,T>` G5 `REDUCE_GROUP_TO_UBUF` — two machine instructions and two template facades — into one; the new-instruction count drops from "+2 +reuse 2" to "+1 +reuse 2". Design doc: `2026-07-24-bcast-reduce-合并mov_ubuf_group方案.md`.) |
-| `../../../../include/pto/npu/a2a3/grid_intrinsic.hpp` | GridPipe A2/A3 data model + mock support: Section 1 is the mesh model + neighbor / K-hop / group resolvers; Section 2 is the GM-mock boundary-fault sentinels; Section 3 is the `GmSramArena` address-segment SRAM model + the TPOP read-locality guard. |
+| `gridpipe_payload_inl.hpp` | Local GridPipe payload hooks and fake-window adapter: peer-slot/SCB resolution, tile-to-producer-L1 staging, producer-L1-to-peer-ring copies, local receive-ring drains, and the TPOP locality guard. |
+| `smoke/` | Standalone Vec-only GridPipe broadcast smoke test (`bcast_smoke_*` + `run_bcast_smoke.sh`). |
+| `../../../../include/pto/npu/a2a3/grid_cce_intrinsic.hpp` | Grid CCE facades: unified-L1 copies, absolute `sync_hscb`, MPSC `atom_add_hscb`, blocking `wait_ipc_scb`, and group `mov_ubuf_group`. The A3 mock represents L1 ranges with GM windows. |
+| `../../../../include/pto/npu/a2a3/grid_intrinsic.hpp` | GridPipe A2/A3 data model + mock support: per-channel ready/free/close SCBs, producer/consumer bindings, the three-state per-consumer FSM, durable relay counters, mesh/group resolvers, fault sentinels, and the `GmSramArena` TPOP locality guard. |
 | `scripts/gen_data.py` | Generates the FULL fp16 X/weight tensors (`x_full`, `w_gate_full`, `w_up_full`, `w_down_full`) the Batcher consumes, plus an fp32 SwiGLU `golden` reference. |
 | `build/` | Ignored generated build directory. |
 | `out/` | Ignored generated data directory. |
@@ -47,7 +47,7 @@ Beyond these FFN examples, GridPipe also supports routed K-hop unicast (`TPUSH` 
 
 Run with `-r npu` (the `sim`/`camodel` modes fail `aclrtSetDevice` 507033); on a shared host every run goes through `task-submit`. All four examples produce `max diff = 0` vs `golden.bin` — bit-exact, not merely within the `1e-3` tolerance. Two real bugs once masked that, both now fixed:
 
-- **Cache-line doorbell stride (TBROADCAST MPSC).** `TBROADCAST` is a true concurrent MPSC channel — every member may publish at the same instant, each ringing only its *own* per-source ready lane. Those lanes were packed as consecutive `u32`s: `GroupMax` lanes × 4 B ≤ 32 B < one 64 B cache line. Several producers therefore each wrote a different word of the *same* line while the consumer `dcci`-invalidated + read it each poll; the AICore store is line-granular, so one producer's write-back clobbered another's word and that doorbell silently **dropped from GM** (proven by a D2H lane dump that bypasses the consumer's `dcci`). Symptom: sporadic `wait ready timeout`. Fix: give each ready/free lane its **own cache line** — `kBcastLaneStride = 64` / `kBcastLaneStrideU32 = 16` in `grid_intrinsic.hpp`, mirrored as `FFN_NCUT_LANE_STRIDE = 64` in `ffn_config.hpp` — at all four lane-index sites in `GridTBroadcast.hpp`. The phase-B/C handshake dropped from 10–20 s (retry waves) to ~40 µs.
+- **MPSC SPR doorbells (TBROADCAST/TREDUCE).** Broadcast payloads remain collision-free because source rank `k` owns slot `k` in every receiver. Notification no longer uses static per-source L1 lanes: each collective reserves `ready_scb/free_scb/close_scb[CollectiveChan]` from the fixed `GridPipe` SPR header. All producers atomically add READY/CLOSE at a receiver, and all receivers atomically add FREE at a producer. Replacing the old lanes with ordinary absolute `sync_hscb` stores would be incorrect—simultaneous writers would overwrite one another (last-writer-wins), lose counts, and deadlock. The A3 mock implements `atom_add_hscb` with an atomic s32 UB→GM accumulate; native `__atom_add_hscb` peer-SPR routing remains an explicit hardware dependency.
 - **Phase-D output T-stride (both AllGather kernels).** The AllGather y-shard `[T, Hc]` is written into the *full* `[T, H]` output, so its row stride must be the full output width `kHfull` (= `H` = 7168). A copy-paste from the `hidden_full` store had left it at `kIfull` (= `I` = 3072), scrambling y rows 1–7 (≈50 % zero output / large drift). One-line fix `kIfull` → `kHfull` in the `GY` store of both AllGather kernels.
 
 The `treduce` ReduceSum additionally requires its per-cell partial buffers (`partialBuf` / `rowPartialBuf`) to be laid out **segment-major** — each `[T, kHBase]` H-segment contiguous at offset `h*(T*kHBase)` — so the group fan-in reads every row-mate's segment as one contiguous byte range; only the final `yFull` keeps the strided `[T, H]` golden layout.
@@ -135,38 +135,9 @@ col  = cell % gridCols
 
 All cells run on one device. `gridRows` controls data-parallel token tiles, and `gridCols` controls model-parallel FFN shards.
 
-### GridPipe channel binding (one pipe = one (producer, consumer) pair)
-
-Everything a `GridPipe` holds is core-local **register** state: on real silicon `ready_scb` / `free_scb` are IPC_SCB slots (SPR) and `prod_idx` / `cons_idx` are GPRs. A register cannot be re-pointed at another peer mid-flight, so the peer identity lives in the pipe's **type**:
-
-```cpp
-// unicast SPSC channel: producer = the core Dist hops upstream along Dir,
-//                       consumer = the core Dist hops downstream
-GridPipe<Tile, GridDirection::EAST, SlotStride, SlotCount /*, Dist = 1, ScbId = 2*Dir */>
-// group collective channel (真·同时 MPSC): producer/consumer = the whole group
-GridGroupPipe<Tile, GridGroup::ROW, SlotStride, SlotCount, GroupMax>
-```
-
-`TPUSH(pipe, tile)`, `TPOP(pipe, tile)`, `TREDUCE<Op>(pipe, acc, recv)`, `TBROADCAST(pipe, tile)` and `TPOP(pipe, tile, srcRank)` therefore carry no direction or group template argument — **a different producer or consumer means a different pipe**. A bidirectional relay is two pipes (forward and backward), and the reduce's EAST and SOUTH phases are two pipes, each owning its own slice of the cell window (`FFN_NCUT_TPUSH_PIPE_WIN_P*` / `FFN_RS_REDUCE_PIPE_WIN`). The slices must be disjoint, or the second phase would start from the ready/free counts the first left behind.
-
-All four demos and both smokes call **that PTO instruction layer**, not the A2/A3 backend's `GRID_*_IMPL` / `GRID_TRY_*_IMPL` entry points, so one run exercises the instruction surface itself (overload selection, the `SOURCE` `static_assert`, the target-profile guard) and not just the lowering. The cost is that the instructions carry no spin bound — they block like the hardware `WAIT_SPR` — so a mis-wired handshake shows up as a hang rather than a `kFaultWaitReadyTimeout` sentinel. That is safe here because the host waves each relay group / collective group wholly into one launch (see `LaunchWave` in the `main_*.cpp`). To get the timeout sentinel back while debugging, call the matching `GRID_TRY_*_IMPL(..., maxSpins)` directly.
-
-`TREDUCE` has two overloads for two different reduction *shapes*: `TREDUCE<Op>(pipe, acc, recv)` is the hop-by-hop relay (first template argument a `comm::ReduceOp`), and `TREDUCE<Group, Op, T>(acc, scratch, base, bytes, memberCount, rect, memberStride)` is the N→1 group fan-in (first template argument a `GridGroup`, lowering to one `mov_ubuf_group`). The latter takes no pipe — a fan-in reads the contribution arena directly, so there is no ring, no scoreboard pair and no per-hop handshake to bind. They cannot be confused: each one's leading template argument fails substitution into the other.
-
-The state is grouped into the three categories it maps to in hardware:
-
-| Member | Contents | Hardware |
-| --- | --- | --- |
-| `pipe.ctx` | `runtimeCtx` (the global context instance used to address a peer) + `shape` / `coord` / `pipeId` | runtime handle + this core's cell in the mesh |
-| `pipe.slots` | payload ring base + `SlotStride` (one slot's size) + `SlotCount` (ring depth) | the payload ring in this core's SRAM |
-| `pipe.prod` | `freeScb` + `prodIndex` + payload sub-window | IPC_SCB (SPR) + GPR |
-| `pipe.cons` | `readyScb` + `consIndex` + payload sub-window | IPC_SCB (SPR) + GPR |
-
-`pipe.HasProducer()` / `HasConsumer()` / `ProducerRank()` / `ConsumerRank()` derive from the bound `(Dir, Dist)` plus `coord` / `shape`; kernels use them to tell whether this cell starts a chain, ends it, or sits in the middle.
-
 ### Local GridPipe mock
 
-The host allocates `gridRows * gridCols` local SRAM windows, backed by GM in the mock. On an EAST-bound pipe, `TPUSH` resolves the east neighbor's SRAM slot with the `ResolvePeerSlotAddr` runtime helper, writes the payload, then publishes the ready counter; `TPOP` waits on the local ready counter, loads the local SRAM slot, and returns free credit to the west neighbor.
+The host allocates `gridRows * gridCols` local SRAM windows, backed by GM in the mock. `TPUSH(..., consId)` resolves that consumer's SRAM slot with `ResolvePeerSlotAddr`, writes the payload, then publishes READY; `TPOP(..., prodId)` waits on local READY, loads the local slot, and returns FREE credit to that producer.
 
 The mock uses GM flag polling and cache maintenance to emulate the intended LPU WSE `SPR` / `WFE` behavior on A2/A3.
 
@@ -178,12 +149,21 @@ To stay close to real silicon, the mock models future-hardware per-core SRAM as 
 segment c = [base + c*winSize, base + (c+1)*winSize)   // base == windowsIn[0]
 ```
 
+Each segment keeps receive and producer storage distinct:
+
+```text
+control + record | unicast receive rings | optional broadcast receive ring | producer staging slot
+                                                                             [SlotStride bytes]
+```
+
+The producer slot is appended after every receive-side region. `TPUSH` and `TBROADCAST` first stage the tile there, then map that local L1 source to the selected peer payload-ring address. This models real WSE, where vector data and L1 share one SRAM address space, without allowing the producer source to alias a receive ring.
+
 `GmSramArena` (in `include/pto/npu/a2a3/grid_intrinsic.hpp`) carries `{base, segBytes, numSegs}` plus the `SegmentOf` / `InSegment` classifiers; the demo builds it on-device from the fake `HcclDeviceContext` window table (`SramArenaFromCtx`). It is the single source of truth for "which core owns this address".
 
 This makes the NoC contract explicit and **enforced**: the fabric can only *write* across cores, never *read*.
 
-- `TPUSH` writes a payload into the **neighbor's** segment — a cross-segment write, exactly what the fabric does.
-- `TPOP` may only drain **this core's own** segment. `GRID_TRY_TPOP_IMPL` calls the `PopSlotIsLocal` guard before the payload read; on a cross-segment read it raises `kFaultPopNonLocal` (`0x205`, "pop non-local segment") and aborts the pop. The host's `CheckGridPipeFaults` surfaces it.
+- `TPUSH(pipe, tile, consId, ...)` reads this core's dedicated producer slot and writes the payload into the **consumer's receive ring** — a cross-segment write, exactly what the fabric does.
+- `TPOP(pipe, tile, prodId)` may only drain **this core's own** segment. `GRID_TRY_TPOP_IMPL` calls the `PopSlotIsLocal` guard before the payload read; on a cross-segment read it raises `kFaultPopNonLocal` (`0x205`, "pop non-local segment") and aborts the pop. The host's `CheckGridPipeFaults` surfaces it.
 
 On native hardware `PopSlotIsLocal` is a no-op (`true`): a TPOP read address is local by construction because the fabric has no remote-read path. The guard exists only because the A2/A3 mock backs SRAM with a GM window that *can* physically read any address, so without it a demo could silently rely on a remote read the silicon cannot perform. A compile-time `static_assert(GmSramArenaSelfCheck())` is built into every A2/A3 kernel, so a regression in the segment math fails the build rather than mis-routing a pop.
 
@@ -191,49 +171,53 @@ On native hardware `PopSlotIsLocal` is a no-op (`true`): a TPOP read address is 
 
 ### IPC_SCB scoreboard intrinsic API
 
-GridPipe ready/free synchronization follows the V8 IPC_SCB scoreboard route. The handshake intrinsics live in `include/pto/npu/a2a3/grid_cce_intrinsic.hpp` as a thin CCE facade layer — each facade forwards 1:1 to a `__builtin_cce_*` under `PTO_GRID_CCE_NATIVE`, and otherwise emulates the same semantics in the A2/A3 mock with a GM word + cache maintenance (`dcci`/`dsb`):
+GridPipe ready/free/close synchronization follows the V8 IPC_SCB scoreboard route. Each channel owns one SCB of each kind. The handshake intrinsics live in `include/pto/npu/a2a3/grid_cce_intrinsic.hpp` as a thin CCE facade layer — each facade forwards 1:1 to a `__builtin_cce_*` under `PTO_GRID_CCE_NATIVE`, and otherwise emulates the same semantics in the A2/A3 mock with a GM word + cache maintenance (`dcci`/`dsb`):
 
-- `copy_ubuf_to_neighbor_ubuf(dstNeighborSlot, src, bytes)` (V8 `COPY_UBUF_TO_NBR`, G1 — the only new machine instruction / HW-DEP-0) writes a local UB payload into the resolved neighbor L1/SRAM slot. Not self-syncing; data-ready is announced by the following `sync_hscb(READY)`.
-- `sync_hscb(peerScb, absCount)` (V8 `SYNC_HSCB`/`ST_HSCB`, G2 — reused HSCB store + neighbor IPC_SCB addressing / HW-DEP-1) stores this core's new monotone absolute count into the peer's `ready_scb`/`free_scb` IPC_SCB. The `(kind, dir, dist)` machine operands are resolved into `peerScb` by the caller's `RemoteScbPtr` runtime helper, so the facade operates on the resolved target.
-- `wait_ipc_scb(localScb, threshold, slot)` (V8 `WAIT_SPR`, G3 — reused IPC_SCB blocking wait) reads + blocks in **one** instruction: the entry reads the local IPC_SCB and proceeds if it is already `>= threshold`, else blocks the current pipe until the peer's `sync_hscb` store raises it. V8 dropped the V7 `MOV_SPR2X` non-blocking peek — there is no separate read step. GridPipe's handshake sequences go through the `wait_ipc_scb_sim(..., maxSpins)` mock wrapper, which adds a spin-timeout fault sentinel (when `maxSpins > 0`) so a handshake deadlock fails the test instead of hanging. The PTO instructions lower with `maxSpins = 0` — block-forever, like the hardware `WAIT_SPR` — so the timeout sentinel is only reachable by calling `GRID_TRY_*_IMPL` directly. The documented hardware interface is the void `wait_ipc_scb`.
+- `copy_l1_to_neighbor_l1(dstNeighborSlot, srcProducerSlot, transferScratch, bytes)` (G1 / HW-DEP-0) writes the isolated local producer L1 slot into the resolved neighbor receive-ring slot. `transferScratch` exists only for the A3 GM-backed DMA pump; it is not an architectural source address. The operation is not self-synchronizing; the following `sync_hscb(READY)` publishes data-ready.
+- `sync_hscb(peerScb, absCount)` (V8 `SYNC_HSCB`/`ST_HSCB`, G2 — reused HSCB store + neighbor IPC_SCB addressing / HW-DEP-1) stores an absolute count into the peer's `ready_scb`, `free_scb`, or `close_scb`. The target kind and peer are resolved into `peerScb` by `RemoteScbPtr`.
+- `atom_add_hscb(peerScb, delta)` atomically increments a peer scoreboard for MPSC READY/FREE/CLOSE fan-in. The A3 mock lowers it to atomic s32 accumulation; the native facade maps to `__atom_add_hscb` and requires peer IPC_SCB targeting/wakeup support from the final WSE ISA.
+- `wait_ipc_scb(localScb, threshold, slot)` (V8 `WAIT_SPR`, G3 — reused IPC_SCB blocking wait) reads + blocks in **one** instruction: the entry reads the local IPC_SCB and proceeds if it is already `>= threshold`, else blocks the current pipe until the peer's `sync_hscb` store raises it. V8 dropped the V7 `MOV_SPR2X` non-blocking peek — there is no separate read step. The demo calls the `wait_ipc_scb_sim(..., maxSpins)` mock wrapper, which adds a spin-timeout fault sentinel so a handshake deadlock fails the test instead of hanging; the documented hardware interface is the void `wait_ipc_scb`.
 
-Payload address resolution (turning a local slot / scoreboard word into the same byte offset in a peer's GM window) is a plain runtime helper in the demo's `gridpipe_payload_inl.hpp` (`ResolvePeerSlotAddr` / `RemoteScbPtr`), not an intrinsic. TPOP's local drain reuses the existing local `copy_gm_to_ubuf` — the NoC is write-only, so there is deliberately **no cross-core read** of payload — guarded by the `GmSramArena` segment check `PopSlotIsLocal` so a mis-wired cross-segment read is rejected instead of silently serviced.
+Payload destination resolution (turning a local receive-ring slot / scoreboard word into the same byte offset in a peer's GM window) is a plain runtime helper in `gridpipe_payload_inl.hpp` (`ResolvePeerSlotAddr` / `RemoteScbPtr`), not an intrinsic. The source is separately fixed at `producerSlotBase`. TPOP's local drain reuses `copy_gm_to_ubuf`; the NoC is write-only, so there is deliberately **no cross-core read** of payload. `PopSlotIsLocal` rejects a mis-wired cross-segment read.
 
-Native lowering targets the real CCE HSCB/IPC_SCB stack (`__sync_hscb`/`__st_hscb`; `__builtin_cce___wait_ipc_scb`, or the closest-real `__wait_ast_scb`, for the blocking wait — the header exposes no blocking `WAIT_SPR` on IPC_SCB yet). The current A2/A3 mock stands in for those IPC_SCB scoreboards with GM words + cache maintenance. Once native hardware provides neighbor-IPC_SCB addressing (V8 HW-DEP-1) and the `COPY_UBUF_TO_NBR` builtin (V8 HW-DEP-0), GridPipe call sites do not change — flip `PTO_GRID_CCE_NATIVE` on and the facades route to the real builtins.
+Native lowering targets the real CCE HSCB/IPC_SCB stack. The compiler-facing copy builtin retains its historical `ubuf` spelling, but the facade always passes the dedicated unified-L1 producer address; the caller's tile address is never used as the NoC source mapping. The A3 mock represents scoreboards and both L1 ranges with GM plus cache maintenance.
 
-`TPUSH` waits the local `free_scb` with `wait_ipc_scb`, writes the payload slot, then publishes `prod_idx` to the downstream `ready_scb` with `sync_hscb`. `TPOP` waits the local `ready_scb`, reads the payload slot, then publishes `cons_idx` to the upstream `free_scb`.
+`TPUSH(pipe, tile, consId)` waits the selected local producer channel's `free_scb`, stages the tile in `producerSlotBase`, copies that L1 range to the independently selected consumer channel's ring, then publishes `prod_idx`. `TPOP(pipe, tile, prodId)` waits its local consumer channel's `ready_scb`, reads only that local receive ring, then publishes `cons_idx` to the negotiated producer channel's `free_scb` at the peer. The two channel indices need not be equal.
 
-### Group broadcast & reduce intrinsic (G4 / MOV_UBUF_GROUP)
+### Time-division MPSC relay counting
 
-On top of the three handshake facades (G1–G3), the same header exposes one group *data-movement* intrinsic, `mov_ubuf_group` — the unified single-instruction form of *both* a Tier-2 broadcast and a Tier-2 reduce. From the issuing core's perspective the two are the same action — move a `bytes`-sized UB tile to/from the resolved per-member group arena — so what distinguishes them is the NoC collective mode, a **runtime** operand rather than a second instruction. The 2026-07-23 design lowered these as a `bcast_ubuf_to_group<Group>` (G4 `BCAST_UBUF_TO_GROUP`) + `reduce_group_to_ubuf<Group,Op,T>` (G5 `REDUCE_GROUP_TO_UBUF`) pair; the 2026-07-24 merge folds both into one machine instruction and one template-free facade (`mov_ubuf_group`, the new-instruction count drops from "+2 +reuse 2" to "+1 +reuse 2"; design doc `2026-07-24-bcast-reduce-合并mov_ubuf_group方案.md`):
+The producer keeps one FSM entry per consumer (`UNBOUND`, `ACTIVE`, or `CLOSED`) plus a local producer-channel table (`UNBOUND`, `ACTIVE`, or producer-`CLOSED`). An `ACTIVE` consumer uses the normal TPUSH fast path. For an `UNBOUND` or `CLOSED` consumer, the producer first reserves an unused or producer-`CLOSED` local channel, waiting if none is available. It sends `[producer block id, local producer channel]` through the consumer's bind-request L1 line; it does not wait for the consumer to choose the producer-side resource.
 
-- `mov_ubuf_group(ubTile, groupSlotBase, bytes, memberCount, memberStride, op, eltype, rect, combineScratch, groupDesc)` (G4 `MOV_UBUF_GROUP`, **template-free** — the `Group`/`Op`/`T` template parameters are gone; `Group` is resolved by the Tier-2 caller into `groupSlotBase`/`memberCount` or `groupDesc`). `op` is a runtime `GridCollOp` that selects the NoC collective mode **and** implies the datapath direction:
-  - `op == COPY` — broadcast: this core is the **source**; its UB tile is replicated once into every member's slot (1→N fan-out, push). It is a byte-level pure copy (it does not read element values), so `eltype` is ignored — exactly the former `bcast_ubuf_to_group`.
-  - `op == SUM/MAX/MIN` — reduce: this core is the **sink**; it reads every member's contribution slot and folds them element-wise into UB (N→1 fan-in, pull). The combine must know the element width, so `eltype` (1/2/4 bytes) selects the combine granularity — exactly the former `reduce_group_to_ubuf`, with the template `T` replaced by the runtime `eltype` = `sizeof(T)` dispatch.
-  `GridCollOp` values are deliberately `comm::ReduceOp{Sum,Max,Min}` + 1, so the Tier-2 reduce caller maps with `static_cast<GridCollOp>(uint32_t(commOp) + 1)` (`COPY=0` stays reserved for broadcast). Not self-syncing: data-ready is still announced by the caller's `sync_hscb(READY)` after the publish fence. It folds members in **ascending** order (member 0 seeds `ubTile`), so an SPMD row/column fan-in reproduces the directional relay's left-to-right accumulation bit-for-bit (IEEE-754 add is commutative). On the A3 mock a reduce pulls each member GM→UB and runs an in-core `vadd`/`vmax`/`vmin` over a per-member `combineScratch` (required on the mock, ignored for `COPY` and on native/`__CPU_SIM`). The three-state body is byte-identical to the former two facades — only the template `T`/`Op` became the runtime `eltype`/`op` switch — so behavior is bit-exact by construction.
+The consumer independently scans its receive channels, preferring never-used entries and otherwise requiring `close_scb > closeBaseline` and `cons_idx >= close_scb` so the old producer has closed and its final item has drained. It returns `[ready_scb baseline, consumer channel, completion]` through the producer's response L1 line and writes its current `cons_idx` into `free_scb[producer channel]`. `completion` is written last; the producer polls only that explicit field, then MOVs the ready baseline into `prod_idx` and records the local-producer-channel ↔ remote-consumer-channel mapping. Counts are absolute overwrite values and continue monotonically on each consumer ring across producer turns; they are not increments and no SCB is reset.
 
-`GRID_TBROADCAST`'s per-member copy loop now **collapses to one** `mov_ubuf_group(..., op=COPY, eltype=1)` whenever the group's receive slots form a uniform-stride arena — ROW and COL always do (consecutive ranks → `memberStride = resolved slot₁ − slot₀`); a SUBRECT is uniform when it is a single row/column, otherwise the multi-row rectangle falls back to the per-member `copy_ubuf_to_neighbor_ubuf` loop. The `treduce` ReduceSum's EAST (row) and SOUTH (column) phases fan in at the sink (`col == gridCols-1` / `row == gridRows-1`) via `GRID_TREDUCE_GROUP_IMPL<ROW/COL, Sum, float>`, which lowers to `mov_ubuf_group(..., op=SUM, eltype=sizeof(float))` — a genuine N→1 fan-in, a different collective *shape* from the directional `TREDUCE<Op>` relay that the `tpush` ReduceSum example spells out as `TPOP` + `TADD` + `TPUSH`. The Tier-2 facades (`GRID_TBROADCAST` / `GRID_TREDUCE_GROUP_IMPL`) keep their `<Group[,Op,T]>` templates — that structural info lives in the PTO layer, not the CCE instruction layer — but they are tile-agnostic, so the payload hook `TileUbPtr<T>` (in `gridpipe_payload_inl.hpp`) extracts the tile's `__ubuf__` pointer to hand to the intrinsic.
+The public A2/A3 API is `TPUSH(pipe, tile, consId, isLastTransfer, events...)`; omitting the Boolean is equivalent to `isLastTransfer == false`. Set it to `true` only on the last tile of that producer→consumer turn. The final TPUSH publishes the same absolute count to the remote consumer channel's `close_scb` after payload and READY, then transitions both that consumer FSM entry and the local producer channel to `CLOSED`. This is time-division MPSC: only one bind request may target a consumer at a time.
+
+### Group broadcast and reduce data movement
+
+The group COPY and reduce modes share the native group opcode, but their facades keep the local address contract explicit:
+
+- `copy_l1_to_group(srcProducerSlot, groupSlot, transferScratch, ...)` is the broadcast path. It fans out from the isolated producer L1 slot; the A3 mock expands the operation per member, while native still emits one group COPY.
+- `mov_ubuf_group(..., op=SUM/MAX/MIN, ...)` is the current group-reduce path. The sink reads each member contribution and folds members in ascending block-id order, preserving relay accumulation order.
+
+`GRID_TBROADCAST` stages once, then uses `copy_l1_to_group` for an affine group arena or per-member `copy_l1_to_neighbor_l1` otherwise. Its aggregate SPR barrier waits for the full declared producer set before any rank slot is drained. Group `TREDUCE` is called by every member: contributors atomically publish READY/CLOSE, the sink waits for all `N-1`, lowers SUM/MAX/MIN to `mov_ubuf_group`, and returns atomic FREE credits. It is distinct from the peer-id TPOP + TADD + TPUSH relay.
 
 ### fp32 reduction
 
-The reduce slot carries fp32 `[T, H]`, so `FFN_SLOT_BYTES = T * H * 4`. This keeps `downPartial`, `yOutput`, and `golden.bin` in fp32 for direct tolerance-based comparison. The ReduceSum reduce is H-chunked (`FFN_RS_REDUCE_SLOT_COUNT = kHSegs` = 7, one slot per H-segment): the `treduce` example folds the segment-h partials with `GRID_TREDUCE_GROUP_IMPL` at the sink, while the `tpush` example relays them hop-by-hop with `TPOP` + `TADD` + `TPUSH`. In the relay form the slot count must equal `kHSegs` — reusing slots across segments deadlocks on the cross-segment *free* doorbell.
+The reduce slot carries fp32 `[T, H]`, so `FFN_SLOT_BYTES = T * H * 4`. This keeps `downPartial`, `yOutput`, and `golden.bin` in fp32 for direct tolerance-based comparison. The ReduceSum reduce is H-chunked (`kHSegs` = 7): the `treduce` example reads symmetric per-cell segment storage under the dedicated aggregate-SPR handshake, while the `tpush` example relays segments hop-by-hop with peer-id TPOP + TADD + TPUSH. Phase B and C keep their collective counters monotone in the persistent window; no SCB is reset.
 
-### Routed K-hop unicast
+### Peer-id unicast
 
-Declaring the pipe as `GridPipe<Tile, dir, …, dist>` extends the nearest-neighbor pipe to a routed unicast `dist` hops along `dir` (Scheme A); the `TPUSH` / `TPOP` call sites do not change. The payload write resolves the slot in the `dist`-hop neighbor's segment, and the ready/free scoreboard stores are routed to the `dist`-hop peer's IPC_SCB (resolved via `RemoteScbPtr`) and issued through `sync_hscb`, so the receiver `dist` hops downstream pops the tile with no relays in between. `dist == 1` reproduces the original nearest-neighbor behavior. Fan-in stays 1 (one upstream per direction/distance), so no slot/flag expansion is needed.
+Unicast direction is derived by the schedule, not encoded in the instruction type. TPUSH receives the destination logical block id (`consId`), TPOP receives the source logical block id (`prodId`), and `RemoteScbPtr` resolves the symmetric slot/SCB offset in that peer's window. This keeps one GridPipe usable when the peer changes between phases.
 
 ### Concurrent group broadcast (TBROADCAST)
 
-`TBROADCAST` (`ROW` or `COL` as the first template argument) broadcasts a cell's tile to every other cell in its row (`ROW`) or column (`COL`) as one op: the per-target writes into each receiver's shared ring are batched with no inter-target fence, the whole broadcast pays a single publish fence, then per-source ready lanes fire. It is not lowered to a per-hop `TPUSH` loop.
+`TBROADCAST<GridGroup>` (`ROW`, `COL`, or `SUBRECT`) broadcasts a cell's tile to every other group member as one op: per-target writes into rank-indexed receiver slots are batched with no inter-target fence, the whole broadcast pays one publish fence, then aggregate ready/close SPRs are atomically incremented. It is not lowered to a per-hop `TPUSH` loop.
 
-Unlike the old single-source `TPUSH<GridSpan>` multicast (fan-in 1, which forbade concurrent senders), `TBROADCAST` is a 真·同时 MPSC channel (design doc `Grid_TPUSH_TPOP_WSE核间握手机制选型 §4 方案②·前缀偏移`): every member of the group may call it at the same instant. Each source writes only its own prefix-offset slot in each receiver's shared ring and rings only its own per-source ready lane, so K concurrent senders never clobber a shared counter. This is what makes the AllGather-of-shards ("every AICORE broadcasts its own shard") correct. Receivers drain member `srcRank`'s shard with `TPOP(pipe, tile, srcRank)` (ascending srcRank, so the directed free-notification chain advances with consumption). The per-member payload fan-out itself collapses to a single `mov_ubuf_group` intrinsic when the group is a uniform-stride arena (see [Group broadcast & reduce intrinsic](#group-broadcast--reduce-intrinsic-g4--mov_ubuf_group)). See `Grid_TPUSH_TBROADCAST_TREDUCE_接口设计说明.md` for the full handshake.
+Unlike the old single-source `TPUSH<GridSpan>` multicast, every group member may call `TBROADCAST` simultaneously. Payload writes cannot conflict because `BcastSlotCount >= GroupMax` gives each source a disjoint rank slot. Signal writes do target the same receiver SPR, so atomic accumulation is mandatory. Before draining, a caller sets `pipe.SetBcastExpectedProducerCount(K)` (`K=groupSize-1` for AllGather, `K=1` for the smoke); every TPOP in that round waits the same complete-set READY/CLOSE barrier, reads one distinct source slot, and atomically returns FREE to that source. All participants in a group must be resident in the same hardware wave, because `WAIT_SPR` cannot make progress if a required producer has not been scheduled.
 
 ### GridPipe smoke tests
 
-The two capabilities above each have a Vec-only data-movement smoke test under `smoke/` (no Cube, no matmul, no data files; in-process verification on the same GM-backed mock as the FFN demos):
-
-- `khop_smoke` — a `1 x cols` row; each cell pushes a stamped fp32 `[T, W]` tile `DIST` hops east, the receiver pops and stores it; the host checks `out[c] == in[c-DIST]`.
-- `bcast_smoke` — one source cell (`--src`) broadcasts its stamped tile to its whole row (or column with `--span-col 1`) via `TBROADCAST`; every other cell drains it with `TPOP(pipe, tile, src)` and stores it; the host checks `out[cell] == in[source]`. The default 1x5 row with the source at col 2 exercises receivers on both sides of the source in one run.
+`bcast_smoke` is a Vec-only data-movement smoke test (no Cube, no matmul, no data files) on the same GM-backed mock. One source cell broadcasts a stamped fp32 `[T, W]` tile to its row, column, or sub-rectangle; each receiver drains and stores it, and the host checks `out[cell] == in[source]`.
 
 ### AllGather variant
 
@@ -264,13 +248,11 @@ On a shared host, wrap each run in `task-submit` (e.g. `task-submit bash run_tre
 ### GridPipe smoke tests
 
 ```bash
-# Routed K-hop unicast: 1x4 row, shift-by-2
-bash smoke/run_khop_smoke.sh -r npu -v Ascend910B1 --device-id 0 --grid-cols 4 --dist 2
 # Single-source broadcast: 1x5 row, source at col 2 (use --span-col 1 + Rx1 grid for a column broadcast)
 bash smoke/run_bcast_smoke.sh -r npu -v Ascend910B1 --device-id 0 --grid-cols 5 --src 2
 ```
 
-Both accept `--build-only` and need no data generation.
+The smoke script accepts `--build-only` and needs no data generation.
 
 ### Common arguments
 
@@ -288,7 +270,7 @@ Both accept `--build-only` and need no data generation.
 --build-only        build only; skip data generation and execution
 ```
 
-The smoke scripts reuse `-r/-v/-d`, `--grid-rows/--grid-cols`, `--token-tile/--model-tile` (tile `[T, W]`), and `--build-only`; `run_khop_smoke.sh` adds `--dist` (hop count, default 2). `run_bcast_smoke.sh` adds `--src` (source index, default 2), `--span-col` (1 = column group, default 0 = row group), and `--subrect` (1 = sub-rectangle group, default 0) with `--rect-r0/r1/c0/c1` / `--rect-src` to scope the rectangle.
+The broadcast smoke script reuses `-r/-v/-d`, `--grid-rows/--grid-cols`, `--token-tile/--model-tile` (tile `[T, W]`), and `--build-only`; it adds `--src`, `--span-col`, and `--subrect` with `--rect-r0/r1/c0/c1` / `--rect-src` to scope a sub-rectangle.
 
 ## Expected Result
 
@@ -304,6 +286,5 @@ On success, each FFN executable prints its bit-exact verdict:
 The smoke tests print:
 
 ```text
-[SUCCESS] GridPipe K-hop unicast smoke PASS.
 [SUCCESS] GridPipe single-source broadcast smoke PASS.
 ```

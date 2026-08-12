@@ -306,23 +306,13 @@ static const char* GridPipeFaultName(uint32_t code)
 {
     switch (code) {
         case 0x101:
-            return "push north boundary";
-        case 0x102:
-            return "push east boundary";
-        case 0x103:
-            return "push west boundary";
-        case 0x104:
-            return "push south boundary";
-        case 0x105:
-            return "push source boundary";
+            return "push peer outside the mesh";
+        case 0x106:
+            return "push peer has no bound channel";
         case 0x201:
-            return "pop north boundary";
-        case 0x202:
-            return "pop east boundary";
-        case 0x203:
-            return "pop west boundary";
-        case 0x204:
-            return "pop south boundary";
+            return "pop peer outside the mesh";
+        case 0x206:
+            return "pop peer has no bound channel";
         case 0x205:
             return "pop non-local segment";
         case 0x301:
@@ -335,48 +325,78 @@ static const char* GridPipeFaultName(uint32_t code)
             return "pop payload window out of slot range";
         case 0x403:
             return "broadcast payload window out of slot range";
+        case 0x501:
+            return "consumer binding history full";
+        case 0x502:
+            return "no channel bound on this pipe";
+        case 0x503:
+            return "relay counters unavailable";
+        case 0x504:
+            return "bind request timeout";
+        case 0x505:
+            return "bind response timeout";
+        case 0x506:
+            return "no reusable channel became available";
+        case 0x507:
+            return "invalid bind-handshake state";
+        case 0x508:
+            return "consumer channel received an early duplicate bind";
+        case 0x509:
+            return "no local producer channel became available";
         default:
             return "unknown";
     }
 }
 
-// Scan every PIPE's flag header in one arena for fault sentinels (any word
-// >= 0x100).  A cell's window holds FFN_NCUT_RELAY_PIPE_COUNT pipe windows
-// (forward channel, then backward), each opening with its own 128 B header of
-// ready/free scoreboards + reserved fault words.
-static bool CheckArenaFaults(void* arenaDev, int winBytes, int pipeWinBytes, int cells, const char* arenaName)
+// Scan one arena's fixed ready/free/close scoreboard header for fault sentinels.
+static bool CheckArenaFaults(void* arenaDev, int winBytes, int cells, const char* arenaName)
 {
     constexpr size_t kFlagWords = static_cast<size_t>(FFN_NCUT_GRID_FLAGS_BYTES) / sizeof(uint32_t);
-    constexpr int kPipesPerCell = FFN_NCUT_RELAY_PIPE_COUNT;
-    std::vector<uint32_t> flags(static_cast<size_t>(cells) * kPipesPerCell * kFlagWords, 0);
+    // Fault sentinels live at word kFaultFlagWordOffset of each scoreboard's own
+    // cache line; the scoreboard word itself holds a monotone count that would read
+    // as a code once a run gets long enough, so scan only the sentinel words.
+    constexpr size_t kScbLineWords = 64 / sizeof(uint32_t); // grid_mock::kScbLineStrideU32
+    constexpr size_t kFaultWordInLine = 10;                 // grid_mock::kFaultFlagWordOffset
+    constexpr size_t kScbLines = kFlagWords / kScbLineWords;
+    std::vector<uint32_t> flags(static_cast<size_t>(cells) * kFlagWords, 0);
     for (int cell = 0; cell < cells; ++cell) {
-        for (int p = 0; p < kPipesPerCell; ++p) {
-            auto* src = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes +
-                        static_cast<size_t>(p) * pipeWinBytes;
-            auto* dst = flags.data() + (static_cast<size_t>(cell) * kPipesPerCell + p) * kFlagWords;
-            if (aclrtMemcpy(
-                    dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t),
-                    ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-                std::cerr << "[ERROR] GridPipe flag D2H failed (" << arenaName << " cell " << cell << " pipe " << p
-                          << ")" << std::endl;
-                return false;
-            }
+        auto* src = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes;
+        auto* dst = flags.data() + static_cast<size_t>(cell) * kFlagWords;
+        if (aclrtMemcpy(
+                dst, kFlagWords * sizeof(uint32_t), src, kFlagWords * sizeof(uint32_t), ACL_MEMCPY_DEVICE_TO_HOST) !=
+            ACL_SUCCESS) {
+            std::cerr << "[ERROR] GridPipe flag D2H failed (" << arenaName << " cell " << cell << ")" << std::endl;
+            return false;
         }
     }
     bool ok = true;
     for (int cell = 0; cell < cells; ++cell) {
         int row = cell / FFN_NCUT_COLS;
         int col = cell - row * FFN_NCUT_COLS;
-        for (int p = 0; p < kPipesPerCell; ++p) {
-            const uint32_t* pipeFlags = flags.data() + (static_cast<size_t>(cell) * kPipesPerCell + p) * kFlagWords;
-            for (size_t i = 0; i < kFlagWords; ++i) {
-                uint32_t value = pipeFlags[i];
-                if (value >= 0x100U) {
-                    std::cerr << "[ERROR] GridPipe fault " << arenaName << " cell=" << cell << " row=" << row
-                              << " col=" << col << " pipe=" << p << " word=" << i << " code=0x" << std::hex << value
-                              << std::dec << " (" << GridPipeFaultName(value) << ")" << std::endl;
-                    ok = false;
+        const uint32_t* cellFlags = flags.data() + static_cast<size_t>(cell) * kFlagWords;
+        for (size_t line = 0; line < kScbLines; ++line) {
+            const size_t i = line * kScbLineWords + kFaultWordInLine;
+            uint32_t value = cellFlags[i];
+            if (value >= 0x100U) {
+                std::cerr << "[ERROR] GridPipe fault " << arenaName << " cell=" << cell << " row=" << row
+                          << " col=" << col << " word=" << i << " code=0x" << std::hex << value << std::dec << " ("
+                          << GridPipeFaultName(value) << ")" << std::endl;
+                // The pipe record is what the binding decisions were made from, so
+                // dump its leading words alongside: curConsChan+1, prevProd+1,
+                // consCur+1, consUsed, then incoming producer ids and bind counts.
+                std::vector<uint32_t> rec(FFN_GRID_RECORD_WORDS, 0);
+                auto* recSrc = reinterpret_cast<uint8_t*>(arenaDev) + static_cast<size_t>(cell) * winBytes +
+                               FFN_GRID_FLAGS_BYTES + FFN_GRID_CONTROL_BYTES;
+                if (aclrtMemcpy(
+                        rec.data(), rec.size() * sizeof(uint32_t), recSrc, rec.size() * sizeof(uint32_t),
+                        ACL_MEMCPY_DEVICE_TO_HOST) == ACL_SUCCESS) {
+                    std::cerr << "[ERROR]   record:";
+                    for (size_t w = 0; w < 4 + 2 * static_cast<size_t>(FFN_GRID_CHAN_MAX); ++w) {
+                        std::cerr << " [" << w << "]=" << rec[w];
+                    }
+                    std::cerr << std::endl;
                 }
+                ok = false;
             }
         }
     }
@@ -385,8 +405,8 @@ static bool CheckArenaFaults(void* arenaDev, int winBytes, int pipeWinBytes, int
 
 static bool CheckGridPipeFaults(DeviceResources& r)
 {
-    return CheckArenaFaults(r.p1_windows_dev, FFN_NCUT_TPUSH_WIN_P1, FFN_NCUT_TPUSH_PIPE_WIN_P1, r.cells, "P1") &&
-           CheckArenaFaults(r.p2_windows_dev, FFN_NCUT_TPUSH_WIN_P2, FFN_NCUT_TPUSH_PIPE_WIN_P2, r.cells, "P2");
+    return CheckArenaFaults(r.p1_windows_dev, FFN_NCUT_TPUSH_WIN_P1, r.cells, "P1") &&
+           CheckArenaFaults(r.p2_windows_dev, FFN_NCUT_TPUSH_WIN_P2, r.cells, "P2");
 }
 
 static bool VerifyOutput(DeviceResources& r)

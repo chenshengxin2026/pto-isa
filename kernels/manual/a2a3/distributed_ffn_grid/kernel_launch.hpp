@@ -21,8 +21,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //
 // ReduceSum pattern (I split across all 32 cells, x broadcast, full-H down partial
 // per cell, partials reduced EAST 8-way then SOUTH 4-way):
-//   - TREDUCE  : the fused TREDUCE<Dir, Sum> collective.
-//   - TPUSH    : the explicit TPOP<Dir> + TADD + TPUSH<Dir> lowering of TREDUCE.
+//   - TREDUCE  : the fused TREDUCE<GridGroup, Sum> collective.
+//   - TPUSH    : explicit peer-id TPOP + TADD + TPUSH with time-division rebinding.
 //
 // AllGather pattern (I split across all 32 cells, hidden AllGathered before down):
 //   - TBROADCAST : the TBROADCAST<GridGroup> MPSC collective (every cell broadcasts).
@@ -42,8 +42,8 @@ void launchDistributedFfnGridTpushReduceSumMixedKernel(
     uint8_t* upPartialBuf, uint8_t* hiddenBuf, uint8_t* hcclCtx, int phase, int rowStart, int colStart, int waveCols,
     int gridRows, int gridCols, int blockCount, void* stream);
 
-// --- AllGather pattern: TBROADCAST variant (MPSC group broadcast).  Each ready/
-//     free lane owns a full cache line (kBcastLaneStride), so the MPSC gather no
+// --- AllGather pattern: TBROADCAST variant (MPSC group broadcast).  Its shared
+//     ready/free/close SPRs use atomic accumulation, so the vec-only gather no
 //     longer needs a cube keep-alive (doneFlags removed). ---
 void launchDistributedFfnGridTbroadcastAllGatherMixedKernel(
     uint8_t* ffts, uint8_t* p1Window, uint8_t* p2Window, uint8_t* xFull, uint8_t* wGateShards, uint8_t* wUpShards,

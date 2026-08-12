@@ -13,11 +13,11 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // Same pure-1D-N-cut topology and compute as the TREDUCE ReduceSum variant, but
 // the EAST(8-way)+SOUTH(4-way) reduction is spelled with the explicit TPUSH/TPOP
 // unicast primitives instead of the fused TREDUCE collective.  This is the exact
-// A3 lowering of TREDUCE<Dir, Sum> documented in GridTReduce.hpp
+// A3 lowering of TREDUCE<Sum> documented in GridTReduce.hpp
 // (GRID_TREDUCE_IMPL): a fan-in-1 chain where each cell
-//   - TPOP<Dir>  the transiting partial from its upstream neighbor,
+//   - TPOP(prodId)  the transiting partial from its upstream neighbor,
 //   - TADD       folds it into its own running partial, then
-//   - TPUSH<Dir> forwards the running partial to its downstream neighbor.
+//   - TPUSH(consId) forwards the running partial to its downstream neighbor.
 // The sink (no downstream) keeps the complete reduction.  Verifying it here
 // proves TPUSH/TPOP are functionally correct end-to-end on a real distributed-FFN
 // ReduceSum, bit-exact against the same SwiGLU golden the TREDUCE variant uses.
@@ -38,6 +38,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "common.hpp"
 #include "ffn_config.hpp"
 #include "gridpipe_payload_inl.hpp"
+#include "single_vector_sync_inl.hpp"
 #include "tpipe_tmov_inl.hpp"
 
 #ifdef __CCE_AICORE__
@@ -69,14 +70,14 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-// The reduce chain runs EAST (row) then SOUTH (col).  Those are two different
-// (producer, consumer) pairs, so they are two pipes -- and their windows must be
-// disjoint, or the col phase would start on the ready/free counts the row phase
-// left behind (see FFN_RS_REDUCE_PIPE_WIN in ffn_config.hpp).
-using FfnReduceRowPipe =
-    GridPipe<ReduceSegTile, GridDirection::EAST, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT>;
-using FfnReduceColPipe =
-    GridPipe<ReduceSegTile, GridDirection::SOUTH, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT>;
+// EAST and SOUTH are different producer turns over one channel.  CLOSE and the
+// relay-count bind handshake carry its absolute sequence across the launch boundary.
+constexpr int kFfnReduceChanCount = FFN_RS_REDUCE_CHAN_COUNT;
+using FfnReducePipe =
+    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceChanCount>;
+static_assert(
+    a2a3_grid::WindowBytes<FfnReducePipe>() == static_cast<uint32_t>(FFN_RS_REDUCE_WIN),
+    "FFN ReduceSum host/device GridPipe window layouts must match");
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
 
@@ -131,31 +132,34 @@ AICORE inline void RsCubeGemmFill(
     }
 }
 
-// One TPUSH reduce hop along the pipe's direction (the explicit A3 lowering of
-// TREDUCE<Sum>).  `seg` is in/out -- on entry this cell's local partial, on
-// return the running sum up to and including this cell (at the sink, the complete
-// result).  `recv` is the landing tile for the transiting partial.  The hop's
-// peers are the pipe's bound producer/consumer (Dist == 1 = nearest neighbor).
+// One TPUSH reduce hop (the explicit A3 lowering of TREDUCE<Sum>).  `seg` is
+// in/out -- on entry this cell's local partial, on return the running sum up to and
+// including this cell (at the sink, the complete result).  `recv` is the landing
+// tile for the transiting partial.  `prodId` / `consId` are the two peers of the
+// hop; kGridNoPeer on either side is what makes this cell a source or a sink, so
+// the boundary test that used to be CanPopK / CanPushK is now just "is that a real
+// core".  The first TPUSH/TPOP on a turn performs the lazy dual-channel bind.
 template <typename Pipe, typename TileAcc, typename TileRecv>
-AICORE inline void TpushReduceHop(Pipe& pipe, TileAcc& seg, TileRecv& recv)
+AICORE inline void TpushReduceHop(
+    Pipe& pipe, uint32_t prodId, uint32_t consId, TileAcc& seg, TileRecv& recv, bool isLastTransfer)
 {
-    // Receive-and-combine half.  A source cell (no producer peer) has nothing to
-    // drain and forwards its own contribution unchanged.
-    if (pipe.HasProducer()) {
-        TPOP(pipe, recv);
+    // Receive-and-combine half.  A source cell has nothing to drain and forwards
+    // its own contribution unchanged.
+    if (pto::GridBlockIdValid(prodId, pipe.shape)) {
+        TPOP(pipe, recv, prodId);
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
         dsb(DSB_DDR);
         TADD(seg, seg, recv);
     }
-    // Forward half.  A sink cell (no consumer peer) keeps the complete sum.
-    if (pipe.HasConsumer()) {
+    // Forward half.  A sink cell keeps the complete sum.
+    if (pto::GridBlockIdValid(consId, pipe.shape)) {
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
         dsb(DSB_DDR);
-        TPUSH(pipe, seg);
+        TPUSH(pipe, seg, consId, isLastTransfer);
     }
 }
 
@@ -177,7 +181,6 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
     if (cell < 0 || cell >= gridRows * gridCols) {
         return;
     }
-
     using pto::GridDirection;
 
     // =========================== phase A: gate + up + SwiGLU + down ===========================
@@ -190,6 +193,16 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
         __gm__ uint8_t* gatePartialBlock = gatePartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* upPartialBlock = upPartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* hiddenBlock = hiddenBuf + cell * FFN_NCUT_HIDDEN_SHARD_BYTES;
+
+        if constexpr (DAV_VEC) {
+            if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+                // AIV1 only supplies the mode-2 C2V/V2C control signals. AIV0
+                // alone performs the activation, data movement, and later Grid work.
+                FfnInactiveVectorC2vV2cHandshake<GatePipe, UpPipe, HiddenPipe>(
+                    gatePartialBlock, upPartialBlock, hiddenBlock);
+                return;
+            }
+        }
 
         if constexpr (DAV_CUBE) {
             GateAccTile cGate;
@@ -366,17 +379,28 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
         return;
     }
 
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            return;
+        }
+    }
+
     // =========================== phase B: EAST 8-way reduce (row, H-chunked, TPUSH) ===========================
     if (phase == 1) {
         if constexpr (DAV_VEC) {
             __gm__ uint8_t* partialBlock = partialBuf + cell * FFN_RS_PARTIAL_BYTES;
             __gm__ uint8_t* rowPartialBlock = rowPartialBuf + row * FFN_RS_ROW_PARTIAL_BYTES; // sink (col 7) writes
             __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
-            FfnReduceRowPipe reducePipe; // EAST channel: this phase's window region is the first
+            FfnReducePipe reducePipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
             a2a3_grid::InitGridPipeFromWindow(
                 reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
+
+            // The first TPUSH/TPOP pair performs the producer-id + dual-channel
+            // relay-count handshake and binds the only producer/consumer pair.
+            const uint32_t eastProd = pto::GridPeerBlockIdForPop(GridDirection::EAST, coord, shape);
+            const uint32_t eastCons = pto::GridPeerBlockIdForPush(GridDirection::EAST, coord, shape);
 
             ReduceSegTile seg;
             ReduceSegTile recv;
@@ -393,7 +417,7 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
 #endif
                 // Fused receive-add-forward along EAST as explicit TPOP+TADD+TPUSH;
                 // sink (col 7) keeps the row sum.
-                TpushReduceHop(reducePipe, seg, recv);
+                TpushReduceHop(reducePipe, eastProd, eastCons, seg, recv, h + 1 == kHSegs);
 #ifndef __PTO_AUTO__
                 pipe_barrier(PIPE_ALL);
 #endif
@@ -420,14 +444,17 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
         if constexpr (DAV_VEC) {
             __gm__ uint8_t* rowPartialBlock = rowPartialBuf + row * FFN_RS_ROW_PARTIAL_BYTES;
             __gm__ uint8_t* window = reduceWindow + cell * FFN_RS_REDUCE_WIN;
-            // SOUTH channel: its own pipe on the SECOND window region, so it starts
-            // from zeroed scoreboards rather than the row phase's leftovers.
-            FfnReduceColPipe reducePipe;
+            FfnReducePipe reducePipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
             a2a3_grid::InitGridPipeFromWindow(
-                reducePipe, shape, coord, window + FFN_RS_REDUCE_PIPE_WIN, reinterpret_cast<__gm__ void*>(hcclCtxRaw),
-                /*pipeId=*/1);
+                reducePipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw), /*pipeId=*/0);
+
+            // SOUTH is a different producer turn over the same physical channel.
+            // The phase-B final TPUSH closed it, so the first SOUTH transfer
+            // performs the relay-count handshake before moving payload.
+            const uint32_t southProd = pto::GridPeerBlockIdForPop(GridDirection::SOUTH, coord, shape);
+            const uint32_t southCons = pto::GridPeerBlockIdForPush(GridDirection::SOUTH, coord, shape);
 
             ReduceSegTile seg;
             ReduceSegTile recv;
@@ -442,7 +469,7 @@ __global__ AICORE void DistributedFfnGridTpushReduceSumMixedKernel(
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 #endif
-                TpushReduceHop(reducePipe, seg, recv);
+                TpushReduceHop(reducePipe, southProd, southCons, seg, recv, h + 1 == kHSegs);
 #ifndef __PTO_AUTO__
                 pipe_barrier(PIPE_ALL);
 #endif
@@ -492,10 +519,9 @@ void launchDistributedFfnGridTpushReduceSumMixedKernel(
     uint8_t* upPartialBuf, uint8_t* hiddenBuf, uint8_t* hcclCtx, int phase, int rowStart, int colStart, int waveCols,
     int gridRows, int gridCols, int blockCount, void* stream)
 {
-    if (blockCount <= 0) {
-        return;
+    if (blockCount > 0) {
+        DistributedFfnGridTpushReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
+            ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
+            gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
     }
-    DistributedFfnGridTpushReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
-        ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
-        gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
 }

@@ -278,6 +278,12 @@ static bool Verify(Resources& r)
 static bool CheckFaults(Resources& r)
 {
     constexpr size_t kFlagWords = static_cast<size_t>(BCAST_GRID_FLAGS_BYTES) / sizeof(uint32_t);
+    // Fault sentinels live at word kFaultFlagWordOffset of each scoreboard's own
+    // cache line; the scoreboard word itself holds a monotone count that would read
+    // as a code once a run gets long enough, so scan only the sentinel words.
+    constexpr size_t kScbLineWords = 64 / sizeof(uint32_t); // grid_mock::kScbLineStrideU32
+    constexpr size_t kFaultWordInLine = 10;                 // grid_mock::kFaultFlagWordOffset
+    constexpr size_t kScbLines = kFlagWords / kScbLineWords;
     std::vector<uint32_t> flags(r.cells * kFlagWords, 0);
     for (size_t cell = 0; cell < r.cells; ++cell) {
         auto* src = reinterpret_cast<uint8_t*>(r.windows_dev) + cell * BCAST_WINDOW_BYTES;
@@ -292,7 +298,8 @@ static bool CheckFaults(Resources& r)
     bool ok = true;
     for (size_t cell = 0; cell < r.cells; ++cell) {
         const uint32_t* cf = flags.data() + cell * kFlagWords;
-        for (size_t i = 0; i < kFlagWords; ++i) {
+        for (size_t line = 0; line < kScbLines; ++line) {
+            const size_t i = line * kScbLineWords + kFaultWordInLine;
             if (cf[i] >= 0x100U) {
                 std::cerr << "[ERROR] GridPipe fault cell=" << cell << " flagWord=" << i << " code=0x" << std::hex
                           << cf[i] << std::dec << std::endl;

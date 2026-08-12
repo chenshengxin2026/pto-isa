@@ -55,16 +55,37 @@ constexpr int FFN_SLOT_COUNT = 4;
 
 // Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>().
 // Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp:
-//   unicast layout = kFlagsBytes (512) + 5 dirs * SlotCount * SlotBytes.
+//   receive layout = kSlotRegionOffset + ChanCount * SlotCount * SlotBytes,
+// where the fixed header is
+//   kFlagsBytes       = 3 * kGridChanCount * kScbLineStride  (ready/free/close,
+//                       full cache line each -- a different remote writer per word)
+//   kSlotRegionOffset = kFlagsBytes + 2 control lines + kRecordBytes  (the LOCAL pipe record: the
+//                       binding table + consumer history + dual channel maps/states,
+//                       which no peer ever writes, rounded up to a cache line)
 // The AllGather variant additionally appends the TBROADCAST (scheme-②) region:
 //   + BcastSlotCount * SlotBytes   (shared payload ring)
-//   + 2 * GroupMax * 4             (per-source ready lanes + free lanes)
 // because each cell broadcasts its own hidden shard concurrently (真·同时 MPSC)
-// and the per-receiver shared ring + per-source lanes live in every window.
-constexpr int FFN_GRID_DIRECTION_COUNT = 5;
-constexpr int FFN_GRID_FLAGS_BYTES = 512;
-constexpr int FFN_GRID_UNICAST_WINDOW_BYTES =
-    FFN_GRID_FLAGS_BYTES + FFN_GRID_DIRECTION_COUNT * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
+// and the per-receiver shared ring lives in every window.  Notification reuses
+// one fixed ready/free/close SPR triplet and adds no payload-region bytes.
+// Every layout finally appends one SlotBytes producer L1 staging slot, after all
+// receive-side regions, so outbound source data cannot alias a payload ring.
+constexpr int FFN_GRID_CHAN_MAX = 4;         // pto::kGridChanCount
+constexpr int FFN_GRID_CONS_HIST_MAX = 8;    // pto::kGridConsHistMax
+constexpr int FFN_GRID_SCB_LINE_STRIDE = 64; // pto::grid_mock::kScbLineStride
+constexpr int FFN_ACTIVE_VECTOR_SUBBLOCK_ID = 0;
+constexpr int FFN_GRID_FLAGS_BYTES = 3 * FFN_GRID_CHAN_MAX * FFN_GRID_SCB_LINE_STRIDE; // 768
+constexpr int FFN_GRID_CONTROL_BYTES = 2 * FFN_GRID_SCB_LINE_STRIDE;                   // request + response L1 lines
+// pto::kGridRecordWords = header + 8 channel arrays + 4 consumer-history arrays + current producer channel + scratch.
+constexpr int FFN_GRID_RECORD_WORDS = 4 + 8 * FFN_GRID_CHAN_MAX + 4 * FFN_GRID_CONS_HIST_MAX + 2; // 70
+constexpr int FFN_GRID_RECORD_BYTES =
+    ((FFN_GRID_RECORD_WORDS * 4 + FFN_GRID_SCB_LINE_STRIDE - 1) / FFN_GRID_SCB_LINE_STRIDE) *
+    FFN_GRID_SCB_LINE_STRIDE; // 320
+constexpr int FFN_GRID_SLOT_REGION_OFFSET =
+    FFN_GRID_FLAGS_BYTES + FFN_GRID_CONTROL_BYTES + FFN_GRID_RECORD_BYTES; // 1216
+constexpr int FFN_GRID_CHAN_COUNT = FFN_GRID_CHAN_MAX;                     // legacy demo pipe: the default full array
+constexpr int FFN_GRID_RECEIVE_REGION_BYTES =
+    FFN_GRID_SLOT_REGION_OFFSET + FFN_GRID_CHAN_COUNT * FFN_SLOT_COUNT * FFN_SLOT_BYTES;
+constexpr int FFN_GRID_UNICAST_WINDOW_BYTES = FFN_GRID_RECEIVE_REGION_BYTES + FFN_SLOT_BYTES;
 #ifdef CONFIG_FFN_GRID_ALLGATHER
 // Largest group this grid forms (a row or a column) = max(rows, cols).  Each
 // member owns one prefix-offset slot, so the shared ring carries one slot per
@@ -72,8 +93,8 @@ constexpr int FFN_GRID_UNICAST_WINDOW_BYTES =
 constexpr int FFN_GRID_GROUP_MAX = (FFN_GRID_ROWS > FFN_GRID_COLS) ? FFN_GRID_ROWS : FFN_GRID_COLS;
 constexpr int FFN_BCAST_SLOT_COUNT = FFN_GRID_GROUP_MAX;
 constexpr int FFN_BCAST_REGION_BYTES =
-    FFN_BCAST_SLOT_COUNT * FFN_SLOT_BYTES + 2 * FFN_GRID_GROUP_MAX * static_cast<int>(sizeof(uint32_t));
-constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_UNICAST_WINDOW_BYTES + FFN_BCAST_REGION_BYTES;
+    FFN_BCAST_SLOT_COUNT * FFN_SLOT_BYTES + 2 * FFN_GRID_GROUP_MAX * FFN_GRID_SCB_LINE_STRIDE;
+constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_RECEIVE_REGION_BYTES + FFN_BCAST_REGION_BYTES + FFN_SLOT_BYTES;
 #else
 constexpr int FFN_GRID_WINDOW_BYTES = FFN_GRID_UNICAST_WINDOW_BYTES;
 #endif
@@ -292,58 +313,58 @@ constexpr int FFN_NCUT_Y_SHARD_BYTES = FFN_NCUT_T * FFN_NCUT_H_SHARD * 4;      /
 // Each carries one tile per source (single-shot, no slot reuse) ⟹ SlotCount = 1
 // and BcastSlotCount = group size.
 //
-// These are GridGroupPipes: the payload travels through the group's shared MPSC
-// ring and no unicast TPUSH/TPOP ever runs on them, so the window carries no
-// scoreboard pair and no per-direction ring.  Window =
-// flags(128) + SlotCount*SlotStride + 2*GroupMax*kBcastLaneStride, matching
-// pto::a2a3_grid::WindowBytes<GridGroupPipe<...>>() in grid_pipe_runtime.hpp.
-constexpr int FFN_NCUT_GRID_FLAGS_BYTES = 512;
+// These are PURE-BROADCAST pipes: the payload travels through the broadcast ring
+// (bcastRingBase), and no unicast TPUSH/TPOP ever runs on them.  So their
+// GridPipe ChanCount is 0 and the unicast slot region is ZERO bytes -- it used to
+// be 5*SlotCount*SlotStride of never-touched window.  Window =
+// header(1216) + 0 + BcastSlotCount*SlotStride + one isolated producer
+// staging slot.  Broadcast notification reuses the fixed GridPipe SPR triplet
+// at CollectiveChan; there are no per-source signal lanes.
+// matching the layout in include/pto/npu/a2a3/grid_pipe_runtime.hpp.
+constexpr int FFN_NCUT_BCAST_CHAN_COUNT = 0; // pure-broadcast pipes: no unicast rings
+constexpr int FFN_NCUT_RELAY_CHAN_COUNT = 2; // a relay runs two flows through each cell
+constexpr int FFN_NCUT_GRID_FLAGS_BYTES = FFN_GRID_FLAGS_BYTES;
+constexpr int FFN_NCUT_GRID_SLOT_REGION_OFFSET = FFN_GRID_SLOT_REGION_OFFSET;
+constexpr int FFN_NCUT_SLOT_COUNT = 1;
 constexpr int FFN_NCUT_SLOT_BYTES_P1 = FFN_NCUT_HIDDEN_SHARD_BYTES;
 constexpr int FFN_NCUT_SLOT_BYTES_P2 = FFN_NCUT_ROW_BLOCK_BYTES;
 constexpr int FFN_NCUT_GROUP_P1 = FFN_NCUT_COLS; // 8 (ROW group)
 constexpr int FFN_NCUT_GROUP_P2 = FFN_NCUT_ROWS; // 4 (COL group)
 constexpr int FFN_NCUT_BCAST_SLOTS_P1 = FFN_NCUT_GROUP_P1;
 constexpr int FFN_NCUT_BCAST_SLOTS_P2 = FFN_NCUT_GROUP_P2;
-// Per-source ready/free lane stride (bytes) -- one full cache line per lane so
-// concurrent TBROADCAST producers never share a cache line (avoids the
-// write-back lost-update that dropped doorbell writes).  Must match the kernel
-// layout constant kBcastLaneStride in grid_intrinsic.hpp.
-constexpr int FFN_NCUT_LANE_STRIDE = 64;
-// Byte offset of the ready-lane region inside a group pipe's window (the free
-// lanes follow it), used by the host-side doorbell dump.
-constexpr int FFN_NCUT_READY_LANES_OFF_P1 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_BCAST_SLOTS_P1 * FFN_NCUT_SLOT_BYTES_P1;
-constexpr int FFN_NCUT_WIN_P1 = FFN_NCUT_READY_LANES_OFF_P1 + 2 * FFN_NCUT_GROUP_P1 * FFN_NCUT_LANE_STRIDE;
-constexpr int FFN_NCUT_READY_LANES_OFF_P2 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_BCAST_SLOTS_P2 * FFN_NCUT_SLOT_BYTES_P2;
-constexpr int FFN_NCUT_WIN_P2 = FFN_NCUT_READY_LANES_OFF_P2 + 2 * FFN_NCUT_GROUP_P2 * FFN_NCUT_LANE_STRIDE;
+constexpr int FFN_NCUT_WIN_P1 = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+                                FFN_NCUT_BCAST_CHAN_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P1 +
+                                FFN_NCUT_BCAST_SLOTS_P1 * FFN_NCUT_SLOT_BYTES_P1 + FFN_NCUT_SLOT_BYTES_P1;
+constexpr int FFN_NCUT_WIN_P2 = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+                                FFN_NCUT_BCAST_CHAN_COUNT * FFN_NCUT_SLOT_COUNT * FFN_NCUT_SLOT_BYTES_P2 +
+                                FFN_NCUT_BCAST_SLOTS_P2 * FFN_NCUT_SLOT_BYTES_P2 + FFN_NCUT_SLOT_BYTES_P2;
 
 // ---------------------------------------------------------------------------
 // TPUSH-AllGather topology (方案①).  Same pure 1D N-cut 32-cell mesh and shapes
 // as the TBROADCAST variant above, but the two gather phases are driven by the
 // TPUSH/TPOP unicast primitives via a nearest-neighbor relay instead of the
 // TBROADCAST MPSC collective.  The relay is fan-in-1 per direction, so it needs
-// no group lanes: each channel's window is the plain unicast layout
-//   pipe window = flags(128) + SlotCount * SlotStride
-// (== pto::a2a3_grid::WindowBytes<GridPipe<...>>()).  A bidirectional relay is
-// TWO channels and therefore TWO pipes -- one bound to the forward direction,
-// one to the backward -- so a phase's per-cell window is two pipe windows laid
-// end to end (forward first).  P1 relays the [8,768] row block (row gather: EAST
-// forward + WEST backward), P2 the [8,3072] full hidden (col gather: SOUTH
-// forward + NORTH backward); SlotCount = 2 double-buffers each channel.  The slot
-// must hold the FULL relay tile (it grows during the forward pass), so P1's slot
-// is the row block and P2's slot is the full hidden.
+// NO broadcast region (GroupMax = 0): the window is the plain unicast layout
+//   header(1216) + 2 channels * SlotCount * SlotStride + one producer staging slot
+// (mirrors FFN_RS_REDUCE_WIN).  Two channels, not four: a relay runs exactly two
+// flows through a cell -- the forward gather and the backward scatter -- so the
+// GridPipe ChanCount names that pair and the other rings are never allocated.
+// P1 relays the [8,768] row block (row gather),
+// P2 relays the [8,3072] full hidden (col gather); each relay uses two opposite
+// directions (EAST forward + WEST backward for P1; SOUTH forward + NORTH backward
+// for P2), so SlotCount = 2 double-buffers the two hops.  The slot must hold the
+// FULL relay tile (it grows during the forward pass), so P1's slot is the row
+// block and P2's slot is the full hidden.
 // ---------------------------------------------------------------------------
-constexpr int FFN_NCUT_RELAY_PIPE_COUNT = 2;                             // forward channel + backward channel
 constexpr int FFN_NCUT_TPUSH_SLOT_COUNT = 2;                             // double-buffer each relay channel
 constexpr int FFN_NCUT_TPUSH_SLOT_BYTES_P1 = FFN_NCUT_ROW_BLOCK_BYTES;   // [8,768]  half (row relay)
 constexpr int FFN_NCUT_TPUSH_SLOT_BYTES_P2 = FFN_NCUT_HIDDEN_FULL_BYTES; // [8,3072] half (col relay)
-constexpr int FFN_NCUT_TPUSH_PIPE_WIN_P1 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_TPUSH_SLOT_COUNT * FFN_NCUT_TPUSH_SLOT_BYTES_P1;
-constexpr int FFN_NCUT_TPUSH_PIPE_WIN_P2 =
-    FFN_NCUT_GRID_FLAGS_BYTES + FFN_NCUT_TPUSH_SLOT_COUNT * FFN_NCUT_TPUSH_SLOT_BYTES_P2;
-constexpr int FFN_NCUT_TPUSH_WIN_P1 = FFN_NCUT_RELAY_PIPE_COUNT * FFN_NCUT_TPUSH_PIPE_WIN_P1;
-constexpr int FFN_NCUT_TPUSH_WIN_P2 = FFN_NCUT_RELAY_PIPE_COUNT * FFN_NCUT_TPUSH_PIPE_WIN_P2;
+constexpr int FFN_NCUT_TPUSH_WIN_P1 =
+    FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+    FFN_NCUT_RELAY_CHAN_COUNT * FFN_NCUT_TPUSH_SLOT_COUNT * FFN_NCUT_TPUSH_SLOT_BYTES_P1 + FFN_NCUT_TPUSH_SLOT_BYTES_P1;
+constexpr int FFN_NCUT_TPUSH_WIN_P2 =
+    FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+    FFN_NCUT_RELAY_CHAN_COUNT * FFN_NCUT_TPUSH_SLOT_COUNT * FFN_NCUT_TPUSH_SLOT_BYTES_P2 + FFN_NCUT_TPUSH_SLOT_BYTES_P2;
 
 // ===========================================================================
 // ReduceSum variant on the same pure 1D N-cut 32-cell topology (Option B).
@@ -374,15 +395,17 @@ constexpr int FFN_RS_Y_BYTES = FFN_NCUT_T * FFN_NCUT_H * 4;                  // 
 
 // EAST/SOUTH reduce tile = [T, H_base] fp32 (fits the 192 KB UB with the add acc).
 constexpr int FFN_RS_REDUCE_TILE_BYTES = FFN_NCUT_T * FFN_RS_REDUCE_H_BASE * 4; // 32768 B (32 KB)
-// One slot per H-segment so the H-chunked reduce never waits a cross-segment
-// free doorbell (each segment lands in its own slot; prodIndex < SlotCount always).
+// Retained unicast-ring shape for ABI compatibility with the TPUSH ReduceSum
+// variant.  Group TREDUCE reads symmetric partialBuf storage directly; its
+// cross-segment backpressure is carried by the dedicated collective free SPR.
 constexpr int FFN_RS_REDUCE_SLOT_COUNT = FFN_NCUT_H / FFN_RS_REDUCE_H_BASE; // = kHSegs (7)
-// The reduce chain is two channels run back to back -- EAST (row) then SOUTH
-// (col) -- and a pipe is bound to one channel, so the per-cell window holds two
-// pipe windows (row phase first).  They MUST be disjoint: the col phase would
-// otherwise inherit the row phase's already-raised ready/free counts.
-constexpr int FFN_RS_REDUCE_PIPE_COUNT = 2; // row (EAST) channel + col (SOUTH) channel
-constexpr int FFN_RS_REDUCE_PIPE_WIN = FFN_NCUT_GRID_FLAGS_BYTES + FFN_RS_REDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES;
-constexpr int FFN_RS_REDUCE_WIN = FFN_RS_REDUCE_PIPE_COUNT * FFN_RS_REDUCE_PIPE_WIN;
+// The reduce runs as TWO launches over ONE persistent window.  One unicast
+// channel remains reserved (and unused here); group TREDUCE therefore takes SPR
+// triplet CollectiveChan=1.  Phase-B and phase-C aggregate counters continue
+// monotonically across the launch boundary without clearing any scoreboard.
+constexpr int FFN_RS_REDUCE_CHAN_COUNT = 1;
+constexpr int FFN_RS_REDUCE_WIN = FFN_NCUT_GRID_SLOT_REGION_OFFSET +
+                                  FFN_RS_REDUCE_CHAN_COUNT * FFN_RS_REDUCE_SLOT_COUNT * FFN_RS_REDUCE_TILE_BYTES +
+                                  FFN_RS_REDUCE_TILE_BYTES;
 
 #endif // DISTRIBUTED_FFN_GRID_CONFIG_HPP

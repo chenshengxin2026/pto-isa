@@ -72,46 +72,6 @@ if(NOT DEFINED NCUT_I)
     set(NCUT_I 3072)
 endif()
 
-# K-hop unicast smoke kernel config (independent of the FFN grid/tile sizes).
-if(NOT DEFINED KHOP_ROWS)
-    set(KHOP_ROWS 1)
-endif()
-if(NOT DEFINED KHOP_COLS)
-    set(KHOP_COLS 4)
-endif()
-if(NOT DEFINED KHOP_DIST)
-    set(KHOP_DIST 2)
-endif()
-if(NOT DEFINED KHOP_T)
-    set(KHOP_T 16)
-endif()
-if(NOT DEFINED KHOP_W)
-    set(KHOP_W 64)
-endif()
-
-# 接力计数 producer-handoff smoke kernel config (independent of the FFN sizes).
-if(NOT DEFINED HANDOFF_ROWS)
-    set(HANDOFF_ROWS 3)
-endif()
-if(NOT DEFINED HANDOFF_COLS)
-    set(HANDOFF_COLS 4)
-endif()
-if(NOT DEFINED HANDOFF_P1_TILES)
-    set(HANDOFF_P1_TILES 2)
-endif()
-if(NOT DEFINED HANDOFF_P1_POPS)
-    set(HANDOFF_P1_POPS 1)
-endif()
-if(NOT DEFINED HANDOFF_P2_TILES)
-    set(HANDOFF_P2_TILES 1)
-endif()
-if(NOT DEFINED HANDOFF_T)
-    set(HANDOFF_T 16)
-endif()
-if(NOT DEFINED HANDOFF_W)
-    set(HANDOFF_W 64)
-endif()
-
 # Single-source broadcast smoke kernel config (independent of the FFN sizes).
 if(NOT DEFINED BCAST_ROWS)
     set(BCAST_ROWS 1)
@@ -152,9 +112,7 @@ endif()
 
 message(STATUS "Grid: ${GRID_ROWS}x${GRID_COLS}  Tile: ${TOKEN_TILE}x${MODEL_TILE}  FfnTile: ${FFN_TILE}")
 message(STATUS "NCut topology: ${NCUT_GRID_ROWS}x${NCUT_GRID_COLS}  T=${NCUT_T} H=${NCUT_H} I=${NCUT_I}")
-message(STATUS "KHop smoke: ${KHOP_ROWS}x${KHOP_COLS}  DIST=${KHOP_DIST}  Tile: ${KHOP_T}x${KHOP_W}")
 message(STATUS "Bcast smoke: ${BCAST_ROWS}x${BCAST_COLS}  SRC=${BCAST_SRC}  SPAN_COL=${BCAST_SPAN_COL}  SUBRECT=${BCAST_SUBRECT}  Rect=[r${BCAST_RECT_R0}:${BCAST_RECT_R1},c${BCAST_RECT_C0}:${BCAST_RECT_C1}] RectSRC=${BCAST_RECT_SRC}  Tile: ${BCAST_T}x${BCAST_W}")
-message(STATUS "Handoff smoke: ${HANDOFF_ROWS}x${HANDOFF_COLS}  P1=${HANDOFF_P1_TILES}/${HANDOFF_P1_POPS} popped  P2=${HANDOFF_P2_TILES}  Tile: ${HANDOFF_T}x${HANDOFF_W}")
 
 add_compile_options(
     -D_FORTIFY_SOURCE=2
@@ -456,66 +414,7 @@ target_link_libraries(distributed_ffn_grid_tpush_allgather PRIVATE
 )
 
 # =============================================================================
-# 4. GridPipe routed K-hop unicast smoke test (Scheme A).  Vec-only data
-#    movement: TPUSH<EAST, KHOP_DIST> / TPOP<EAST, KHOP_DIST> across a 1xCOLS
-#    row, exercising the K-hop data path and the routed ready/free doorbell.
-# =============================================================================
-add_library(khop_smoke_kernel SHARED smoke/khop_smoke_kernel.cpp)
-target_compile_options(khop_smoke_kernel PRIVATE
-    ${CMAKE_CCE_COMPILE_OPTIONS}
-    --cce-aicore-arch=dav-c220
-    -DMEMORY_BASE -std=c++17
-    -DCONFIG_KHOP_ROWS=${KHOP_ROWS} -DCONFIG_KHOP_COLS=${KHOP_COLS}
-    -DCONFIG_KHOP_DIST=${KHOP_DIST} -DCONFIG_KHOP_T=${KHOP_T} -DCONFIG_KHOP_W=${KHOP_W}
-)
-target_include_directories(khop_smoke_kernel PRIVATE
-    ${PROJECT_SOURCE_DIR}
-    ${PROJECT_SOURCE_DIR}/../../../../include/
-    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/ascendc/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/impl/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api/impl
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/interface
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/utils
-)
-target_link_directories(khop_smoke_kernel PRIVATE ${ASCEND_HOME_PATH}/lib64)
-target_link_libraries(khop_smoke_kernel PRIVATE hcomm runtime nnopbase)
-target_link_options(khop_smoke_kernel PRIVATE --cce-fatobj-link)
-
-add_executable(khop_smoke smoke/main_khop_smoke.cpp)
-target_compile_options(khop_smoke PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
-target_include_directories(khop_smoke PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../../include/
-    ${PROJECT_SOURCE_DIR}/../../../../tests/common
-    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
-    ${ASCEND_HOME_PATH}/pkg_inc/runtime
-    ${ASCEND_HOME_PATH}/pkg_inc/toolchain
-    ${ASCEND_HOME_PATH}/pkg_inc/profiling
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/runtime
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/profiling
-)
-target_compile_definitions(khop_smoke PRIVATE
-    CONFIG_KHOP_ROWS=${KHOP_ROWS} CONFIG_KHOP_COLS=${KHOP_COLS}
-    CONFIG_KHOP_DIST=${KHOP_DIST} CONFIG_KHOP_T=${KHOP_T} CONFIG_KHOP_W=${KHOP_W}
-)
-target_link_directories(khop_smoke PUBLIC
-    ${ASCEND_HOME_PATH}/lib64
-    ${ASCEND_HOME_PATH}/simulator/${SOC_VERSION}/lib
-    ${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib
-)
-target_link_libraries(khop_smoke PRIVATE
-    khop_smoke_kernel
-    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},sim>:runtime_camodel>>
-    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},npu>:runtime>>
-    stdc++ ascendcl hcomm m tiling_api platform c_sec dl nnopbase pthread
-)
-
-# =============================================================================
-# 5. GridPipe single-source broadcast smoke test (Tier 1).  Vec-only data
+# 4. GridPipe single-source broadcast smoke test (Tier 1).  Vec-only data
 #    movement: one source TBCAST<ROW|COL>-es a stamped fp32 tile to its whole
 #    span in a single multicast (batched writes + one publish fence + batched
 #    doorbells, NOT a per-hop TPUSH loop); every other cell TPOP<dir,dist>s it.
@@ -579,71 +478,6 @@ target_link_directories(bcast_smoke PUBLIC
 )
 target_link_libraries(bcast_smoke PRIVATE
     bcast_smoke_kernel
-    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},sim>:runtime_camodel>>
-    $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},npu>:runtime>>
-    stdc++ ascendcl hcomm m tiling_api platform c_sec dl nnopbase pthread
-)
-
-# =============================================================================
-# 6. GridPipe 接力计数 producer-handoff smoke test (THANDOFF).  Vec-only data
-#    movement: one window per cell driven by two producers in turn -- phase 1
-#    TPUSH/TPOP<EAST>, then THANDOFF, then phase 2 TPUSH/TPOP<SOUTH> -- proving
-#    that the ring counters relay across the producer swap (and rebase to 0 where
-#    the ring is drained) instead of aliasing undrained slots.
-# =============================================================================
-add_library(handoff_smoke_kernel SHARED smoke/handoff_smoke_kernel.cpp)
-target_compile_options(handoff_smoke_kernel PRIVATE
-    ${CMAKE_CCE_COMPILE_OPTIONS}
-    --cce-aicore-arch=dav-c220
-    -DMEMORY_BASE -std=c++17
-    -DCONFIG_HANDOFF_ROWS=${HANDOFF_ROWS} -DCONFIG_HANDOFF_COLS=${HANDOFF_COLS}
-    -DCONFIG_HANDOFF_P1_TILES=${HANDOFF_P1_TILES} -DCONFIG_HANDOFF_P1_POPS=${HANDOFF_P1_POPS}
-    -DCONFIG_HANDOFF_P2_TILES=${HANDOFF_P2_TILES}
-    -DCONFIG_HANDOFF_T=${HANDOFF_T} -DCONFIG_HANDOFF_W=${HANDOFF_W}
-)
-target_include_directories(handoff_smoke_kernel PRIVATE
-    ${PROJECT_SOURCE_DIR}
-    ${PROJECT_SOURCE_DIR}/../../../../include/
-    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/ascendc/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/impl/basic_api
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/ascendc/include/basic_api/impl
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/interface
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/utils
-)
-target_link_directories(handoff_smoke_kernel PRIVATE ${ASCEND_HOME_PATH}/lib64)
-target_link_libraries(handoff_smoke_kernel PRIVATE hcomm runtime nnopbase)
-target_link_options(handoff_smoke_kernel PRIVATE --cce-fatobj-link)
-
-add_executable(handoff_smoke smoke/main_handoff_smoke.cpp)
-target_compile_options(handoff_smoke PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
-target_include_directories(handoff_smoke PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../../include/
-    ${PROJECT_SOURCE_DIR}/../../../../tests/common
-    ${PROJECT_SOURCE_DIR}/../../../../tests/npu/a2a3/comm/st/testcase/
-    ${ASCEND_HOME_PATH}/pkg_inc/runtime
-    ${ASCEND_HOME_PATH}/pkg_inc/toolchain
-    ${ASCEND_HOME_PATH}/pkg_inc/profiling
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/runtime
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    ${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/profiling
-)
-target_compile_definitions(handoff_smoke PRIVATE
-    CONFIG_HANDOFF_ROWS=${HANDOFF_ROWS} CONFIG_HANDOFF_COLS=${HANDOFF_COLS}
-    CONFIG_HANDOFF_P1_TILES=${HANDOFF_P1_TILES} CONFIG_HANDOFF_P1_POPS=${HANDOFF_P1_POPS}
-    CONFIG_HANDOFF_P2_TILES=${HANDOFF_P2_TILES}
-    CONFIG_HANDOFF_T=${HANDOFF_T} CONFIG_HANDOFF_W=${HANDOFF_W}
-)
-target_link_directories(handoff_smoke PUBLIC
-    ${ASCEND_HOME_PATH}/lib64
-    ${ASCEND_HOME_PATH}/simulator/${SOC_VERSION}/lib
-    ${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib
-)
-target_link_libraries(handoff_smoke PRIVATE
-    handoff_smoke_kernel
     $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},sim>:runtime_camodel>>
     $<BUILD_INTERFACE:$<$<STREQUAL:${RUN_MODE},npu>:runtime>>
     stdc++ ascendcl hcomm m tiling_api platform c_sec dl nnopbase pthread
