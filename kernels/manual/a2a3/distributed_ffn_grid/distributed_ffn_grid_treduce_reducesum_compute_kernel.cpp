@@ -42,6 +42,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "common.hpp"
 #include "ffn_config.hpp"
 #include "gridpipe_payload_inl.hpp"
+#include "single_vector_sync_inl.hpp"
 #include "tpipe_tmov_inl.hpp"
 
 #ifdef __CCE_AICORE__
@@ -73,14 +74,15 @@ using HiddenPipe = TPipe<4, Direction::DIR_V2C, FFN_NCUT_HIDDEN_SHARD_BYTES, 1>;
 
 // EAST/SOUTH reduce tile = one H-segment [8, H_base] fp32.
 using ReduceSegTile = Tile<TileType::Vec, float, kT, kHBase, BLayout::RowMajor>;
-// No pipe type here: this variant reduces through the group fan-in overload of
-// TREDUCE (TREDUCE<Group, Op, T>(acc, scratch, base, ...), which lowers to
-// GRID_TREDUCE_GROUP_IMPL).  It reads each member's contribution in place out of
-// partialBuf (bytes and memberStride are independent runtime operands) and so
-// binds no channel, holds no semaphore and needs no slot ring -- which is also
-// why it takes no pipe argument, unlike the relay overload TREDUCE<Op>(pipe, acc,
-// recv).  `reduceWindow` is allocated by the host for layout parity with the
-// TPUSH relay variant and is deliberately unused.
+// Kept for shape/type documentation only -- this variant reduces through
+// GRID_TREDUCE_GROUP_IMPL, which takes each member's contribution in place out of
+// partialBuf (the sink and the member rectangle are runtime operands, the payload
+// length another) and so needs no slot ring at all.  Same ChanCount as the TPUSH
+// relay variant so the type and FFN_RS_REDUCE_WIN stay consistent if it is ever
+// wired up.
+constexpr int kFfnReduceChanCount = FFN_RS_REDUCE_CHAN_COUNT;
+using FfnReducePipe =
+    GridPipe<ReduceSegTile, FFN_RS_REDUCE_TILE_BYTES, FFN_RS_REDUCE_SLOT_COUNT, 0, 0, kFfnReduceChanCount>;
 
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>; // [16,96] (gate/up)
 
@@ -153,7 +155,6 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     if (cell < 0 || cell >= gridRows * gridCols) {
         return;
     }
-
     using pto::GridDirection;
     using pto::comm::ReduceOp;
 
@@ -167,6 +168,16 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
         __gm__ uint8_t* gatePartialBlock = gatePartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* upPartialBlock = upPartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
         __gm__ uint8_t* hiddenBlock = hiddenBuf + cell * FFN_NCUT_HIDDEN_SHARD_BYTES;
+
+        if constexpr (DAV_VEC) {
+            if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+                // AIV1 only supplies the mode-2 C2V/V2C control signals. AIV0
+                // alone performs the activation, data movement, and later Grid work.
+                FfnInactiveVectorC2vV2cHandshake<GatePipe, UpPipe, HiddenPipe>(
+                    gatePartialBlock, upPartialBlock, hiddenBlock);
+                return;
+            }
+        }
 
         if constexpr (DAV_CUBE) {
             GateAccTile cGate;
@@ -351,19 +362,34 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
         return;
     }
 
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            return;
+        }
+    }
+
     // =========================== phase B: EAST 8-way reduce (row, H-chunked) ===========================
     // Group fan-in (mov_ubuf_group, op=SUM).  Each cell wrote its full-H partial to
-    // partialBuf in phase A; the host stream barrier makes every row-mate's
-    // partial visible here.  The row SINK (col == gridCols-1) folds all 8
-    // row-mates' segment-h partials directly out of partialBuf with one
-    // N->1 reduce intrinsic.  Member k == cell (row, k), so members are visited
-    // col0..col7 -- the SAME order the EAST relay accumulated in, hence the FP
-    // sum is bit-identical (IEEE-754 add is commutative).  Non-sink cells have
-    // nothing to do (their partial is already in GM).
+    // its own block-id slot of partialBuf in phase A; the host stream barrier makes
+    // every row-mate's partial visible here.  The row SINK (col == gridCols-1) names
+    // ITSELF as the sink (its block id, `cell`) and its ROW as the group (the
+    // one-row block-id rectangle from (row,0) to (row,gridCols-1)), and one N->1
+    // reduce intrinsic folds all 8 row-mates' segment-h partials into its UB.
+    // Members are walked in ascending block id, i.e. col0..col7 -- the SAME order
+    // the EAST relay accumulated in, hence the FP sum is bit-identical (IEEE-754 add
+    // is commutative).  Non-sink cells have nothing to do (their partial is already
+    // in GM).
     if (phase == 1) {
         if constexpr (DAV_VEC) {
             if (col + 1 == gridCols) {
-                __gm__ uint8_t* rowPartialBlock = rowPartialBuf + row * FFN_RS_ROW_PARTIAL_BYTES;
+                // The row result goes to THIS cell's block-id slot of rowPartialBuf:
+                // both reduce arenas are indexed by block id, which is what makes the
+                // group instruction's "member b's copy of this address" arithmetic hold.
+                __gm__ uint8_t* rowPartialBlock = rowPartialBuf + cell * FFN_RS_ROW_PARTIAL_BYTES;
+                // Group = this row; sink = this cell.
+                const GridBlockRect rowGroup{
+                    static_cast<uint32_t>(row * gridCols), static_cast<uint32_t>(row * gridCols + gridCols - 1),
+                    static_cast<uint32_t>(gridCols)};
                 ReduceSegTile seg;     // reduce accumulator / result
                 ReduceSegTile scratch; // in-core combine scratch
                 TASSIGN(seg, 0x0000);
@@ -374,15 +400,15 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
                     float, Shape<1, 1, 1, kT, kHBase>, Stride<kT * kHBase, kT * kHBase, kT * kHBase, kHBase, 1>>;
                 for (int h = 0; h < kHSegs; ++h) {
                     const int hSegOff = h * (kT * kHBase); // segment-major offset (floats)
-                    // Contribution arena = cell (row, 0..gridCols-1)'s segment-h
-                    // partials.  Cell (row, k) sits at partialBuf + (row*gridCols+k)*PPB
-                    // + hSegOff; consecutive row members are uniformly spaced by PPB.
-                    __gm__ const float* base =
-                        reinterpret_cast<__gm__ const float*>(
-                            partialBuf + static_cast<int64_t>(row) * gridCols * FFN_RS_PARTIAL_BYTES) +
-                        hSegOff;
-                    TREDUCE<GridGroup::ROW, ReduceOp::Sum, float>(
-                        seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridCols, GridRect{}, FFN_RS_PARTIAL_BYTES);
+                    // THIS cell's segment-h contribution.  Cell b's copy of the same
+                    // address is + (b - cell)*PPB, which the instruction derives from
+                    // the group rectangle -- the caller no longer folds any geometry.
+                    __gm__ const float* mySeg = reinterpret_cast<__gm__ const float*>(
+                                                    partialBuf + static_cast<int64_t>(cell) * FFN_RS_PARTIAL_BYTES) +
+                                                hSegOff;
+                    GRID_TREDUCE_GROUP_IMPL<ReduceOp::Sum, float>(
+                        seg, scratch, mySeg, FFN_RS_REDUCE_TILE_BYTES, rowGroup, static_cast<uint32_t>(cell),
+                        FFN_RS_PARTIAL_BYTES);
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -400,14 +426,21 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
     }
 
     // =========================== phase C: SOUTH 4-way reduce (col 7, H-chunked) ===========================
-    // Group fan-in (mov_ubuf_group, op=SUM).  Phase B left one row partial per row
-    // in rowPartialBuf; the column SINK (row == gridRows-1) folds all 4 rows'
-    // segment-h partials out of rowPartialBuf with one N->1 reduce intrinsic.
-    // Member k == row k at rowPartialBuf + k*RPPB (uniform stride RPPB); the
-    // row0..row3 order matches the SOUTH relay accumulation (bit-identical).
+    // Group fan-in (mov_ubuf_group, op=SUM).  Phase B left each row's partial in the
+    // row sink's own block-id slot of rowPartialBuf; the column SINK (row ==
+    // gridRows-1) names itself as the sink and its COLUMN as the group (the
+    // one-column block-id rectangle from (0,gridCols-1) to (gridRows-1,gridCols-1)),
+    // and one N->1 reduce intrinsic folds all 4 rows' segment-h partials in.  Members
+    // are walked in ascending block id = row0..row3, which matches the SOUTH relay
+    // accumulation (bit-identical).  Note the members' block ids are NOT consecutive
+    // -- they step by gridCols -- which is exactly the geometry the block-id
+    // rectangle expresses and a rank stride could not.
     if (phase == 2) {
         if constexpr (DAV_VEC) {
             if (row + 1 == gridRows) {
+                const GridBlockRect colGroup{
+                    static_cast<uint32_t>(gridCols - 1),
+                    static_cast<uint32_t>((gridRows - 1) * gridCols + gridCols - 1), static_cast<uint32_t>(gridCols)};
                 ReduceSegTile seg;
                 ReduceSegTile scratch;
                 TASSIGN(seg, 0x0000);
@@ -420,9 +453,13 @@ __global__ AICORE void DistributedFfnGridTreduceReduceSumMixedKernel(
                 for (int h = 0; h < kHSegs; ++h) {
                     const int hSegOff = h * (kT * kHBase); // segment-major offset into rowPartialBuf
                     const int hStridedOff = h * kHBase;    // strided column offset into yFull [T,H]
-                    __gm__ const float* base = reinterpret_cast<__gm__ const float*>(rowPartialBuf) + hSegOff;
-                    TREDUCE<GridGroup::COL, ReduceOp::Sum, float>(
-                        seg, scratch, base, FFN_RS_REDUCE_TILE_BYTES, gridRows, GridRect{}, FFN_RS_ROW_PARTIAL_BYTES);
+                    __gm__ const float* mySeg =
+                        reinterpret_cast<__gm__ const float*>(
+                            rowPartialBuf + static_cast<int64_t>(cell) * FFN_RS_ROW_PARTIAL_BYTES) +
+                        hSegOff;
+                    GRID_TREDUCE_GROUP_IMPL<ReduceOp::Sum, float>(
+                        seg, scratch, mySeg, FFN_RS_REDUCE_TILE_BYTES, colGroup, static_cast<uint32_t>(cell),
+                        FFN_RS_ROW_PARTIAL_BYTES);
 #ifndef __PTO_AUTO__
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -467,10 +504,9 @@ void launchDistributedFfnGridTreduceReduceSumMixedKernel(
     uint8_t* upPartialBuf, uint8_t* hiddenBuf, uint8_t* hcclCtx, int phase, int rowStart, int colStart, int waveCols,
     int gridRows, int gridCols, int blockCount, void* stream)
 {
-    if (blockCount <= 0) {
-        return;
+    if (blockCount > 0) {
+        DistributedFfnGridTreduceReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
+            ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
+            gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
     }
-    DistributedFfnGridTreduceReduceSumMixedKernel<<<blockCount, nullptr, stream>>>(
-        ffts, reduceWindow, xFull, wGateShards, wUpShards, wDownShards, partialBuf, rowPartialBuf, yFull,
-        gatePartialBuf, upPartialBuf, hiddenBuf, hcclCtx, phase, rowStart, colStart, waveCols, gridRows, gridCols);
 }

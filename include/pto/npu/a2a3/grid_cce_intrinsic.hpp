@@ -22,44 +22,43 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // clang-format off
 //   V8 machine instr | CCE facade (this file)      | CCE builtin (native)                    | facade
 //   -----------------+------------------------------+------------------------------------------+---------------------------
-//   COPY_UBUF_TO_NBR | copy_ubuf_to_neighbor_ubuf   | __builtin_cce_copy_ubuf_to_neighbor_ubuf | copy_ubuf_to_neighbor_ubuf
+//   COPY_L1_TO_NBR   | copy_l1_to_neighbor_l1       | __builtin_cce_copy_ubuf_to_neighbor_ubuf | copy_l1_to_neighbor_l1
 //   SYNC_HSCB/ST_HSCB| __sync_hscb                  | __builtin_cce___sync_hscb                | sync_hscb
 //   WAIT_SPR         | __wait_ipc_scb               | __builtin_cce___wait_ipc_scb             | wait_ipc_scb
 //   MOV_SPR2X        | __mov_ipc_scb_to_l1          | __builtin_cce___mov_ipc_scb_to_l1        | mov_ipc_scb_to_l1
-//   MOV_L12X         | __mov_l1_to_gpr              | __builtin_cce___mov_l1_to_gpr            | mov_l1_to_gpr
+//   MOVX2SPR         | __mov_x_to_ipc_scb           | __builtin_cce___mov_x_to_ipc_scb         | mov_x_to_ipc_scb
+//   MOVX2GPR         | __mov_x_to_gpr               | __builtin_cce___mov_x_to_gpr             | mov_x_to_gpr
 // clang-format on
 //
 // V8 revision vs V7: WAIT_SPR alone reads the local IPC_SCB and blocks -- read+block
 // is ONE instruction (entry reads the unsigned count and compares: >= threshold
 // proceeds, < threshold suspends the current pipe until the peer's SYNC_HSCB store
 // raises it).  The V7 "先 get_ipc_scb (MOV_SPR2X) 非阻塞 peek、不足才 WAIT_SPR 阻塞"
-// two-step is GONE: get_ipc_scb / MOV_SPR2X no longer appears in the STEADY-STATE
-// handshake path (TPUSH / TPOP / TBROADCAST / TREDUCE), so the per-tile machine
-// instruction count collapses from "新增 1 + 复用 3" to "新增 1 + 复用 2".
+// two-step is GONE from every steady-state TPUSH/TPOP wait: get_ipc_scb /
+// MOV_SPR2X is not a pre-check before WAIT_SPR, so that hot path still collapses
+// from "新增 1 + 复用 3" to "新增 1 + 复用 2".  MOV_SPR2X remains available on the
+// infrequent time-division bind path, where the consumer must snapshot ready_scb
+// and close_scb to choose a channel and relay an absolute baseline.
 //
-// The MOV-class facades exist for the 接力计数 producer handoff (THANDOFF /
-// GridTHandoff.hpp) and for NOTHING else.  In particular they are NOT how a
-// scoreboard is tested: ready_scb / free_scb live in the SPR file and WAIT_SPR
-// compares their value against the threshold in the instruction itself.  What the
-// handoff needs is to move a prod_idx BETWEEN TWO PRODUCER CORES; prod_idx is a GPR
-// run-counter on both ends, and the only cross-core transport (SYNC_HSCB / ST_HSCB)
-// both SOURCES FROM and LANDS IN L1.  So the two moves are:
+// The MOV-class facades serve GridPipe's dynamic close/relay bind.  Producer and
+// consumer channel indices are independent: the response supplies the consumer's
+// ready baseline and receive-channel index, while the consumer writes its cons_idx
+// directly into the producer channel's free_scb and commits an explicit completion
+// word last.
 //
-//   MOV_SPR2X (mov_ipc_scb_to_l1) -- SPR -> L1, on the relaying consumer.  It drops
-//     the retiring producer's final prod_idx (already sitting in this core's
-//     ready_scb, put there by that producer's last SYNC_HSCB(READY)) into an L1 word,
-//     which is exactly where ST_HSCB can pick it up.  There is deliberately NO
-//     SPR -> GPR form: nothing needs one, since a scoreboard is only ever compared
-//     (WAIT_SPR) or forwarded (this).  Deliberately NOT named get_ipc_scb either --
-//     that V7 name meant "non-blocking peek in front of a WAIT_SPR", a step V8 deleted.
-//   MOV_L12X  (mov_l1_to_gpr)     -- L1 -> GPR.  The only way a value in memory
-//     becomes a scalar the code can branch on or run a counter with: the incoming
-//     producer uses it to load the delivered baseline into its prod_idx, and the
-//     relaying consumer uses it to read back the word it just staged so it can
-//     compare against cons_idx.
+//   MOV_SPR2X (mov_ipc_scb_to_l1) -- SPR -> memory.  Snapshots ready/close during
+//     dynamic consumer-channel selection.  A scoreboard cannot be read into a GPR
+//     directly.
+//   MOVX2SPR (mov_x_to_ipc_scb)   -- memory -> SPR.  Retained as a machine facade,
+//     but the current GridPipe protocol does not use it: free_scb has an external
+//     consumer writer even when its local producer channel is rebound.
+//   MOVX2GPR (mov_x_to_gpr)       -- memory -> GPR.  Polls the request/completion
+//     commits and installs the returned ready baseline into prod_idx.  V8 spells the
+//     L1-source case MOV_L12X; the value must reach a register before TPUSH can
+//     derive a ring slot or free threshold.
 //
-// Note the asymmetry -- one moves an SPR into memory, the other memory into a
-// register.  They are different machine instructions and must not share a facade.
+// Note the asymmetry -- one lands in memory, one in the scoreboard file, one in a
+// GPR.  They are different machine instructions and must not share a facade.
 //
 // Why the facade names here drop the leading "__" (sync_hscb / wait_ipc_scb):
 // cce_aicore_intrinsics.h *already* declares __sync_hscb and __wait_ast_scb as real
@@ -75,7 +74,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // cannot address a geometric neighbor's IPC_SCB / L1).  So the DEFAULT build models
 // each direction IPC_SCB slot as a volatile GM word and the neighbor L1 as a GM
 // window: SYNC_HSCB -> cross-core GM store + cache maintenance; WAIT_SPR -> GM
-// spin-poll (read+block); COPY_UBUF_TO_NBR -> UB->GM window copy.  Define
+// spin-poll (read+block); COPY_L1_TO_NBR -> local producer-window read followed
+// by a remote receive-window write.  Define
 // PTO_GRID_CCE_NATIVE on silicon that provides the builtins to route each facade to
 // the real __builtin_cce_*; call sites do not change.
 
@@ -91,65 +91,155 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 namespace pto {
 
-// Forward declarations of the GridPipe group/topology types.  They are defined
-// in grid_intrinsic.hpp, which includes THIS header (so a real include here
-// would be circular).  The broadcast/reduce group intrinsics below only need
-// their NAMES -- GridGroup as a non-type template parameter and GridRect as an
-// unused by-reference group descriptor -- so forward declarations suffice.
-// (Their underlying-type / field definitions are complete by the time any
-// translation unit that instantiates these templates is compiled.)
-enum class GridGroup : uint8_t;
-struct GridRect;
+// ---------------------------------------------------------------------------
+// GridBlockRect: the MOV_UBUF_GROUP `group` machine operand -- WHICH CORES take
+// part in a group collective, named the way this mesh names cores everywhere
+// else: by BLOCK ID.  A group is the INCLUSIVE sub-rectangle of the mesh whose
+// opposite corners are the block ids `topLeft` and `botRight`; its members are
+// every cell inside it, ranked row-major (which is ascending block id).
+// `meshCols` is the mesh width -- what turns a block id back into a coordinate
+// (blockId = row*meshCols + col).  Silicon knows the mesh it is wired into; the
+// mock has to be told, so the width travels in the descriptor.
+//
+// This REPLACES the (memberCount + rank-strided arena) pair the instruction used
+// to take.  Two corners describe the old ROW / COL groups exactly (a one-row /
+// one-column rectangle) and, unlike a rank stride, they also describe a
+// MULTI-ROW rectangle: the jump in block id at a row boundary is the
+// instruction's own arithmetic now, not a geometry the caller has to fold into a
+// single stride that cannot express it.
+//
+// It is defined HERE, in the machine layer, because the member set is a machine
+// operand; grid_intrinsic.hpp (which includes this header) adds the Tier-2
+// helpers that build one out of mesh topology (GridBlockRectOfGroup et al).
+// ---------------------------------------------------------------------------
+struct GridBlockRect {
+    uint32_t topLeft = 0;  // block id of the rectangle's top-left cell
+    uint32_t botRight = 0; // block id of the rectangle's bottom-right cell (INCLUSIVE)
+    uint32_t meshCols = 0; // mesh width; 0 => empty group, and the instruction is a no-op
+};
+
+AICORE constexpr uint32_t GridBlockRectRowSpan(const GridBlockRect& g)
+{
+    return (g.meshCols == 0 || g.botRight < g.topLeft) ? 0u : (g.botRight / g.meshCols - g.topLeft / g.meshCols + 1u);
+}
+
+AICORE constexpr uint32_t GridBlockRectColSpan(const GridBlockRect& g)
+{
+    if (g.meshCols == 0 || g.botRight < g.topLeft) {
+        return 0u;
+    }
+    const uint32_t c0 = g.topLeft % g.meshCols;
+    const uint32_t c1 = g.botRight % g.meshCols;
+    return (c1 < c0) ? 0u : (c1 - c0 + 1u); // corners crossed in the column axis => empty
+}
+
+AICORE constexpr uint32_t GridBlockRectSize(const GridBlockRect& g)
+{
+    return GridBlockRectRowSpan(g) * GridBlockRectColSpan(g);
+}
+
+// Block id of the member whose rank-in-group is `rank`, row-major inside the
+// rectangle.  Rank order is ascending block id, which is what keeps a row/column
+// fan-in folding in the same order the directional relay accumulates in (so the
+// two lowerings of a reduce stay bit-identical).
+AICORE constexpr uint32_t GridBlockRectMember(const GridBlockRect& g, uint32_t rank)
+{
+    const uint32_t cols = GridBlockRectColSpan(g);
+    return (cols == 0) ? g.topLeft : (g.topLeft + (rank / cols) * g.meshCols + (rank % cols));
+}
+
+// Is `blockId` one of the group's members?  A block id between the two corners
+// is NOT enough -- a multi-row rectangle skips the cells outside its columns.
+AICORE constexpr bool GridBlockRectContains(const GridBlockRect& g, uint32_t blockId)
+{
+    return GridBlockRectSize(g) != 0 && blockId >= g.topLeft && blockId <= g.botRight &&
+           (blockId % g.meshCols) >= (g.topLeft % g.meshCols) && (blockId % g.meshCols) <= (g.botRight % g.meshCols);
+}
+
+// Pack the member set + the caller's own block id into the 64-bit `group_desc`
+// machine operand the native builtin takes: 16 bits each of
+// [topLeft | botRight | meshCols | root], where root is the issuing core -- the
+// SOURCE of a COPY, the SINK of a combine.
+AICORE constexpr uint64_t GridPackGroupDesc(const GridBlockRect& g, uint32_t selfBlockId)
+{
+    return (static_cast<uint64_t>(g.topLeft & 0xFFFFu)) | (static_cast<uint64_t>(g.botRight & 0xFFFFu) << 16) |
+           (static_cast<uint64_t>(g.meshCols & 0xFFFFu) << 32) | (static_cast<uint64_t>(selfBlockId & 0xFFFFu) << 48);
+}
 
 // ---------------------------------------------------------------------------
 // ScbKind: the G2 SYNC_HSCB `kind` machine operand (V8 §3.3 G2).  READY stores the
-// producer's prod_idx into the downstream consumer's ready_scb_<dir>; FREE stores the
-// consumer's cons_idx into the upstream producer's free_scb_<dir>.  The mock resolves
-// the specific ready/free target into the `peerScb` pointer already (via the runtime
-// RemoteScbPtr helper), so sync_hscb need not carry kind/dir/dist redundantly; this
+// producer's prod_idx into the consumer's ready_scb for that channel; FREE stores the
+// consumer's cons_idx into the producer's independently negotiated free_scb channel;
+// CLOSE stores the final prod_idx into the consumer's close_scb.  The mock
+// resolves the specific ready/free target into the `peerScb` pointer already (via the
+// runtime RemoteScbPtr helper), so sync_hscb need not carry the kind redundantly; this
 // enum is kept for documentation and for the native lowering's operand encoding.
 // ---------------------------------------------------------------------------
 enum class ScbKind : uint8_t {
-    READY = 0, // SYNC_HSCB(READY): prod_idx -> downstream ready_scb_<dir>
-    FREE = 1,  // SYNC_HSCB(FREE):  cons_idx -> upstream   free_scb_<dir>
+    READY = 0, // SYNC_HSCB(READY): prod_idx -> the consumer's ready_scb[chan]
+    FREE = 1,  // SYNC_HSCB(FREE):  cons_idx -> the producer's free_scb[chan]
+    CLOSE = 2, // SYNC_HSCB(CLOSE): final prod_idx -> the consumer's close_scb[chan]
 };
 
 // ---------------------------------------------------------------------------
-// (1) COPY_UBUF_TO_NBR  ->  copy_ubuf_to_neighbor_ubuf  ->  __builtin_cce_copy_ubuf_to_neighbor_ubuf
+// (1) COPY_L1_TO_NBR  ->  copy_l1_to_neighbor_l1
+//                      ->  __builtin_cce_copy_ubuf_to_neighbor_ubuf (legacy compiler spelling)
 //
-// Cross-core payload write: local UB -> the target core's L1/SRAM slot (V8 §3.3 G1,
-// HW-DEP-0, the ONLY new machine instruction).  Not self-syncing; data-ready is
+// Cross-core payload write: a dedicated local producer L1 slot -> the target
+// core's receive-side L1/SRAM slot (V8 §3.3 G1, HW-DEP-0, the ONLY new
+// machine instruction).  Real WSE has one unified L1 SRAM; there is no separate
+// vector UB address space that may be used as the source mapping.  Not
+// self-syncing; data-ready is
 // announced by the following sync_hscb(READY) after the publish fence (V8 R5).
 //
 // §3.3 G1 operands (dir, dist, nbr_off, local_off, bytes) map to this facade as:
 // `dstNeighborSlot` = the resolved neighbor L1 slot (native: the encoded neighbor L1
 // address resolved from (dir, dist, nbr_off); mock: the GM window standing in for
-// it); `src` = the local UB source tile (local_off folded into the UB pointer);
-// `bytes` = payload size.
+// it); `srcProducerSlot` = the isolated local L1 producer slot (mock: a disjoint
+// range in this core's GM window); `transferScratch` is only the A3 mock's UB DMA
+// pump and is not an architectural source address; `bytes` = payload size.
 // ---------------------------------------------------------------------------
-AICORE inline void copy_ubuf_to_neighbor_ubuf(__gm__ void* dstNeighborSlot, __ubuf__ void* src, uint32_t bytes)
+AICORE inline void copy_l1_to_neighbor_l1(
+    __gm__ void* dstNeighborSlot, __gm__ const void* srcProducerSlot, __ubuf__ void* transferScratch, uint32_t bytes)
 {
 #if defined(PTO_GRID_CCE_NATIVE)
-    __builtin_cce_copy_ubuf_to_neighbor_ubuf(dstNeighborSlot, src, bytes, /*config=*/0);
+    (void)transferScratch;
+    // The currently exposed builtin retains the historical "ubuf" spelling.
+    // On WSE that qualifier names the same physical unified L1 SRAM; the pointer
+    // value is the producer staging address, never the caller's tile address.
+    auto* srcUnifiedL1 = reinterpret_cast<__ubuf__ void*>(reinterpret_cast<uint64_t>(srcProducerSlot));
+    __builtin_cce_copy_ubuf_to_neighbor_ubuf(dstNeighborSlot, srcUnifiedL1, bytes, /*config=*/0);
 #elif defined(__CPU_SIM)
-    // CPU_SIM: __gm__/__ubuf__ collapse to ordinary host pointers and the CCE DMA
-    // intrinsic (copy_ubuf_to_gm_align_b8) is not declared in this build, so a plain
-    // byte copy stands in for the neighbor L1 write.  A loop (not memcpy) keeps the
-    // CPU-sim source lint happy.
+    // CPU_SIM: address-space qualifiers collapse to host pointers.  Read from the
+    // explicit producer range so the model catches source/receive-ring aliasing.
+    (void)transferScratch;
     auto* dstBytes = reinterpret_cast<uint8_t*>(dstNeighborSlot);
-    auto* srcBytes = reinterpret_cast<uint8_t*>(src);
+    const auto* srcBytes = reinterpret_cast<const uint8_t*>(srcProducerSlot);
     for (uint32_t i = 0; i < bytes; ++i) {
         dstBytes[i] = srcBytes[i];
     }
 #else
-    // A3 mock: chunked UB -> GM-window copy stands in for the neighbor L1 write.
+    // A3 mock: both L1 ranges are represented by GM.  Pump local producer GM ->
+    // scratch UB -> peer GM in chunks.  The scratch pointer is the original tile
+    // storage; each load restores the same staged bytes before the outbound DMA,
+    // so it remains unchanged when this synchronous facade returns.
     constexpr uint32_t kChunkBytes = 256;
     auto* dstBytes = reinterpret_cast<__gm__ uint8_t*>(dstNeighborSlot);
-    auto* srcBytes = reinterpret_cast<__ubuf__ uint8_t*>(src);
+    const auto* srcBytes = reinterpret_cast<__gm__ const uint8_t*>(srcProducerSlot);
+    auto* scratchBytes = reinterpret_cast<__ubuf__ uint8_t*>(transferScratch);
     uint32_t offset = 0;
     while (offset < bytes) {
         uint32_t chunk = (bytes - offset > kChunkBytes) ? kChunkBytes : (bytes - offset);
-        copy_ubuf_to_gm_align_b8(dstBytes + offset, srcBytes + offset, 0, 1, chunk, 0, 0, 0, 0);
+        copy_gm_to_ubuf_align_b8(scratchBytes + offset, srcBytes + offset, 0, 1, chunk, 0, 0, 0, 0);
+#ifndef __PTO_AUTO__
+        pipe_barrier(PIPE_ALL);
+#endif
+        dsb(DSB_DDR);
+        copy_ubuf_to_gm_align_b8(dstBytes + offset, scratchBytes + offset, 0, 1, chunk, 0, 0, 0, 0);
+#ifndef __PTO_AUTO__
+        pipe_barrier(PIPE_ALL);
+#endif
+        dsb(DSB_DDR);
         offset += chunk;
     }
 #endif
@@ -158,10 +248,12 @@ AICORE inline void copy_ubuf_to_neighbor_ubuf(__gm__ void* dstNeighborSlot, __ub
 // ---------------------------------------------------------------------------
 // (2) SYNC_HSCB / ST_HSCB  ->  __sync_hscb  ->  __builtin_cce___sync_hscb
 //
-// Store this core's new absolute count into the direction scoreboard of the peer
-// (READY -> downstream neighbor's ready_scb = prod_idx; FREE -> upstream neighbor's
-// free_scb = cons_idx).  Single external writer per scoreboard (SPSC), so the
-// overwrite store of a monotone absolute count is safe (V8 §2.1).
+// Store this core's new absolute count into a resolved peer word (READY ->
+// downstream ready_scb = prod_idx; FREE -> upstream free_scb = cons_idx; CLOSE ->
+// downstream close_scb = final prod_idx).  The bind control path also uses the
+// same resolved-store mechanism for its request/response L1 words.  Each live word
+// has one external writer in the time-division protocol, so overwrite stores are
+// safe (V8 §2.1).
 //
 // §3.3 G2 operands (kind, dir, dist, abs_count): `peerScb` is the RESOLVED peer
 // scoreboard (native: the encoded peer IPC_SCB address resolved from (kind, dir,
@@ -207,11 +299,9 @@ AICORE inline void sync_hscb(__gm__ uint32_t* peerScb, uint32_t absCount)
 // ===========================================================================
 
 namespace grid_cce_detail {
-// Shared GM-mock scalar read of a word this core owns (an IPC_SCB stand-in or an
-// L1 word).  The dcci is not optional: AICORE caches are not coherent between
-// cores, so without invalidating the line first this can return a stale value that
-// a peer's sync_hscb store already superseded -- the same reason the wait_ipc_scb
-// spin re-invalidates on every iteration.
+// Shared GM-mock scalar read of a word this core owns.  The leading dcci
+// invalidates the local line first: AICORE caches are not coherent between cores,
+// so without it the read can return a stale copy.
 AICORE inline uint32_t read_local_word(__gm__ uint32_t* addr)
 {
     if (addr == nullptr) {
@@ -225,7 +315,7 @@ AICORE inline uint32_t read_local_word(__gm__ uint32_t* addr)
 }
 
 // Shared GM-mock scalar write of a word this core owns.  The trailing dcci writes
-// the line back so a later read (this core's mov_l1_to_gpr, or the host's D2H dump)
+// the line back so a later read (this core's mov_x_to_gpr, or the host's D2H dump)
 // observes it; AICORE caches are not coherent between cores.
 AICORE inline void write_local_word(__gm__ uint32_t* addr, uint32_t value)
 {
@@ -275,9 +365,10 @@ AICORE inline bool poll_ipc_scb_ge(__gm__ uint32_t* localScb, uint32_t threshold
 // mirroring the real __wait_ast_scb -- this is the documented CCE intrinsic for G3.
 //
 // §3.3 G3 operands (local_scb_id, threshold): `slot` selects the native IPC_SCB slot
-// (0..15) -- ready_scb_<dir> -> slot dirIdx, free_scb_<dir> -> slot
-// kGridDirectionCount+dirIdx; `localScb` is the GM word the mock reads instead.  Native
-// ignores localScb; the mock ignores slot.  Memory ordering: acquire.
+// (0..15) -- ready_scb of channel c -> slot c, free_scb of channel c -> slot
+// kGridChanCount+c, close_scb of channel c -> slot 2*kGridChanCount+c;
+// `localScb` is the GM word the mock reads instead.  Native ignores
+// localScb; the mock ignores slot.  Memory ordering: acquire.
 AICORE inline void wait_ipc_scb(__gm__ uint32_t* localScb, uint32_t threshold, uint32_t slot)
 {
 #if defined(PTO_GRID_CCE_NATIVE)
@@ -311,50 +402,72 @@ AICORE inline bool wait_ipc_scb_sim(__gm__ uint32_t* localScb, uint32_t threshol
 // ===========================================================================
 // (4) MOV_SPR2X  ->  __mov_ipc_scb_to_l1  ->  __builtin_cce___mov_ipc_scb_to_l1
 //
-// Copy a LOCAL IPC_SCB into a LOCAL L1 word.  NOT part of any handshake -- a
-// scoreboard TEST is wait_ipc_scb, which compares inside the instruction.  The one
-// legitimate use is the 接力计数 handoff's relay step: the retiring producer's
-// final prod_idx is sitting in this core's ready_scb and has to be forwarded to the
-// incoming producer, so it must first land somewhere ST_HSCB can source from, which
-// is L1.  There is no SPR -> GPR variant because nothing needs one.
+// Copy a LOCAL IPC_SCB into a LOCAL memory word.  It is not a steady-state
+// wait pre-check -- wait_ipc_scb compares inside the instruction.  GridPipe uses
+// it on control paths to save free credit and to snapshot ready/close counts while
+// selecting and rebasing a time-division channel.  There is no SPR -> GPR variant;
+// the value must land in memory first.
 //
 // `srcSlot` selects the native IPC_SCB slot (0..15); `srcScb` is the GM word the
-// mock reads instead (native ignores it, the mock ignores the slot).  `dstL1` is the
-// local L1 word to deposit into.  Null operands are tolerated as no-ops, matching
-// sync_hscb / wait_ipc_scb.
+// mock reads instead (native ignores it, the mock ignores the slot).  `dst` is the
+// local word to deposit into.  Null operands are no-ops, matching sync_hscb.
 // ===========================================================================
-AICORE inline void mov_ipc_scb_to_l1(__gm__ uint32_t* dstL1, __gm__ uint32_t* srcScb, uint32_t srcSlot)
+AICORE inline void mov_ipc_scb_to_l1(__gm__ uint32_t* dst, __gm__ uint32_t* srcScb, uint32_t srcSlot)
 {
 #if defined(PTO_GRID_CCE_NATIVE)
     (void)srcScb;
-    __builtin_cce___mov_ipc_scb_to_l1(dstL1, srcSlot); // MOV_SPR2X; encoding per ISA manual
+    __builtin_cce___mov_ipc_scb_to_l1(dst, srcSlot); // MOV_SPR2X; encoding per ISA manual
 #else
     (void)srcSlot;
-    grid_cce_detail::write_local_word(dstL1, grid_cce_detail::read_local_word(srcScb));
+    grid_cce_detail::write_local_word(dst, grid_cce_detail::read_local_word(srcScb));
 #endif
 }
 
 // ===========================================================================
-// (5) MOV_L12X  ->  __mov_l1_to_gpr  ->  __builtin_cce___mov_l1_to_gpr
+// (5) MOVX2SPR  ->  __mov_x_to_ipc_scb  ->  __builtin_cce___mov_x_to_ipc_scb
 //
-// READ a LOCAL L1/SRAM word into a scalar GPR -- the only way a value in memory
-// becomes something the scalar unit can branch on or run a counter with.  Two uses,
-// both in the 接力计数 relay: the incoming producer loads the delivered baseline
-// into its prod_idx (TPUSH derives the ring slot and the free threshold from it),
-// and the relaying consumer reads back the word MOV_SPR2X just staged so it can
-// compare it against cons_idx.
+// Install a scalar into a LOCAL IPC_SCB.  This is NOT used by the current GridPipe
+// handshake: a scoreboard has exactly one writer and that writer is the PEER
+// (选型文档 §1.1 约束①: a core may not write its own IPC_SCB).  During rebinding the
+// new consumer transfers its baseline directly with SYNC_HSCB to the selected local
+// producer channel.  Calling MOVX2SPR on such a live GridPipe SCB could race that
+// external writer and lose credit; the facade remains only as a direct machine
+// primitive for callers that can independently prove exclusive ownership.
 //
-// Unlike mov_ipc_scb_to_l1 above this addresses L1 rather than naming a slot, which
-// is exactly why the two cannot share a facade.  On the receiving side the caller
-// must have observed the arrival doorbell (wait_ipc_scb on the install scoreboard)
-// first; this read carries no synchronisation of its own.
+// `slot` selects the native IPC_SCB slot (0..15); `localScb` is the GM word the mock
+// writes instead (native ignores it, the mock ignores the slot).  Null is a no-op,
+// matching sync_hscb / wait_ipc_scb.
 // ===========================================================================
-AICORE inline uint32_t mov_l1_to_gpr(__gm__ uint32_t* localL1)
+AICORE inline void mov_x_to_ipc_scb(__gm__ uint32_t* localScb, uint32_t slot, uint32_t value)
 {
 #if defined(PTO_GRID_CCE_NATIVE)
-    return __builtin_cce___mov_l1_to_gpr(localL1); // MOV_L12X; encoding per ISA manual
+    (void)localScb;
+    __builtin_cce___mov_x_to_ipc_scb(slot, value); // MOVX2SPR; encoding per ISA manual
 #else
-    return grid_cce_detail::read_local_word(localL1);
+    (void)slot;
+    grid_cce_detail::write_local_word(localScb, value);
+#endif
+}
+
+// ===========================================================================
+// (6) MOVX2GPR  ->  __mov_x_to_gpr  ->  __builtin_cce___mov_x_to_gpr
+//
+// READ a LOCAL word into a scalar GPR -- the only way a value in memory becomes
+// something the scalar unit can branch on or run a counter with.  V8 spells the
+// same move MOV_L12X when the source is specifically L1; the instruction is named
+// by where the value LANDS, so one facade covers both commit-word polling and the
+// bind-response ready-baseline install into prod_idx.
+//
+// Unlike mov_x_to_ipc_scb above this addresses memory rather than naming a slot,
+// which is exactly why the two cannot share a facade.  It carries no
+// synchronisation of its own: the caller must already own the word it reads.
+// ===========================================================================
+AICORE inline uint32_t mov_x_to_gpr(__gm__ uint32_t* localWord)
+{
+#if defined(PTO_GRID_CCE_NATIVE)
+    return __builtin_cce___mov_x_to_gpr(localWord); // MOVX2GPR; encoding per ISA manual
+#else
+    return grid_cce_detail::read_local_word(localWord);
 #endif
 }
 
@@ -363,9 +476,10 @@ AICORE inline uint32_t mov_l1_to_gpr(__gm__ uint32_t* localL1)
 // communication MODE (design: 2026-07-24-bcast-reduce-合并mov_ubuf_group方案.md
 // §2.1).  From the issuing core's perspective a group broadcast (1->N identity
 // copy, push) and a group reduce (N->1 element-wise combine, pull) are the SAME
-// action -- move a UB tile to/from the resolved group arena -- differing only in
+// action -- move local data to/from the resolved group arena -- differing only in
 // the NoC mode; that mode is this runtime operand, NOT a different instruction.
-// COPY = replicate-fan-out (UB -> arena, the former bcast_ubuf_to_group);
+// COPY = replicate-fan-out (dedicated producer L1 -> arena; GridPipe uses
+// copy_l1_to_group so the source cannot alias a receive ring);
 // SUM/MAX/MIN = combine-fan-in (arena -> UB, the former reduce_group_to_ubuf).
 // The datapath direction is IMPLIED by op (COPY => out, combine => in).
 // Values are deliberately comm::ReduceOp{Sum=0,Max=1,Min=2} + 1 so the Tier-2
@@ -378,20 +492,61 @@ enum class GridCollOp : uint8_t {
     MIN = 3,
 };
 
+namespace grid_cce_detail {
+// Byte distance from THIS core's copy of a symmetric group slot to member
+// `blockId`'s copy of the same slot.  Signed: a member's block id may sit either
+// side of the caller's, and the top-left member of a group usually sits below it.
+// See the MOV_UBUF_GROUP note below for why a uniform per-block-id stride is what
+// the mock uses to model symmetric addressing.
+AICORE constexpr int64_t member_slot_delta(uint32_t blockId, uint32_t selfBlockId, uint32_t blockStride)
+{
+    return (static_cast<int64_t>(blockId) - static_cast<int64_t>(selfBlockId)) * static_cast<int64_t>(blockStride);
+}
+} // namespace grid_cce_detail
+
+// Broadcast COPY counterpart of mov_ubuf_group for the unified-L1 address
+// model.  The architectural source is `srcProducerSlot`, a dedicated L1 range;
+// `transferScratch` exists only because the A3 GM mock needs UB as a DMA pump.
+// Native still lowers to one group instruction (whose current builtin retains
+// the historical `ubuf` spelling), while the mock expands it per member.
+AICORE inline void copy_l1_to_group(
+    __gm__ const void* srcProducerSlot, __gm__ void* groupSlot, __ubuf__ void* transferScratch, uint32_t bytes,
+    uint32_t blockStride, const pto::GridBlockRect& group, uint32_t selfBlockId, uint64_t groupDesc = 0)
+{
+    const uint32_t stride = (blockStride == 0) ? bytes : blockStride;
+#if defined(PTO_GRID_CCE_NATIVE)
+    (void)transferScratch;
+    const uint64_t desc = (groupDesc != 0) ? groupDesc : pto::GridPackGroupDesc(group, selfBlockId);
+    auto* srcUnifiedL1 = reinterpret_cast<__ubuf__ void*>(reinterpret_cast<uint64_t>(srcProducerSlot));
+    __builtin_cce_mov_ubuf_group(
+        srcUnifiedL1, groupSlot, bytes, stride, static_cast<uint32_t>(pto::GridCollOp::COPY), /*eltype=*/1, desc);
+#else
+    (void)groupDesc;
+    const uint32_t memberCount = pto::GridBlockRectSize(group);
+    for (uint32_t k = 0; k < memberCount; ++k) {
+        auto* dst = reinterpret_cast<__gm__ uint8_t*>(groupSlot) +
+                    grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, k), selfBlockId, stride);
+        copy_l1_to_neighbor_l1(dst, srcProducerSlot, transferScratch, bytes);
+    }
+#endif
+}
+
 // ===========================================================================
-// (6) MOV_UBUF_GROUP  ->  mov_ubuf_group  ->  __builtin_cce_mov_ubuf_group
+// (7) MOV_UBUF_GROUP  ->  mov_ubuf_group  ->  __builtin_cce_mov_ubuf_group
 //
 // Unified template-free group collective transfer.  The issuing core moves
-// `bytes` between its local UB tile and the resolved per-member group arena,
-// with the NoC collective mode selected by the RUNTIME `op` operand:
+// `bytes` between its local UB tile and every group member's copy of one
+// SYMMETRIC group slot, with the NoC collective mode selected by the RUNTIME
+// `op` operand:
 //   * op == COPY          : broadcast -- this core is the SOURCE; its UB tile is
-//     replicated once into every member's slot (1->N fan-out, push).  Byte-level
-//     pure copy (does NOT read element values), so eltype is IGNORED -- mirrors
-//     copy_ubuf_to_neighbor_ubuf above.
-//   * op == SUM/MAX/MIN   : reduce -- this core is the SINK; it reads every
-//     member's contribution slot and folds them element-wise by op into UB
-//     (N->1 fan-in, pull).  Element-wise combine MUST know the element width, so
-//     `eltype` (1/2/4 bytes) selects the combine granularity.
+//     replicated once into every member's copy of the slot (1->N fan-out, push).
+//     Byte-level pure copy (does NOT read element values), so eltype is IGNORED
+//     -- retained for non-GridPipe compatibility.  GridPipe broadcast uses
+//     copy_l1_to_group above so its architectural source is dedicated L1.
+//   * op == SUM/MAX/MIN   : reduce -- this core is the SINK; every member's copy
+//     of the slot is read and folded element-wise by op into UB (N->1 fan-in,
+//     pull).  Element-wise combine MUST know the element width, so `eltype`
+//     (1/2/4 bytes) selects the combine granularity.
 // This collapses the former bcast_ubuf_to_group + reduce_group_to_ubuf<T,Op> pair
 // (two machine instructions, two template facades) into ONE machine instruction
 // and ONE template-free facade: the NoC mode + dtype are runtime operand fields,
@@ -399,13 +554,27 @@ enum class GridCollOp : uint8_t {
 // (MemoryDirection_t / atomic_op_t).  NOT self-syncing: data-ready is still
 // announced by the caller's sync_hscb(READY) after the publish fence.
 //
-// `groupSlotBase` is the RESOLVED per-member arena base (member 0's slot); member
-// m's slot = groupSlotBase + m*memberStride (memberStride==0 means packed, stride
-// == bytes).  Writable for COPY (the source writes each slot); read-only for
-// SUM/MAX/MIN (the sink only reads contributions -- the caller const-casts).  The
-// Tier-2 caller resolves member spacing from the group topology (ROW/COL are
-// uniformly spaced; a non-uniform multi-row SUBRECT falls back to a per-member
-// copy_ubuf_to_neighbor_ubuf loop and never reaches here).
+// WHO the collective ends at is now an OPERAND, not an implication of who ran
+// the code: `selfBlockId` is the issuing core's own block id and names the
+// collective's ROOT -- the SOURCE of a COPY, the SINK of a combine.  `group`
+// (GridBlockRect) names the member set as the two corner block ids of a mesh
+// sub-rectangle.  Together they read exactly as the collective is specified:
+// every core in the rectangle contributes the data at its own copy of
+// `groupSlot`, and the reduction of all of it lands in the UB of the core whose
+// block id is `selfBlockId`.  The root is normally a member of the rectangle
+// (GridBlockRectContains), but nothing here requires it -- the member set comes
+// from the corners alone, so a core outside the rectangle can gather it.
+//
+// `groupSlot` is THIS core's copy of the symmetric slot; member b's copy sits at
+// `groupSlot + (b - selfBlockId)*blockStride` (blockStride == 0 means packed by
+// block id, stride == bytes).  The stride is how the MOCK models "the same
+// address in every core's space" -- the per-cell HCCL windows and the demo's
+// contribution arenas are both laid out uniformly by block id; silicon resolves a
+// symmetric address in the NoC and ignores the operand.  Writable for COPY (the
+// source writes each member's copy); read-only for SUM/MAX/MIN (the sink only
+// reads contributions -- the caller const-casts).  Because members are walked by
+// BLOCK ID, a multi-row rectangle costs nothing extra here: the row-boundary jump
+// is this arithmetic, not a stride the caller has to fake.
 //
 // `combineScratch` is the A3-mock combine scratch (one member's worth of UB).
 // REQUIRED on the A3 mock for op != COPY (no on-transit combine: the in-core Vec
@@ -413,16 +582,20 @@ enum class GridCollOp : uint8_t {
 // (hardware collective) / __CPU_SIM (host loop reads members directly).
 // ===========================================================================
 AICORE inline void mov_ubuf_group(
-    __ubuf__ void* ubTile, __gm__ void* groupSlotBase, uint32_t bytes, uint32_t memberCount, uint32_t memberStride,
-    pto::GridCollOp op, uint32_t eltype, const pto::GridRect& rect, __ubuf__ void* combineScratch = nullptr,
+    __ubuf__ void* ubTile, __gm__ void* groupSlot, uint32_t bytes, uint32_t blockStride, pto::GridCollOp op,
+    uint32_t eltype, const pto::GridBlockRect& group, uint32_t selfBlockId, __ubuf__ void* combineScratch = nullptr,
     uint64_t groupDesc = 0)
 {
-    (void)rect; // ROW/COL ignore; SUBRECT range already folded into base/stride by the caller.
-    const uint32_t stride = (memberStride == 0) ? bytes : memberStride;
+    const uint32_t stride = (blockStride == 0) ? bytes : blockStride;
+    const uint32_t memberCount = pto::GridBlockRectSize(group);
 #if defined(PTO_GRID_CCE_NATIVE)
-    (void)memberCount; // native: member count is encoded into the group descriptor.
+    (void)memberCount; // native: the member set travels in the group descriptor.
     (void)combineScratch;
-    __builtin_cce_mov_ubuf_group(ubTile, groupSlotBase, bytes, stride, static_cast<uint32_t>(op), eltype, groupDesc);
+    // The descriptor carries the member rectangle AND the root; `stride` still rides
+    // along as the machine's arena-spacing operand, but silicon resolves a symmetric
+    // address in the NoC and does not need it.
+    const uint64_t desc = (groupDesc != 0) ? groupDesc : pto::GridPackGroupDesc(group, selfBlockId);
+    __builtin_cce_mov_ubuf_group(ubTile, groupSlot, bytes, stride, static_cast<uint32_t>(op), eltype, desc);
 #elif defined(__CPU_SIM)
     // CPU_SIM: __gm__/__ubuf__ collapse to ordinary host pointers and the CCE DMA
     // intrinsic is not declared, so a typed host loop (no memcpy, lint-clean) stands
@@ -431,9 +604,10 @@ AICORE inline void mov_ubuf_group(
     (void)combineScratch;
     auto* ub = reinterpret_cast<uint8_t*>(ubTile);
     if (op == pto::GridCollOp::COPY) {
-        // broadcast: replicate ub -> every member's slot.
+        // broadcast: replicate ub -> every member's copy of the slot.
         for (uint32_t k = 0; k < memberCount; ++k) {
-            auto* d = reinterpret_cast<uint8_t*>(groupSlotBase) + static_cast<uint64_t>(k) * stride;
+            auto* d = reinterpret_cast<uint8_t*>(groupSlot) +
+                      grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, k), selfBlockId, stride);
             for (uint32_t i = 0; i < bytes; ++i) {
                 d[i] = ub[i];
             }
@@ -442,7 +616,9 @@ AICORE inline void mov_ubuf_group(
         // reduce: member 0 seeds ub, k>=1 folds element-wise by op (eltype picks width).
         const uint32_t n = bytes / eltype;
         for (uint32_t k = 0; k < memberCount; ++k) {
-            const uint8_t* in = reinterpret_cast<const uint8_t*>(groupSlotBase) + static_cast<uint64_t>(k) * stride;
+            const uint8_t* in =
+                reinterpret_cast<const uint8_t*>(groupSlot) +
+                grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, k), selfBlockId, stride);
             if (k == 0) {
                 for (uint32_t i = 0; i < bytes; ++i) {
                     ub[i] = in[i];
@@ -490,12 +666,13 @@ AICORE inline void mov_ubuf_group(
     (void)groupDesc;
     constexpr uint32_t kChunkBytes = 256;
     if (op == pto::GridCollOp::COPY) {
-        // broadcast: chunked UB -> GM-window copy of ubTile into every member's slot
-        // (mirrors copy_ubuf_to_neighbor_ubuf's 256B-chunked A3-mock pump).
-        auto* dstBase = reinterpret_cast<__gm__ uint8_t*>(groupSlotBase);
+        // Legacy non-GridPipe broadcast: chunked UB -> GM-window copy.  GridPipe's
+        // corrected unified-L1 path exits through copy_l1_to_group above instead.
+        auto* selfSlot = reinterpret_cast<__gm__ uint8_t*>(groupSlot);
         auto* srcBytes = reinterpret_cast<__ubuf__ uint8_t*>(ubTile);
         for (uint32_t k = 0; k < memberCount; ++k) {
-            __gm__ uint8_t* d = dstBase + static_cast<uint64_t>(k) * stride;
+            __gm__ uint8_t* d =
+                selfSlot + grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, k), selfBlockId, stride);
             for (uint32_t off = 0; off < bytes; off += kChunkBytes) {
                 uint32_t chunk = (bytes - off > kChunkBytes) ? kChunkBytes : (bytes - off);
                 copy_ubuf_to_gm_align_b8(d + off, srcBytes + off, 0, 1, chunk, 0, 0, 0, 0);
@@ -507,16 +684,19 @@ AICORE inline void mov_ubuf_group(
         // ReduceTiles (TADD/TMAX/TMIN) path.  One scratch buffer is reused per member.
         auto* accBytes = reinterpret_cast<__ubuf__ uint8_t*>(ubTile);
         auto* scrBytes = reinterpret_cast<__ubuf__ uint8_t*>(combineScratch);
-        auto* baseBytes = reinterpret_cast<__gm__ const uint8_t*>(groupSlotBase);
-        // member 0: contribution -> accumulator.
+        auto* selfSlot = reinterpret_cast<__gm__ const uint8_t*>(groupSlot);
+        // member 0 (the rectangle's top-left cell): contribution -> accumulator.
+        __gm__ const uint8_t* m0 =
+            selfSlot + grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, 0), selfBlockId, stride);
         for (uint32_t off = 0; off < bytes; off += kChunkBytes) {
             uint32_t chunk = (bytes - off > kChunkBytes) ? kChunkBytes : (bytes - off);
-            copy_gm_to_ubuf_align_b8(accBytes + off, baseBytes + off, 0, 1, chunk, 0, 0, 0, 0);
+            copy_gm_to_ubuf_align_b8(accBytes + off, m0 + off, 0, 1, chunk, 0, 0, 0, 0);
         }
         const uint32_t elemsPerRepeat = static_cast<uint32_t>(REPEAT_BYTE) / eltype; // 64 (float) / 128 (half)
         const uint32_t totalRepeats = bytes / static_cast<uint32_t>(REPEAT_BYTE);
         for (uint32_t k = 1; k < memberCount; ++k) {
-            __gm__ const uint8_t* mk = baseBytes + static_cast<uint64_t>(k) * stride;
+            __gm__ const uint8_t* mk =
+                selfSlot + grid_cce_detail::member_slot_delta(pto::GridBlockRectMember(group, k), selfBlockId, stride);
             for (uint32_t off = 0; off < bytes; off += kChunkBytes) {
                 uint32_t chunk = (bytes - off > kChunkBytes) ? kChunkBytes : (bytes - off);
                 copy_gm_to_ubuf_align_b8(scrBytes + off, mk + off, 0, 1, chunk, 0, 0, 0, 0);

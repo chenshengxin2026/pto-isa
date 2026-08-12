@@ -99,8 +99,10 @@ constexpr int BCAST_W = CONFIG_BCAST_W;
 constexpr int BCAST_TILE_ELEMS = BCAST_T * BCAST_W;
 constexpr int BCAST_TILE_BYTES = BCAST_TILE_ELEMS * 4; // fp32 payload tile
 
-// The group pipe's shared ring carries one [T, W] fp32 tile per slot.
+// Unicast slot ring (unused by this pure-broadcast smoke, but the GridPipe
+// template still carries it).  One [T, W] fp32 tile per slot.
 constexpr int BCAST_SLOT_BYTES = BCAST_TILE_BYTES;
+constexpr int BCAST_SLOT_COUNT = 2;
 
 // TBROADCAST (scheme-②) region sizing: the group is the sub-rectangle extent
 // (SUBRECT) or the larger of the row/col extent (ROW/COL); the shared ring
@@ -111,20 +113,40 @@ constexpr int BCAST_GROUP_MAX = (BCAST_SUBRECT != 0) ?
                                     ((BCAST_ROWS > BCAST_COLS) ? BCAST_ROWS : BCAST_COLS);
 constexpr int BCAST_BCAST_SLOT_COUNT = BCAST_GROUP_MAX;
 
-// Host-visible mirror of pto::a2a3_grid::WindowBytes<GridGroupPipe<...>>():
-//   kFlagsBytes (512)                          reserved / fault sentinels
-//   + SlotCount * SlotStride                   shared MPSC ring
-//   + 2 * GroupMax * BCAST_LANE_STRIDE         per-source ready + free lanes
-// A group pipe carries no scoreboard pair and no unicast ring -- its semaphores
-// ARE the lanes.  Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
-constexpr int BCAST_GRID_FLAGS_BYTES = 512;
+// Host-visible mirror of pto::a2a3_grid::WindowBytes<Pipe>():
+//   unicast layout = kSlotRegionOffset + ChanCount * SlotCount * SlotStride;
+//                    this smoke is pure broadcast, so ChanCount = 0 and the
+//                    unicast slot region is empty.
+//   + TBROADCAST region: BcastSlotCount * SlotStride (shared ring)
+//                       + 2 * GroupMax * BCAST_LANE_STRIDE (ready + free lanes)
+//   + SlotStride (isolated local producer L1 staging slot)
+// The fixed header is kFlagsBytes = 3 * kGridChanCount * kScbLineStride
+// (ready/free/close, one cache line each), two bind-control L1 lines, and the
+// LOCAL pipe record (binding table + consumer FSM and persistent counters).
+// Keep in sync with include/pto/npu/a2a3/grid_pipe_runtime.hpp.
+constexpr int BCAST_GRID_CHAN_COUNT = 0;       // pure broadcast: no unicast rings
+constexpr int BCAST_GRID_CHAN_MAX = 4;         // pto::kGridChanCount
+constexpr int BCAST_GRID_CONS_HIST_MAX = 8;    // pto::kGridConsHistMax
+constexpr int BCAST_GRID_SCB_LINE_STRIDE = 64; // pto::grid_mock::kScbLineStride
+constexpr int BCAST_ACTIVE_VECTOR_SUBBLOCK_ID = 0;
+constexpr int BCAST_GRID_FLAGS_BYTES = 3 * BCAST_GRID_CHAN_MAX * BCAST_GRID_SCB_LINE_STRIDE; // 768
+constexpr int BCAST_GRID_CONTROL_BYTES = 2 * BCAST_GRID_SCB_LINE_STRIDE;
+constexpr int BCAST_GRID_RECORD_WORDS = 4 + 8 * BCAST_GRID_CHAN_MAX + 4 * BCAST_GRID_CONS_HIST_MAX + 2; // 70
+constexpr int BCAST_GRID_RECORD_BYTES =
+    ((BCAST_GRID_RECORD_WORDS * 4 + BCAST_GRID_SCB_LINE_STRIDE - 1) / BCAST_GRID_SCB_LINE_STRIDE) *
+    BCAST_GRID_SCB_LINE_STRIDE; // 320
+constexpr int BCAST_GRID_SLOT_REGION_OFFSET =
+    BCAST_GRID_FLAGS_BYTES + BCAST_GRID_CONTROL_BYTES + BCAST_GRID_RECORD_BYTES; // 1216
 // One full cache line per lane -- must match grid_mock::kBcastLaneStride.  This
 // was sizeof(uint32_t) here while the device had already moved to 64, so every
 // window was short by 2*GroupMax*60 bytes and the ready lanes ran off the end
 // into the next cell's window; receivers then waited on a doorbell that had been
 // written outside their window and the smoke hung.
 constexpr int BCAST_LANE_STRIDE = 64;
-constexpr int BCAST_READY_LANES_OFF = BCAST_GRID_FLAGS_BYTES + BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
-constexpr int BCAST_WINDOW_BYTES = BCAST_READY_LANES_OFF + 2 * BCAST_GROUP_MAX * BCAST_LANE_STRIDE;
+constexpr int BCAST_UNICAST_WINDOW_BYTES =
+    BCAST_GRID_SLOT_REGION_OFFSET + BCAST_GRID_CHAN_COUNT * BCAST_SLOT_COUNT * BCAST_SLOT_BYTES;
+constexpr int BCAST_BCAST_REGION_BYTES =
+    BCAST_BCAST_SLOT_COUNT * BCAST_SLOT_BYTES + 2 * BCAST_GROUP_MAX * BCAST_LANE_STRIDE;
+constexpr int BCAST_WINDOW_BYTES = BCAST_UNICAST_WINDOW_BYTES + BCAST_BCAST_REGION_BYTES + BCAST_SLOT_BYTES;
 
 #endif // BCAST_SMOKE_CONFIG_HPP

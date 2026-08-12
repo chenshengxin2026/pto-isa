@@ -9,30 +9,32 @@ See LICENSE in the root of the software repository for the full text of the Lice
 */
 
 // A2/A3 backend for GridPipe TREDUCE<Op>: a fused "receive-combine-forward"
-// reduce hop along the PIPE's direction (the hop's peers are the pipe's bound
-// producer/consumer -- Op is the only per-call template argument).  Builds on
-// GridTPush.hpp / GridTPop.hpp -- see the V7 design spec section 5 (worked
-// ReduceSum example), which frames the row reduce as the SAME single-hop SPSC
-// handshake as AllGather, differing ONLY in the per-hop middle operation:
-// AllGather relays the tile, ReduceSum folds it in with a combine before
-// forwarding.  TREDUCE is that fused hop.
+// reduce hop.  Builds on GridTPush.hpp / GridTPop.hpp -- see the V7 design spec
+// section 5 (worked ReduceSum example), which frames the row reduce as the SAME
+// single-hop SPSC handshake as AllGather, differing ONLY in the per-hop middle
+// operation: AllGather relays the tile, ReduceSum folds it in with a combine
+// before forwarding.  TREDUCE is that fused hop.
 //
-// Semantics per cell (all roles derived from (Dir, Dist, coord, shape); no
-// explicit "am I root" flag needed -- the mesh boundary defines source/sink):
-//   * interior/sink (has an upstream Dist hops back along Dir):
-//         recv  <- TPOP<Dir,Dist>     (drain the transiting partial from upstream)
+// Semantics per cell.  A hop names its two peers -- the producer it drains and the
+// consumer it forwards to -- and kGridNoPeer for either half is what makes a cell a
+// source or a sink.  No explicit "am I root" flag, and no direction: the caller
+// derived both ids from the topology (GridPeerBlockIdForPop / GridPeerBlockIdForPush) and the
+// mesh boundary already turned into a kGridNoPeer there.
+//   * interior/sink (prodId names a core):
+//         recv  <- TPOP(prodId)       (drain the transiting partial)
 //         acc   <- combine(acc, recv) (fold in this cell's local contribution)
-//   * source/interior (has a downstream Dist hops on along Dir):
-//         TPUSH<Dir,Dist>(acc)        (forward the running reduction one hop)
-//   * sink (no downstream): acc holds the COMPLETE reduction; the caller stores it.
+//   * source/interior (consId names a core):
+//         TPUSH(acc, consId)          (forward the running reduction one hop)
+//   * sink (consId == kGridNoPeer): acc holds the COMPLETE reduction; the caller
+//     stores it.
 //
 // Along-the-path / on-transit compute (随路/过路计算): a fabric that can combine
 // in the router collapses this whole receive-combine-forward body into ONE
 // routed reduce-forward instruction -- `recv` and the in-core combine disappear
 // into the transfer.  On A3 there is no such fabric and the adder is core-local,
 // so TREDUCE lowers to exactly the local TPOP + combine + TPUSH sequence below.
-// Nothing in the (Dir, Op, Dist, pipe, acc, recv) signature changes between the
-// two lowerings; only the body does.
+// Nothing in the (Op, pipe, acc, recv, prodId, consId) signature changes between
+// the two lowerings; only the body does.
 
 #ifndef PTO_A2A3_GRID_TREDUCE_HPP
 #define PTO_A2A3_GRID_TREDUCE_HPP
@@ -42,7 +44,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <pto/comm/comm_types.hpp>         // pto::comm::ReduceOp (Sum/Max/Min) -- shared with the collective TREDUCE
 #include <pto/npu/a2a3/GridTPop.hpp>       // GRID_TPOP_IMPL (receive half)
 #include <pto/npu/a2a3/GridTPush.hpp>      // GRID_TPUSH_IMPL (forward half) + payload hooks
-#include <pto/npu/a2a3/grid_intrinsic.hpp> // CanPopK / CanPushK topology
+#include <pto/npu/a2a3/grid_intrinsic.hpp> // GridBlockIdValid
 #include <pto/npu/a2a3/grid_pipe_runtime.hpp>
 
 namespace pto {
@@ -71,7 +73,8 @@ AICORE inline void GridReduceCombine(TileAcc& acc, TileRecv& recv)
 // running reduction up to and including this cell (at the sink, the complete
 // result).  `recv` is the landing tile for the transiting partial (mandatory on
 // A3's in-core adder; unused by a fabric that combines on transit).  Both tiles
-// must share the reduce dtype/shape.
+// must share the reduce dtype/shape.  `prodId` / `consId` are the two peers of this
+// hop, each kGridNoPeer where the chain ends.
 //
 // Fences use the same conservative pipe_barrier(PIPE_ALL) + dsb(DSB_DDR) publish
 // form as GridTPush.hpp (parse-safe on every target profile).  A full barrier
@@ -81,20 +84,15 @@ AICORE inline void GridReduceCombine(TileAcc& acc, TileRecv& recv)
 //   * after the combine / before the push: drain the V combine so the MTE3
 //     payload copy reads the settled accumulator.
 // The push half additionally carries its own data-before-ready publish fence
-// inside GRID_TPUSH_IMPL.  The pop / push are gated on CanPopK / CanPushK so a
-// boundary cell never enters GRID_TPUSH_IMPL's out-of-mesh fault path.
+// inside GRID_TPUSH_IMPL.  Each half is gated on its peer id being a real core, so
+// a boundary cell never enters the out-of-mesh fault path.
 template <pto::comm::ReduceOp Op, typename Pipe, typename TileAcc, typename TileRecv>
-AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv)
+AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv, uint32_t prodId, uint32_t consId)
 {
-    static_assert(
-        Pipe::Dir != pto::GridDirection::SOURCE,
-        "GridPipe TREDUCE on a SOURCE-bound pipe is illegal (SOURCE is TPOP-only)");
-
-    // Receive-and-combine half.  A source cell (no producer peer on this pipe) has
-    // nothing to drain and forwards its own contribution unchanged.
-    const bool didCombine = pipe.HasProducer();
-    if (didCombine) {
-        GRID_TPOP_IMPL<Pipe, TileRecv>(pipe, recv);
+    // Receive-and-combine half.  A source cell (no producer on this hop) has nothing
+    // to drain and forwards its own contribution unchanged.
+    if (GridBlockIdValid(prodId, pipe.shape)) {
+        GRID_TPOP_IMPL<Pipe, TileRecv>(pipe, recv, prodId);
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
@@ -102,14 +100,14 @@ AICORE void GRID_TREDUCE_IMPL(Pipe& pipe, TileAcc& acc, TileRecv& recv)
         GridReduceCombine<Op, TileAcc, TileRecv>(acc, recv);
     }
 
-    // Forward half.  A sink cell (no consumer peer on this pipe) keeps the
-    // complete reduction in `acc` for the caller to store.
-    if (pipe.HasConsumer()) {
+    // Forward half.  A sink cell (no consumer on this hop) keeps the complete
+    // reduction in `acc` for the caller to store.
+    if (GridBlockIdValid(consId, pipe.shape)) {
 #ifndef __PTO_AUTO__
         pipe_barrier(PIPE_ALL);
 #endif
         dsb(DSB_DDR);
-        GRID_TPUSH_IMPL<Pipe, TileAcc>(pipe, acc);
+        GRID_TPUSH_IMPL<Pipe, TileAcc>(pipe, acc, consId);
     }
 }
 
@@ -123,38 +121,50 @@ __tf__ AICORE __ubuf__ void* TileUbPtr(TileT& tile);
 } // namespace a2a3_grid_payload
 
 // ===========================================================================
-// GRID_TREDUCE_GROUP_IMPL: N->1 group fan-in reduce.  The TARGET core (caller
-// == sink) reads every member's resolved contribution slot and folds them
-// element-wise with Op into `acc`, via the mov_ubuf_group intrinsic with op =
-// SUM/MAX/MIN (the unified group-collective CCE instruction, grid_cce_intrinsic.hpp).  This is the
-// hardware-accelerated single-instruction form of an N->1 fan-in -- a DIFFERENT
-// collective shape from the directional GRID_TREDUCE_IMPL relay above (§7.1):
-// every member's contribution is read directly by the sink, not relayed hop by
-// hop.  The directional relay above stays available for nearest-neighbor chains.
+// GRID_TREDUCE_GROUP_IMPL: N->1 group fan-in reduce.  Every core of the mesh
+// sub-rectangle `group` contributes the data at its own copy of `groupSlot`, and
+// the element-wise combine of all of it lands in the UB of the core whose block
+// id is `selfBlockId` -- the SINK.  One mov_ubuf_group intrinsic with op =
+// SUM/MAX/MIN (the unified group-collective CCE instruction,
+// grid_cce_intrinsic.hpp).  This is the hardware-accelerated single-instruction
+// form of an N->1 fan-in -- a DIFFERENT collective shape from the directional
+// GRID_TREDUCE_IMPL relay above (§7.1): every member's contribution is taken
+// directly by the sink, not relayed hop by hop.  The directional relay above
+// stays available for nearest-neighbor chains.
+//
+// WHO the reduction ends at is a value the caller states, not a property of
+// which core happens to execute this code: `selfBlockId` is the caller's own
+// block id, the same id every other grid instruction addresses a peer by, and it
+// names the sink.  WHICH cores feed it is `group` -- the two corner block ids of
+// a sub-rectangle.  Nothing else is needed: the GridGroup enum is gone from this
+// signature because ROW and COL ARE rectangles (one row / one column), and a
+// multi-row rectangle -- which the old rank-strided arena could not address at
+// all -- is now just another pair of corners.
 //
 // `scratch` is the in-core combine scratch (one member's worth of UB; required
-// by the A3 mock's in-core Vec combine).  `groupSlotBase` / `memberStride` /
-// `memberCount` describe the resolved per-member contribution arena -- e.g. the
-// contributors' partial buffer laid out uniform-stride.  The combine folds
-// members in ascending index order (member 0 seeds acc), so an SPMD row/col
-// fan-in reproduces the relay's left-to-right accumulation bit-for-bit (FP add
-// is commutative).
+// by the A3 mock's in-core Vec combine).  `blockStride` is the mock's model of
+// symmetric addressing: member b's contribution sits at `groupSlot + (b -
+// selfBlockId)*blockStride`, so the contribution arena is indexed by BLOCK ID
+// (silicon resolves the symmetric address in the NoC and ignores the operand).
+// The combine folds members in ascending rank order -- row-major in the
+// rectangle, i.e. ascending block id, member 0 seeding acc -- so an SPMD row/col
+// fan-in reproduces the relay's left-to-right accumulation bit-for-bit.
 // ===========================================================================
-template <pto::GridGroup Group, pto::comm::ReduceOp Op, typename T, typename TileAcc, typename TileScratch>
+template <pto::comm::ReduceOp Op, typename T, typename TileAcc, typename TileScratch>
 AICORE void GRID_TREDUCE_GROUP_IMPL(
-    TileAcc& acc, TileScratch& scratch, __gm__ const T* groupSlotBase, uint32_t bytes, uint32_t memberCount,
-    pto::GridRect rect = {}, uint32_t memberStride = 0)
+    TileAcc& acc, TileScratch& scratch, __gm__ const T* groupSlot, uint32_t bytes, pto::GridBlockRect group,
+    uint32_t selfBlockId, uint32_t blockStride = 0)
 {
     __ubuf__ T* dst = reinterpret_cast<__ubuf__ T*>(a2a3_grid_payload::TileUbPtr<TileAcc>(acc));
     __ubuf__ T* scr = reinterpret_cast<__ubuf__ T*>(a2a3_grid_payload::TileUbPtr<TileScratch>(scratch));
     // mov_ubuf_group with op = SUM/MAX/MIN (the reduce / combine-fan-in NoC mode).
     // GridCollOp is comm::ReduceOp + 1 (Sum=0->SUM=1, Max=1->MAX=2, Min=2->MIN=3);
     // eltype = sizeof(T) (2 -> half/_b16, 4 -> float/_b32).  reduce only READS the
-    // contribution arena, so const-cast away to satisfy the shared writable base.
+    // contributions, so const-cast away to satisfy the shared writable slot operand.
     pto::mov_ubuf_group(
-        reinterpret_cast<__ubuf__ void*>(dst), reinterpret_cast<__gm__ void*>(const_cast<__gm__ T*>(groupSlotBase)),
-        bytes, memberCount, memberStride, static_cast<pto::GridCollOp>(static_cast<uint32_t>(Op) + 1),
-        static_cast<uint32_t>(sizeof(T)), rect, reinterpret_cast<__ubuf__ void*>(scr));
+        reinterpret_cast<__ubuf__ void*>(dst), reinterpret_cast<__gm__ void*>(const_cast<__gm__ T*>(groupSlot)), bytes,
+        blockStride, static_cast<pto::GridCollOp>(static_cast<uint32_t>(Op) + 1), static_cast<uint32_t>(sizeof(T)),
+        group, selfBlockId, reinterpret_cast<__ubuf__ void*>(scr));
 }
 
 } // namespace pto

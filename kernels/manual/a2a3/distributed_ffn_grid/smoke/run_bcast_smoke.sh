@@ -9,10 +9,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # --------------------------------------------------------------------------------
 
-# GridPipe single-source broadcast smoke test.  One source cell TPUSH<ROW|COL>-es
-# a stamped fp32 tile to its whole span in a single multicast (batched writes +
-# one publish fence + batched doorbells); every other cell TPOP<dir,dist>s and
-# stores it.  Verifies out[cell] == in[span-source] in-process (no data files).
+# GridPipe single-source broadcast smoke test.  One source cell TBROADCASTs a
+# stamped fp32 tile to its whole group (batched writes + one publish fence +
+# batched doorbells); every other cell drains its source lane and stores it.
+# Verifies out[cell] == in[group-source] in-process (no data files).
 
 : "${ASCEND_CANN_PATH:=$(ls -1d /usr/local/Ascend/cann-*/set_env.sh 2>/dev/null | sort -V | tail -1)}"
 if [ -z "${ASCEND_CANN_PATH}" ]; then
@@ -64,7 +64,11 @@ done
 : "${BCAST_RECT_SRC:=0}"
 : "${BCAST_T:=16}"
 : "${BCAST_W:=64}"
-: "${DEVICE_ID:=${ASCEND_DEVICE_ID:-${DEVICE_ID:-0}}}"
+# TASK_DEVICE first, like the four run_*.sh next door: on this server an NPU run is
+# submitted through task-submit, which locks a card and exports its id there.  Without
+# it this script silently falls back to device 0 and runs on whatever card that is --
+# very likely one another user's task already holds.
+: "${DEVICE_ID:=${TASK_DEVICE:-${ASCEND_DEVICE_ID:-${DEVICE_ID:-0}}}}"
 
 if [[ ! "${SOC_VERSION}" =~ ^Ascend ]]; then
     echo "[ERROR] Unsupported SocVersion: ${SOC_VERSION}"

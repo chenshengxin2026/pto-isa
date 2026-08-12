@@ -21,10 +21,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // direction) it is realized as two bidirectional relays along the mesh line:
 //   phase 1 (B) row gather: forward EAST relay (gather to col-sink) + backward
 //                WEST relay (scatter to all) -- every cell ends with the [8,768]
-//                row block.  Each hop = TPOP<EAST> + TINSERT(own shard) + TPUSH<EAST>;
+//                row block.  Each hop = peer-id TPOP + TINSERT(own shard) + TPUSH;
 //   phase 2 (C) col gather: forward SOUTH relay + backward NORTH relay -- every
-//                cell ends with the full hidden [8,3072].  Each hop = TPOP<SOUTH> +
-//                TINSERT(own row block) + TPUSH<SOUTH>.
+//                cell ends with the full hidden [8,3072].  Each hop uses the same
+//                peer-id TPOP / TINSERT / TPUSH sequence.
 // Each relay is a linear fan-in-1 chain (a DAG, like the TREDUCE reduce chain), so
 // it has NO circular produce/consume dependency and runs reliably on the A2/A3 mock
 // without the cube keep-alive the MPSC variant needed.  The compute phases (A/D)
@@ -57,6 +57,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "common.hpp"
 #include "ffn_config.hpp"
 #include "gridpipe_payload_inl.hpp"
+#include "single_vector_sync_inl.hpp"
 #include "tpipe_tmov_inl.hpp"
 
 #ifdef __CCE_AICORE__
@@ -86,47 +87,38 @@ constexpr int kRowBlock = FFN_NCUT_ROW_BLOCK; // 768 (Phase-1 relay tile width)
 constexpr int kIfull = FFN_NCUT_I;            // 3072 (full intermediate / down K)
 constexpr int kHfull = FFN_NCUT_H;            // 7168 (gate/up K)
 
-// The relay is spelled with the PTO instructions TPUSH / TPOP, not the A2/A3
-// backend's GRID_TRY_*_IMPL entry points, so this demo exercises the ISA surface
-// itself (overload resolution, the SOURCE static_assert, the target-profile
-// guard) and not just the lowering.  The instructions carry no spin bound -- they
-// block like the hardware WAIT_SPR -- so a handshake mis-wire shows up as a hang
-// rather than a kFaultWaitReadyTimeout sentinel.  That is safe here because the
-// host waves each relay group wholly into one launch (see main_tpush_allgather).
-// To bound the spin while debugging, build with -DPTO_GRID_MOCK_WFE_MAX_SPINS=N
-// and call GRID_TRY_TPUSH_IMPL / GRID_TRY_TPOP_IMPL directly.
+// DEBUG: bound the relay spin so a mis-wire surfaces as a fault sentinel instead
+// of an infinite hang.  Generous enough that a correct (us-latency) relay never
+// trips it.  Set 0 to restore block-forever behaviour.
+#ifndef FFN_NCUT_GATHER_MAX_SPINS
+#define FFN_NCUT_GATHER_MAX_SPINS 100000000u
+#endif
+constexpr uint32_t kGatherMaxSpins = FFN_NCUT_GATHER_MAX_SPINS;
 
 // fp32 partials carried cube->vec through the C2V TPipe (phase A).
 using GatePipe = TPipe<0, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 
-// GridPipe types for the two relay gather phases.  A pipe is ONE channel bound
-// to one (producer, consumer) pair, so a bidirectional relay is TWO pipes: the
-// forward one gathers to the far end, the backward one scatters the complete
-// tile back.  P1 relays the [8,768] row block (EAST forward + WEST backward);
-// P2 relays the [8,3072] full hidden (SOUTH forward + NORTH backward).
-// SlotCount = 2 double-buffers each channel's own ring.
+// GridPipe types for the two relay gather phases.  Unicast-only (GroupMax = 0):
+// no broadcast region, fan-in 1 per direction.  P1 relays the [8,768] row block
+// (EAST forward + WEST backward); P2 relays the [8,3072] full hidden (SOUTH forward
+// + NORTH backward).  SlotCount = 2 double-buffers the two opposite directions.
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
 using RowBlockTile = Tile<TileType::Vec, half, kT, kRowBlock, BLayout::RowMajor>;
 using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
-using FfnGatherPipeP1Fwd =
-    GridPipe<RowBlockTile, GridDirection::EAST, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT>;
-using FfnGatherPipeP1Bwd =
-    GridPipe<RowBlockTile, GridDirection::WEST, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT>;
-using FfnGatherPipeP2Fwd =
-    GridPipe<HiddenFullTile, GridDirection::SOUTH, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT>;
-using FfnGatherPipeP2Bwd =
-    GridPipe<HiddenFullTile, GridDirection::NORTH, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT>;
-// Each phase's per-cell window holds the forward pipe first, then the backward
-// one (FFN_NCUT_TPUSH_PIPE_WIN_P* bytes each, the host-visible mirror of
-// pto::a2a3_grid::WindowBytes<Pipe>()).  Every rank computes the same offsets,
-// which is what lets the peer resolver line the scoreboards up.
+// A relay runs two flows through each cell -- the forward gather and the backward
+// scatter -- so each pipe binds two channels and the window carries two slot rings.
+constexpr int kFfnRelayChanCount = FFN_NCUT_RELAY_CHAN_COUNT;
+using FfnGatherPipeP1 =
+    GridPipe<RowBlockTile, FFN_NCUT_TPUSH_SLOT_BYTES_P1, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnRelayChanCount>;
+using FfnGatherPipeP2 =
+    GridPipe<HiddenFullTile, FFN_NCUT_TPUSH_SLOT_BYTES_P2, FFN_NCUT_TPUSH_SLOT_COUNT, 0, 0, kFfnRelayChanCount>;
 static_assert(
-    FFN_NCUT_TPUSH_PIPE_WIN_P1 == static_cast<int>(pto::a2a3_grid::WindowBytes<FfnGatherPipeP1Fwd>()),
-    "FFN_NCUT_TPUSH_PIPE_WIN_P1 must mirror WindowBytes<FfnGatherPipeP1Fwd>()");
+    a2a3_grid::WindowBytes<FfnGatherPipeP1>() == static_cast<uint32_t>(FFN_NCUT_TPUSH_WIN_P1),
+    "P1 host/device GridPipe window layout mismatch");
 static_assert(
-    FFN_NCUT_TPUSH_PIPE_WIN_P2 == static_cast<int>(pto::a2a3_grid::WindowBytes<FfnGatherPipeP2Fwd>()),
-    "FFN_NCUT_TPUSH_PIPE_WIN_P2 must mirror WindowBytes<FfnGatherPipeP2Fwd>()");
+    a2a3_grid::WindowBytes<FfnGatherPipeP2>() == static_cast<uint32_t>(FFN_NCUT_TPUSH_WIN_P2),
+    "P2 host/device GridPipe window layout mismatch");
 
 // Cube GEMM accumulator tiles (L0C): gate/up [16,96] (8 valid), down [16,224].
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>;
@@ -135,8 +127,8 @@ using DownAccTile = TileAcc<float, kBaseM, kHShard, kT, kHShard>;
 // Drain every pipe between relay steps.  The relay reuses one UB tile across a
 // TPOP (MTE2) -> TINSERT (V) -> TPUSH (MTE3) sequence, so a full barrier between
 // steps is the conservative correctness-first fence (matches this kernel's
-// simulation role).  Each TPOP/TPUSH also carries its own data-before-ready
-// publish fence internally.
+// simulation role).  Each GRID_TRY_TPOP_IMPL/GRID_TRY_TPUSH_IMPL also carries its
+// own data-before-ready publish fence internally.
 AICORE inline void FfnRelayDrain()
 {
 #ifndef __PTO_AUTO__
@@ -202,16 +194,15 @@ AICORE inline void FfnCubeGemmFill(TileAcc<float, kBaseM, N, kT, N>& cTile, __gm
 
 // Bidirectional nearest-neighbor relay that AllGathers `ownTile` (this cell's
 // contribution, inserted at `ownOff`) across one mesh axis into `relayTile` on
-// EVERY cell.  It takes TWO pipes because it is two channels: `fwdPipe` gathers
-// towards the far end and `bwdPipe` scatters back, and a pipe is bound to one
-// (producer, consumer) pair.  Their directions are a matched opposite pair
-// (EAST/WEST or SOUTH/NORTH).
+// EVERY cell.  fDir = forward gather direction (data flows to the far end); bDir =
+// the opposite direction (the backward scatter back to all).  fDir/bDir are a
+// matched opposite pair (EAST/WEST or SOUTH/NORTH).
 //
-//   forward: each cell TPOPs the partial from fwdPipe's producer peer, TINSERTs
-//            its own tile, TPUSHes to fwdPipe's consumer peer -- cascades so the
-//            far-end cell ends with the complete tile.
-//   backward: the far-end cell TPUSHes the complete tile back on bwdPipe; each
-//             cell TPOPs it and TPUSHes it on -- cascades so every cell ends
+//   forward: each cell TPOP<fDir> the partial from its upstream neighbor, TINSERT
+//            its own tile, TPUSH<fDir> to its downstream neighbor -- cascades so
+//            the far-end cell ends with the complete tile.
+//   backward: the far-end cell TPUSH<bDir> the complete tile back; each cell
+//             TPOP<bDir> it and TPUSH<bDir> it on -- cascades so every cell ends
 //             with the complete tile in `relayTile`.
 // Linear fan-in-1 chain each way (a DAG), so it is serialization-safe.
 //
@@ -227,17 +218,26 @@ AICORE inline void FfnCubeGemmFill(TileAcc<float, kBaseM, N, kT, N>& cTile, __gm
 // k-1) pushed k*unitCols columns, which is exactly this cell's `ownOff`.  Both
 // sides compute it from the topology, the same way a5's producer and consumer both
 // derive entryOffset from the tile id rather than exchanging it.
-template <typename FwdPipe, typename BwdPipe, typename RelayTile, typename RecvTile, typename OwnTile>
+template <
+    pto::GridDirection fDir, pto::GridDirection bDir, typename Pipe, typename RelayTile, typename RecvTile,
+    typename OwnTile>
 AICORE inline void FfnRelayGather(
-    FwdPipe& fwdPipe, BwdPipe& bwdPipe, RelayTile& relayTile, RecvTile& recvTile, OwnTile& ownTile, uint16_t ownOff,
-    int unitCols)
+    Pipe& pipe, pto::GridShape shape, pto::GridCoord coord, RelayTile& relayTile, RecvTile& recvTile, OwnTile& ownTile,
+    uint16_t ownOff, int unitCols)
 {
-    // Roles come straight off each pipe's bound peers: "no producer" means this
-    // cell starts the chain, "no consumer" means it ends it.
-    const bool isFwdSource = !fwdPipe.HasProducer(); // no upstream -> relay start
-    const bool isFwdSink = !fwdPipe.HasConsumer();   // no downstream -> relay end
-    const bool isBwdSource = isFwdSink;              // fwd sink starts the backward scatter
-    const bool isBwdSink = !bwdPipe.HasConsumer();   // no downstream on bDir -> scatter end
+    // The two flows this cell sits on, named by the peers at their ends.  TPUSH and
+    // TPOP bind lazily: the producer reserves one of its own producer channels and
+    // the peer independently reserves a consumer channel, so the two indices are
+    // intentionally not assumed to match.
+    const uint32_t fwdProd = pto::GridPeerBlockIdForPop(fDir, coord, shape);
+    const uint32_t fwdCons = pto::GridPeerBlockIdForPush(fDir, coord, shape);
+    const uint32_t bwdProd = pto::GridPeerBlockIdForPop(bDir, coord, shape);
+    const uint32_t bwdCons = pto::GridPeerBlockIdForPush(bDir, coord, shape);
+
+    const bool isFwdSource = !pto::GridBlockIdValid(fwdProd, shape); // no upstream -> relay start
+    const bool isFwdSink = !pto::GridBlockIdValid(fwdCons, shape);   // no downstream -> relay end
+    const bool isBwdSource = isFwdSink;                              // fwd sink starts the backward scatter
+    const bool isBwdSink = !pto::GridBlockIdValid(bwdCons, shape);   // no downstream on bDir -> scatter end
 
     // recvTile must have the relay tile's row pitch: the slot's rows are laid out
     // with the producer's relayTile stride, and the consumer walks them with the
@@ -256,6 +256,10 @@ AICORE inline void FfnRelayGather(
     const uint32_t fwdPopCols = static_cast<uint32_t>(ownOff);
     const GridPayloadWindow fwdPushWin{0, fwdPushCols * kElemBytes, kRowsU, kRowPitch, kRowPitch};
     const GridPayloadWindow fwdPopWin{0, fwdPopCols * kElemBytes, kRowsU, kRowPitch, kRowPitch};
+    // Binding happens inside the first TPUSH/TPOP, so configure both independent
+    // channel pools before either side knows which local index it will receive.
+    pipe.SetAllPushWindows(fwdPushWin);
+    pipe.SetAllPopWindows(fwdPopWin);
 
     // TPOP writes the INDEPENDENT recvTile (MTE2 async DMA); relayTile is then built
     // from recvTile + own shard by V (TINSERT) only. relayTile therefore never
@@ -265,33 +269,32 @@ AICORE inline void FfnRelayGather(
     if (isFwdSource) {
         TINSERT(relayTile, ownTile, 0, ownOff); // V: seed with own contribution
     } else {
-        fwdPipe.SetPopWindow(fwdPopWin);        // drain only what upstream sent
-        TPOP(fwdPipe, recvTile);                // MTE2 -> recvTile
-        FfnRelayDrain();                        // MTE2 (async DMA) drain
-        TINSERT(relayTile, recvTile, 0, 0);     // V: recvTile -> relayTile
-        TINSERT(relayTile, ownTile, 0, ownOff); // V: add own contribution
+        (void)pto::GRID_TRY_TPOP_IMPL(pipe, recvTile, fwdProd, kGatherMaxSpins); // MTE2 -> recvTile
+        FfnRelayDrain();                                                         // MTE2 (async DMA) drain
+        TINSERT(relayTile, recvTile, 0, 0);                                      // V: recvTile -> relayTile
+        TINSERT(relayTile, ownTile, 0, ownOff);                                  // V: add own contribution
     }
     FfnRelayDrain(); // V before MTE3 push
     if (!isFwdSink) {
-        fwdPipe.SetPushWindow(fwdPushWin); // ship only the valid column prefix
-        TPUSH(fwdPipe, relayTile);         // MTE3 <- relayTile
+        (void)pto::GRID_TRY_TPUSH_IMPL(pipe, relayTile, fwdCons, true, kGatherMaxSpins); // MTE3 <- relayTile
         FfnRelayDrain();
     }
 
     // --- backward relay: scatter the complete tile to every cell ---
-    // Complete tile from here on, and the backward pipe is a different channel:
-    // its windows start disabled (whole slot), which is exactly what we want.
-    bwdPipe.ResetPopWindow();
-    bwdPipe.ResetPushWindow();
-    if (!isBwdSource) {          // not the fwd sink -> receive the complete tile
-        TPOP(bwdPipe, recvTile); // MTE2 -> recvTile
+    // The backward flow negotiates another independent producer/consumer channel
+    // pair.  It carries a complete tile, so disable the prefix window on every
+    // candidate before the lazy binding chooses either local index.
+    pipe.ResetAllPopWindows();
+    pipe.ResetAllPushWindows();
+    if (!isBwdSource) { // not the fwd sink -> receive the complete tile
+        (void)pto::GRID_TRY_TPOP_IMPL(pipe, recvTile, bwdProd, kGatherMaxSpins); // MTE2 -> recvTile
         FfnRelayDrain();
         TINSERT(relayTile, recvTile, 0, 0); // V: recvTile -> relayTile
     }
     // (bwd source == fwd sink: relayTile already holds the complete fwd result)
-    if (!isBwdSink) {              // not the scatter end -> forward it on
-        FfnRelayDrain();           // relayTile (V) settled before MTE3 push
-        TPUSH(bwdPipe, relayTile); // MTE3 <- relayTile
+    if (!isBwdSink) {    // not the scatter end -> forward it on
+        FfnRelayDrain(); // relayTile (V) settled before MTE3 push
+        (void)pto::GRID_TRY_TPUSH_IMPL(pipe, relayTile, bwdCons, true, kGatherMaxSpins); // MTE3 <- relayTile
         FfnRelayDrain();
     }
     // every cell now holds the complete tile in relayTile
@@ -328,6 +331,17 @@ __global__ AICORE void DistributedFfnGridTpushAllGatherMixedKernel(
     __gm__ uint8_t* gatePartialBlock = gatePartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
     __gm__ uint8_t* upPartialBlock = upPartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
     __gm__ uint8_t* yBlock = yFull + cell * kHShard * static_cast<int>(sizeof(float));
+
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            // AIV1 is control-only. Phase A still needs both physical AIVs in
+            // the C2V mode-2 handshake; every other phase can return directly.
+            if (phase == 0) {
+                FfnInactiveVectorC2vHandshake<GatePipe, UpPipe>(gatePartialBlock, upPartialBlock);
+            }
+            return;
+        }
+    }
 
     // =========================== phase A: gate + up + SwiGLU ===========================
     if (phase == 0) {
@@ -456,22 +470,16 @@ __global__ AICORE void DistributedFfnGridTpushAllGatherMixedKernel(
             TLOAD(shardOwn, ownGm);
             FfnRelayDrain();
 
-            // Two channels, two pipes: EAST gathers forward, WEST scatters back.
-            // Each gets its own region of the cell's window (fwd first, then bwd).
-            FfnGatherPipeP1Fwd fwdPipe;
-            FfnGatherPipeP1Bwd bwdPipe;
+            FfnGatherPipeP1 gatherPipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
             __gm__ uint8_t* window = p1Window + cell * FFN_NCUT_TPUSH_WIN_P1;
             a2a3_grid::InitGridPipeFromWindow(
-                fwdPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p1CtxRaw), /*pipeId=*/0);
-            a2a3_grid::InitGridPipeFromWindow(
-                bwdPipe, shape, coord, window + FFN_NCUT_TPUSH_PIPE_WIN_P1, reinterpret_cast<__gm__ void*>(p1CtxRaw),
-                /*pipeId=*/1);
+                gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p1CtxRaw), /*pipeId=*/0);
 
             // Relay-gather the row block: each cell contributes its shard at col*kIShard.
-            FfnRelayGather(
-                fwdPipe, bwdPipe, rowBlock, recvTile, shardOwn, static_cast<uint16_t>(col * kIShard), kIShard);
+            FfnRelayGather<GridDirection::EAST, GridDirection::WEST>(
+                gatherPipe, shape, coord, rowBlock, recvTile, shardOwn, static_cast<uint16_t>(col * kIShard), kIShard);
             FfnRelayDrain();
 
             // Store the rebuilt row block [8,768] to GM for Phase 2 to gather.
@@ -506,21 +514,17 @@ __global__ AICORE void DistributedFfnGridTpushAllGatherMixedKernel(
             TLOAD(blockOwn, ownGm);
             FfnRelayDrain();
 
-            // Two channels, two pipes: SOUTH gathers forward, NORTH scatters back.
-            FfnGatherPipeP2Fwd fwdPipe;
-            FfnGatherPipeP2Bwd bwdPipe;
+            FfnGatherPipeP2 gatherPipe;
             GridShape shape{gridRows, gridCols};
             GridCoord coord{row, col};
             __gm__ uint8_t* window = p2Window + cell * FFN_NCUT_TPUSH_WIN_P2;
             a2a3_grid::InitGridPipeFromWindow(
-                fwdPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p2CtxRaw), /*pipeId=*/0);
-            a2a3_grid::InitGridPipeFromWindow(
-                bwdPipe, shape, coord, window + FFN_NCUT_TPUSH_PIPE_WIN_P2, reinterpret_cast<__gm__ void*>(p2CtxRaw),
-                /*pipeId=*/1);
+                gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p2CtxRaw), /*pipeId=*/0);
 
             // cell (row, col) holds row `row`'s I-segment -> offset row*768.
-            FfnRelayGather(
-                fwdPipe, bwdPipe, hiddenFull, recvTile, blockOwn, static_cast<uint16_t>(row * kRowBlock), kRowBlock);
+            FfnRelayGather<GridDirection::SOUTH, GridDirection::NORTH>(
+                gatherPipe, shape, coord, hiddenFull, recvTile, blockOwn, static_cast<uint16_t>(row * kRowBlock),
+                kRowBlock);
             FfnRelayDrain();
 
             // Store the full hidden [8,3072] to GM for Phase 3 (down) to consume.
@@ -593,11 +597,10 @@ void launchDistributedFfnGridTpushAllGatherMixedKernel(
     uint8_t* gatePartialBuf, uint8_t* upPartialBuf, uint8_t* yFull, uint8_t* p1Ctx, uint8_t* p2Ctx, int phase,
     int rowStart, int colStart, int waveCols, int gridRows, int gridCols, int blockCount, void* stream)
 {
-    if (blockCount <= 0) {
-        return;
+    if (blockCount > 0) {
+        DistributedFfnGridTpushAllGatherMixedKernel<<<blockCount, nullptr, stream>>>(
+            ffts, p1Window, p2Window, xFull, wGateShards, wUpShards, wDownShards, hiddenShardBuf, rowBlockBuf,
+            hiddenFullBuf, gatePartialBuf, upPartialBuf, yFull, p1Ctx, p2Ctx, phase, rowStart, colStart, waveCols,
+            gridRows, gridCols);
     }
-    DistributedFfnGridTpushAllGatherMixedKernel<<<blockCount, nullptr, stream>>>(
-        ffts, p1Window, p2Window, xFull, wGateShards, wUpShards, wDownShards, hiddenShardBuf, rowBlockBuf,
-        hiddenFullBuf, gatePartialBuf, upPartialBuf, yFull, p1Ctx, p2Ctx, phase, rowStart, colStart, waveCols, gridRows,
-        gridCols);
 }

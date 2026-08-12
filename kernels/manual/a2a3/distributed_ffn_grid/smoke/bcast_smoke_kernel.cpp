@@ -19,7 +19,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //     sub-rectangle for SUBRECT) over the 真·同时 MPSC channel (design doc
 //     §4 方案②·前缀偏移): batched writes into each receiver's shared ring, a
 //     single publish fence, then per-source ready lanes.  This is NOT a
-//     per-hop TPUSH<Dir, k> loop.
+//     per-hop TPUSH loop.
 //   - every other cell drains the source's shard with TPOP<GridGroup>(pipe,
 //     tile, BCAST_SRC) -- it waits the source's per-source ready lane and reads
 //     the source's prefix-offset slot from its own shared ring.
@@ -50,17 +50,21 @@ constexpr bool DAV_VEC = false;
 #endif
 
 using SmokeTile = Tile<TileType::Vec, float, BCAST_T, BCAST_W, BLayout::RowMajor>;
-
-// The group is the pipe's binding -- it names every peer -- so it is a template
-// argument of the pipe, not of the TBROADCAST / TPOP calls.
-constexpr GridGroup kGroup = (BCAST_SUBRECT != 0)  ? GridGroup::SUBRECT :
-                             (BCAST_SPAN_COL != 0) ? GridGroup::COL :
-                                                     GridGroup::ROW;
-using SmokePipe = GridGroupPipe<SmokeTile, kGroup, BCAST_SLOT_BYTES, BCAST_BCAST_SLOT_COUNT, BCAST_GROUP_MAX>;
+// Pure broadcast (TBROADCAST + TPOP<GridGroup>), no unicast: ChanCount = 0, so
+// the concurrency array allocates no slot rings and the window carries none.
+using SmokePipe =
+    GridPipe<SmokeTile, BCAST_SLOT_BYTES, BCAST_SLOT_COUNT, BCAST_BCAST_SLOT_COUNT, BCAST_GROUP_MAX, /*ChanCount=*/0>;
+static_assert(
+    a2a3_grid::WindowBytes<SmokePipe>() == static_cast<uint32_t>(BCAST_WINDOW_BYTES),
+    "broadcast-smoke host/device GridPipe window layouts must match");
 
 using ShapeTW = Shape<1, 1, 1, BCAST_T, BCAST_W>;
 using StrideTW = Stride<BCAST_T * BCAST_W, BCAST_T * BCAST_W, BCAST_T * BCAST_W, BCAST_W, 1>;
 using GSmoke = GlobalTensor<float, ShapeTW, StrideTW, Layout::ND>;
+
+constexpr GridGroup kGroup = (BCAST_SUBRECT != 0)  ? GridGroup::SUBRECT :
+                             (BCAST_SPAN_COL != 0) ? GridGroup::COL :
+                                                     GridGroup::ROW;
 
 constexpr int kUbSend = 0x0000;
 constexpr int kUbRecv = 0x4000;
@@ -78,6 +82,11 @@ __global__ AICORE void BcastSmokeKernel(
     if (blockIdx < 0 || blockIdx >= totalBlocks) {
         return;
     }
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != BCAST_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            return;
+        }
+    }
 
     if constexpr (DAV_VEC) {
         SmokeTile sendTile;
@@ -89,6 +98,7 @@ __global__ AICORE void BcastSmokeKernel(
         GridShape shape{gridRows, gridCols};
         GridCoord coord{blockIdx / gridCols, blockIdx - (blockIdx / gridCols) * gridCols};
         __gm__ uint8_t* window = windows + blockIdx * BCAST_WINDOW_BYTES;
+
         a2a3_grid::InitGridPipeFromWindow(
             pipe, shape, coord, window, reinterpret_cast<__gm__ void*>(hcclCtxRaw),
             /*pipeId=*/0);
@@ -97,7 +107,7 @@ __global__ AICORE void BcastSmokeKernel(
         // addresses every cell inside it, and no-op cells outside it (nobody
         // writes their window, so they must not TPOP and wait).
         if constexpr (BCAST_SUBRECT != 0) {
-            pipe.rect = {BCAST_RECT_R0, BCAST_RECT_R1, BCAST_RECT_C0, BCAST_RECT_C1};
+            pipe.groupRect = {BCAST_RECT_R0, BCAST_RECT_R1, BCAST_RECT_C0, BCAST_RECT_C1};
             const bool inRect = coord.row >= BCAST_RECT_R0 && coord.row < BCAST_RECT_R1 && coord.col >= BCAST_RECT_C0 &&
                                 coord.col < BCAST_RECT_C1;
             if (!inRect) {
@@ -105,9 +115,9 @@ __global__ AICORE void BcastSmokeKernel(
             }
         }
 
-        // This cell's rank within its group (SUBRECT reads pipe.rect; ROW varies
-        // along col, COL along row) and the source's rank-in-group.
-        const int myIdx = pipe.SelfGroupRank();
+        // This cell's rank within its group (SUBRECT reads pipe.groupRect; ROW
+        // varies along col, COL along row) and the source's rank-in-group.
+        const int myIdx = RankInGroup(kGroup, coord, pipe.groupRect);
         const int srcIdx = (BCAST_SUBRECT != 0) ? BCAST_RECT_SRC : BCAST_SRC;
         const bool isSource = (myIdx == srcIdx);
 
@@ -122,17 +132,17 @@ __global__ AICORE void BcastSmokeKernel(
 #endif
             dsb(DSB_DDR);
 
-            // TBROADCAST (scheme-② send): the group pipe type selects this
-            // overload.  The shard lands at the source's prefix-offset slot in
-            // every receiver's shared ring.
-            TBROADCAST(pipe, sendTile);
+            // TBROADCAST (scheme-② send): the GridGroup first template argument
+            // selects this overload.  The shard lands at the source's prefix-
+            // offset slot in every receiver's shared ring.
+            TBROADCAST<kGroup>(pipe, sendTile);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
             dsb(DSB_DDR);
         } else {
             // Receiver: drain the source's shard from the shared ring.
-            TPOP(pipe, recvTile, srcIdx);
+            TPOP<kGroup>(pipe, recvTile, srcIdx);
 #ifndef __PTO_AUTO__
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);

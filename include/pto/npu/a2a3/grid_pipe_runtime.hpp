@@ -8,9 +8,9 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-// A2/A3 GridPipe runtime helpers: shmem window layout, init helpers, neighbor
-// rank resolution.  See the V6 IPC_SCB scoreboard design and its A2/A3 mock in
-// include/pto/npu/a2a3/grid_intrinsic.hpp.
+// A2/A3 GridPipe runtime helpers: shmem window layout and the init helper that
+// wires a pipe's concurrency array to it.  See the V6 IPC_SCB scoreboard design
+// and its A2/A3 mock in include/pto/npu/a2a3/grid_intrinsic.hpp.
 
 #ifndef PTO_A2A3_GRID_PIPE_RUNTIME_HPP
 #define PTO_A2A3_GRID_PIPE_RUNTIME_HPP
@@ -22,176 +22,258 @@ See LICENSE in the root of the software repository for the full text of the Lice
 namespace pto {
 namespace a2a3_grid {
 
-// shmem window layout, in bytes.  ONE WINDOW PER PIPE PER RANK -- a pipe is one
-// channel bound to one (producer, consumer) pair, so it owns one scoreboard pair
-// and one slot ring.  A core that talks to several peers declares several pipes
-// and gives each its own window region (the demos carve them out of one per-cell
-// arena at fixed offsets, which keeps every rank's offsets identical -- required,
-// because the peer resolver maps a local address to the SAME byte offset in the
-// peer's window).
+// shmem window layout (per rank), in bytes.  The ready/free/close scoreboard words stand
+// in for the V6 IPC_SCB slots of each CHANNEL (each carries a monotone absolute
+// count written by the peer bound to that channel via an HSCB store):
 //
-// Unicast pipe (GridPipe).  Every scoreboard owns a FULL CACHE LINE
-// (grid_mock::kScbLineStride) because each has a DIFFERENT external writer and
-// the write-back is line-granular -- see the rationale on kScbLineStride in
-// grid_intrinsic.hpp.  Packing them (the original 4 B spacing) let one peer's
-// store silently drop another peer's doorbell.
+//   offset                                          contents
+//   -----------------------------------------------------------------------
+//   0                                               ready scoreboards, one per
+//     + c * kScbLineStride                            channel, ONE CACHE LINE EACH
+//   kGridChanCount * kScbLineStride                 free scoreboards, likewise
+//     + c * kScbLineStride
+//   2 * kGridChanCount * kScbLineStride             close scoreboards, likewise
+//     + c * kScbLineStride
+//   kScbHeaderBytes                                 bind-request L1 line
+//   kScbHeaderBytes + kScbLineStride                bind-response L1 line
+//   kRecordOffset                                   pipe record: bindings, consumer
+//                                                     FSM/history, both channel maps,
+//                                                     close bases and run counters
+//   kSlotRegionOffset                               slot region, ChanCount rings
+//     + c * SlotCount * SlotStride                    ring of channel c
+//   kSlotRegionOffset + C*SlotCount*SlotStride      TBROADCAST region (GroupMax > 0):
+//     + 0                                             shared payload ring [BcastSlotCount * SlotStride]
+//     + BcastSlotCount*SlotStride                     per-source ready lanes [GroupMax * 64 B] (variant B;
+//                                                     one cache line per lane -- see kBcastLaneStride)
+//     + GroupMax*64                                    per-source free  lanes [GroupMax * 64 B] (X sole writer)
+//   end of receive rings / broadcast lanes           producer staging [SlotStride]
+//                                                     local L1 source for every outbound transfer
 //
-//   offset                        contents                       written by
-//   ------------------------------------------------------------------------
-//   kReadyScbOffset   (0)         ready   scb u32  (consumer sem)  producer peer
-//   kFreeScbOffset    (64)        free    scb u32  (producer sem)  consumer peer
-//   kInstallScbOffset (128)       install scb u32  (producer sem)  consumer peer
-//                                 INSTALL_BASE doorbell = handoff generation
-//   kOpenScbOffset    (192)       open    scb u32  (consumer sem)  producer peer
-//                                 OPEN_ACK, same generation
-//   kBatonOutOffset   (256)       baton L1 u32     (consumer sem)  THIS core
-//                                 the retiring prod_idx staged for ST_HSCB
-//   kBatonInOffset    (320)       baton L1 u32     (producer sem)  consumer peer
-//                                 the relayed prod_idx, delivered by ST_HSCB and
-//                                 lifted into the GPR by MOV_L12X
-//   384 .. kFlagsBytes-1          reserved (alignment, telemetry)
-//   kSlotRegionOffset (512)       slot ring [SlotCount * SlotStride]
+// TWO PROPERTIES THE REST OF THE SYSTEM LEANS ON.
 //
-// The last two are L1/SRAM words, NOT scoreboards: they carry a value to be READ,
-// so they have no IPC_SCB slot number and nothing ever waits on them.  Two of them
-// because under SPMD one core is both sides of a handoff at once -- it stages its
-// own outgoing baton while its successor consumer delivers its incoming one, and a
-// single shared word would collide.
+// (1) The scoreboard header is a FIXED kGridChanCount triplets, whatever a pipe's
+//     ChanCount is, and every scoreboard owns a whole cache line.  Fixed, because
+//     the peer resolver maps a local address to the SAME byte offset in the peer's
+//     window, so two pipes in one build must agree on where channel c's doorbell
+//     lives.  A line each, because each has a DIFFERENT external writer and the
+//     mock's write-back is line-granular -- see kScbLineStride in
+//     grid_intrinsic.hpp for the lost-update this prevents.  Only the RINGS are
+//     trimmed by ChanCount, so a pure-broadcast pipe (ChanCount = 0) pays the
+//     header and no unicast payload bytes at all.
 //
-// Each word's fault sentinel sits kFaultFlagWordOffset u32 words INTO ITS OWN
-// line, so the sentinels stay clear of every live word.  (The sentinel write is
-// local, so it shares a line with a remotely-written word; that is harmless in
-// practice because a sentinel is only ever written on a run that has already
-// failed.)
+// (2) The pipe record is LOCAL-ONLY -- this core is its sole reader and writer, no
+//     peer ever stores into it -- so its words may share cache lines freely, and it
+//     sits OUTSIDE kFlagsBytes.  That boundary matters: the host launchers scan the
+//     flag header for fault sentinels, and the record holds ordinary counters and
+//     block ids that would read as sentinels if they were inside.
 //
-// The four handoff words are idle in steady state.
+// (3) The final SlotStride bytes are a LOCAL PRODUCER STAGING SLOT, not another
+//     receive-ring entry.  Real WSE hardware has one unified L1 SRAM address space
+//     (there is no physically separate Vec UB).  An outbound tile is therefore
+//     staged here first and the NoC maps this local L1 address to the peer's receive
+//     payload ring.  Keeping the producer slot after every receive-side region makes
+//     source and destination storage disjoint even when a cell relays a tile while
+//     its own receive ring is live.
 //
-// Group pipe (GridGroupPipe, scheme-② 真·同时 MPSC):
-//   0 .. kFlagsBytes-1            reserved (fault sentinels, alignment); the
-//                                 group's semaphores are the lanes below, so
-//                                 there is no scoreboard pair here
-//   kSlotRegionOffset (128)       shared payload ring [SlotCount * SlotStride]
-//   + SlotCount*SlotStride        per-source ready lanes [GroupMax * 64 B]
-//                                 (variant B; one cache line per lane -- see
-//                                 grid_mock::kBcastLaneStride)
-//   + GroupMax*64                 per-source free lanes  [GroupMax * 64 B]
-//                                 (this core is the sole writer of each)
-//
-// The pipe's header words, as u32 word indices / byte offsets into its window.
-// Lines 0/1 are the steady-state ready/free scoreboard pair; lines 2/3 the 接力计数
-// handoff doorbells; lines 4/5 the two baton L1 words (see the layout comment
-// above).  The stride is one cache line, NOT one word -- that is the correctness
-// requirement, not padding.
-inline constexpr uint32_t kHeaderLineCount = 6;
-inline constexpr uint32_t kReadyScbWord = 0 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kFreeScbWord = 1 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kInstallScbWord = 2 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kOpenScbWord = 3 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kBatonOutWord = 4 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kBatonInWord = 5 * grid_mock::kScbLineStrideU32;
-inline constexpr uint32_t kReadyScbOffset = kReadyScbWord * sizeof(uint32_t);
-inline constexpr uint32_t kFreeScbOffset = kFreeScbWord * sizeof(uint32_t);
-inline constexpr uint32_t kInstallScbOffset = kInstallScbWord * sizeof(uint32_t);
-inline constexpr uint32_t kOpenScbOffset = kOpenScbWord * sizeof(uint32_t);
-inline constexpr uint32_t kBatonOutOffset = kBatonOutWord * sizeof(uint32_t);
-inline constexpr uint32_t kBatonInOffset = kBatonInWord * sizeof(uint32_t);
+// Fault sentinels live at word kFaultFlagWordOffset of the scoreboard (or lane)
+// they belong to, which is inside that scoreboard's own line and clear of every
+// live word.
+inline constexpr uint32_t kScbHeaderBytes = 3U * static_cast<uint32_t>(kGridChanCount) * grid_mock::kScbLineStride;
 
-// Flag header: kHeaderLineCount cache lines plus reserved headroom, rounded up so
-// the slot ring stays generously aligned.  Host launchers mirror this constant
-// (the *_GRID_FLAGS_BYTES in the demo configs).
-inline constexpr uint32_t kFlagsBytes = 512;
-static_assert(
-    kFlagsBytes >= kHeaderLineCount * grid_mock::kScbLineStride, "flag header must hold one line per header word");
-inline constexpr uint32_t kSlotRegionOffset = kFlagsBytes;
+// Two remotely-written control lines used only when a producer opens/reopens a
+// time-division MPSC binding.  Request = [producer id commit, producer channel];
+// response = [ready baseline, consumer channel, completion commit].  Producer and
+// consumer channels are independent.  Keeping request/response on separate cache
+// lines prevents line-granular mock write-back from clobbering the other mailbox.
+inline constexpr uint32_t kBindRequestOffset = kScbHeaderBytes;
+inline constexpr uint32_t kBindResponseOffset = kBindRequestOffset + grid_mock::kScbLineStride;
+inline constexpr uint32_t kControlBytes = 2U * grid_mock::kScbLineStride;
 
-// Payload ring bytes -- identical formula for both pipe flavours (the group
-// pipe's ring is the shared MPSC ring, so its SlotCount is the ring depth SC).
-template <int SlotStride, int SlotCount>
+// Pipe record: bindings, consumer FSM/history, producer/consumer channel maps and
+// states, close bases, and persistent prod/cons counter mirrors.  It lets a schedule span several kernel
+// launches; rounded up to a cache line so the slot region stays aligned.
+inline constexpr uint32_t kRecordOffset = kScbHeaderBytes + kControlBytes;
+inline constexpr uint32_t kRecordBytes =
+    ((static_cast<uint32_t>(kGridRecordWords) * static_cast<uint32_t>(sizeof(uint32_t)) + grid_mock::kScbLineStride -
+      1U) /
+     grid_mock::kScbLineStride) *
+    grid_mock::kScbLineStride;
+
+// Bytes the host scans for fault sentinels: the scoreboard header only.
+inline constexpr uint32_t kFlagsBytes = kScbHeaderBytes;
+inline constexpr uint32_t kSlotRegionOffset = kRecordOffset + kRecordBytes;
+
+inline constexpr uint32_t kReadyScbOffset(int chan) { return static_cast<uint32_t>(chan) * grid_mock::kScbLineStride; }
+
+inline constexpr uint32_t kFreeScbOffset(int chan)
+{
+    return (static_cast<uint32_t>(kGridChanCount) + static_cast<uint32_t>(chan)) * grid_mock::kScbLineStride;
+}
+
+inline constexpr uint32_t kCloseScbOffset(int chan)
+{
+    return (2U * static_cast<uint32_t>(kGridChanCount) + static_cast<uint32_t>(chan)) * grid_mock::kScbLineStride;
+}
+
+template <int SlotStride, int SlotCount, int ChanCount = kGridChanCount>
 inline constexpr uint32_t kSlotRegionBytes()
 {
-    return static_cast<uint32_t>(SlotCount) * static_cast<uint32_t>(SlotStride);
+    return static_cast<uint32_t>(ChanCount) * SlotCount * SlotStride;
 }
 
-// One direction's worth of per-source lanes (ready or free), one cache line each.
-template <int GroupMax>
-inline constexpr uint32_t kLaneRegionBytes()
+// TBROADCAST (scheme-②) region offsets/sizes.  No-ops (zero) when GroupMax == 0.
+template <int SlotBytes, int BcastSlotCount>
+inline constexpr uint32_t kBcastRingBytes()
 {
-    return static_cast<uint32_t>(GroupMax) * grid_mock::kBcastLaneStride;
+    return static_cast<uint32_t>(BcastSlotCount) * static_cast<uint32_t>(SlotBytes);
+}
+
+template <int GroupMax>
+inline constexpr uint32_t kBcastLaneBytes()
+{
+    return static_cast<uint32_t>(GroupMax) * grid_mock::kBcastLaneStride; // one 64 B cache line per lane
+}
+
+template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax>
+inline constexpr uint32_t kBcastRegionBytes()
+{
+    return kBcastRingBytes<SlotStride, BcastSlotCount>() + // shared payload ring
+           kBcastLaneBytes<GroupMax>() +                   // per-source ready lanes (variant B)
+           kBcastLaneBytes<GroupMax>();                    // per-source free  lanes
+}
+
+template <int SlotStride, int SlotCount, int ChanCount = kGridChanCount>
+inline constexpr uint32_t kProducerRegionOffset()
+{
+    return kSlotRegionOffset + kSlotRegionBytes<SlotStride, SlotCount, ChanCount>();
+}
+
+template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int ChanCount = kGridChanCount>
+inline constexpr uint32_t kProducerRegionOffsetWithBcast()
+{
+    return kProducerRegionOffset<SlotStride, SlotCount, ChanCount>() +
+           kBcastRegionBytes<SlotStride, SlotCount, BcastSlotCount, GroupMax>();
+}
+
+template <int SlotStride, int SlotCount, int ChanCount = kGridChanCount>
+inline constexpr uint32_t kWindowBytes()
+{
+    return kProducerRegionOffset<SlotStride, SlotCount, ChanCount>() +
+           static_cast<uint32_t>(SlotStride); // isolated local producer staging slot
+}
+
+template <int SlotStride, int SlotCount, int BcastSlotCount, int GroupMax, int ChanCount = kGridChanCount>
+inline constexpr uint32_t kWindowBytesWithBcast()
+{
+    return kProducerRegionOffsetWithBcast<SlotStride, SlotCount, BcastSlotCount, GroupMax, ChanCount>() +
+           static_cast<uint32_t>(SlotStride); // isolated local producer staging slot
 }
 
 template <int SlotStride, int SlotCount>
-inline constexpr uint32_t kPipeWindowBytes()
+inline constexpr uint32_t kChanSlotRegionOffset(int chan)
 {
-    return kSlotRegionOffset + kSlotRegionBytes<SlotStride, SlotCount>();
+    return kSlotRegionOffset + static_cast<uint32_t>(chan) * SlotCount * SlotStride;
 }
 
-template <int SlotStride, int SlotCount, int GroupMax>
-inline constexpr uint32_t kGroupPipeWindowBytes()
-{
-    return kSlotRegionOffset + kSlotRegionBytes<SlotStride, SlotCount>() + // shared payload ring
-           kLaneRegionBytes<GroupMax>() +                                  // per-source ready lanes (variant B)
-           kLaneRegionBytes<GroupMax>();                                   // per-source free  lanes
-}
-
-// Host-side helper: total bytes ONE pipe needs in each rank's window.
-template <typename Pipe>
-inline constexpr uint32_t WindowBytes()
-{
-    if constexpr (is_grid_group_pipe_v<Pipe>) {
-        return kGroupPipeWindowBytes<Pipe::SlotStride, Pipe::SlotCount, Pipe::GroupMax>();
-    } else {
-        return kPipeWindowBytes<Pipe::SlotStride, Pipe::SlotCount>();
-    }
-}
-
-// Wire up a GridPipe / GridGroupPipe instance from a flat GM window owned by this
-// rank.  The host launcher allocates WindowBytes<Pipe>() bytes per rank per pipe,
-// then the kernel prologue calls this once per pipe.  `runtimeCtx` is the HCCL
-// device context handle used later by GridTPush/GridTPop/GridTBroadcast to
-// resolve cross-rank addresses.
+// Wire up a GridPipe instance from a flat GM window owned by this rank.
+// The host launcher allocates WindowBytes<Pipe>() bytes per rank, then calls
+// this in the kernel prologue.  `runtimeCtx` is the HCCL device context handle
+// used later by GridTPush/GridTPop/GridTBroadcast to resolve cross-rank
+// addresses.
 //
-// Offsets use the constexpr VARIABLES above plus plain arithmetic on the pipe's
-// static members: CCE forbids calling a host constexpr *function* from an AICORE
-// context, so the kXxx<...>() helpers are for the host mirrors only.
+// It wires resources and ADOPTS the window's pipe record.  No channel is bound
+// here: which producer each element serves is a runtime decision the kernel makes
+// dynamically by the first TPUSH/TPOP identity handshake.
+//
+// Adopting rather than clearing is what makes a multi-launch schedule work: the
+// scoreboards and rings in this window outlive the kernel, so the allocator's
+// memory of which of them are already dirty has to as well.  A window the host has
+// just memset reads back as "nothing bound" on its own.
+//
+// The offsets use the constexpr VARIABLES above plus plain arithmetic (CCE forbids
+// calling a host constexpr *function* from an AICORE context, so the kXxxOffset()
+// helpers are not called here even though they are constexpr).
 template <typename Pipe>
 AICORE inline void InitGridPipeFromWindow(
     Pipe& pipe, GridShape shape, GridCoord coord, __gm__ uint8_t* window, __gm__ void* runtimeCtx, uint32_t pipeId)
 {
-    // (1) runtime-context group: identical for every pipe on this core.
-    pipe.ctx.runtimeCtx = runtimeCtx;
-    pipe.ctx.shape = shape;
-    pipe.ctx.coord = coord;
-    pipe.ctx.pipeId = pipeId;
+    pipe.shape = shape;
+    pipe.coord = coord;
+    pipe.runtimeCtx = runtimeCtx;
+    pipe.pipeId = pipeId;
 
-    // (2) slot group: the payload ring follows the reserved flag header.
-    pipe.slots.base = window + kSlotRegionOffset;
-
-    // (3) semaphore group.
-    if constexpr (is_grid_group_pipe_v<Pipe>) {
-        // MPSC: per-source lane arrays instead of a scoreboard pair.
-        const uint32_t ringBytes = static_cast<uint32_t>(Pipe::SlotCount) * static_cast<uint32_t>(Pipe::SlotStride);
-        const uint32_t readyOff = kSlotRegionOffset + ringBytes;
-        const uint32_t freeOff = readyOff + static_cast<uint32_t>(Pipe::GroupMax) * grid_mock::kBcastLaneStride;
-        pipe.cons.readyLanes = reinterpret_cast<__gm__ uint32_t*>(window + readyOff);
-        pipe.prod.freeLanes = reinterpret_cast<__gm__ uint32_t*>(window + freeOff);
-    } else {
-        // SPSC: this pipe's own ready/free scoreboard pair, its 接力计数 handoff
-        // trio, and zeroed GPR counters.  Two pipes declared over the SAME window
-        // (a time-division producer handoff) therefore land on the same physical
-        // words, which is exactly what lets THANDOFF relay the counters instead of
-        // starting the successor on an unrelated ring.
-        __gm__ uint32_t* scbs = reinterpret_cast<__gm__ uint32_t*>(window);
-        pipe.cons.readyScb = scbs + kReadyScbWord;
-        pipe.cons.openScb = scbs + kOpenScbWord;
-        pipe.cons.batonL1 = scbs + kBatonOutWord;
-        pipe.cons.consIndex = 0;
-        pipe.prod.freeScb = scbs + kFreeScbWord;
-        pipe.prod.installScb = scbs + kInstallScbWord;
-        pipe.prod.batonL1 = scbs + kBatonInWord;
-        pipe.prod.prodIndex = 0;
+    // Scoreboards exist for all kGridChanCount channels (the header is fixed);
+    // only the RINGS are trimmed to Pipe::ChanCount.  All three scoreboards of a
+    // channel are a whole cache line apart, so step by kScbLineStrideU32 in u32 units.
+    __gm__ uint32_t* scbs = reinterpret_cast<__gm__ uint32_t*>(window);
+    for (int c = 0; c < kGridChanCount; ++c) {
+        const uint32_t readyWord = static_cast<uint32_t>(c) * grid_mock::kScbLineStrideU32;
+        const uint32_t freeWord =
+            (static_cast<uint32_t>(kGridChanCount) + static_cast<uint32_t>(c)) * grid_mock::kScbLineStrideU32;
+        const uint32_t closeWord =
+            (2U * static_cast<uint32_t>(kGridChanCount) + static_cast<uint32_t>(c)) * grid_mock::kScbLineStrideU32;
+        pipe.readyScb[c] = scbs + readyWord;
+        pipe.freeScb[c] = scbs + freeWord;
+        pipe.closeScb[c] = scbs + closeWord;
+        if (c < Pipe::ChanCount) {
+            pipe.slotBase[c] = window + kSlotRegionOffset + c * Pipe::SlotCount * Pipe::SlotStride;
+        } else {
+            pipe.slotBase[c] = nullptr; // no ring allocated for this channel
+        }
+        pipe.pushWindow[c] = GridPayloadWindow{};
+        pipe.popWindow[c] = GridPayloadWindow{};
     }
-    pipe.prod.window = GridPayloadWindow{};
-    pipe.cons.window = GridPayloadWindow{};
+    pipe.consHistFull = false;
+    // Binding table + consumer history come from the window, not from zero.
+    pipe.LoadRecord(scbs + kRecordOffset / sizeof(uint32_t));
+    pipe.bindRequestProdIdL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindRequestOffset);
+    pipe.bindRequestProdChanL1 = pipe.bindRequestProdIdL1 + 1;
+    pipe.bindResponseReadyL1 = reinterpret_cast<__gm__ uint32_t*>(window + kBindResponseOffset);
+    pipe.bindResponseConsChanL1 = pipe.bindResponseReadyL1 + 1;
+    pipe.bindResponseCompleteL1 = pipe.bindResponseReadyL1 + 2;
+    // Do not clear bindRequestProdIdL1 here.  A producer in an earlier hardware wave
+    // may already have deposited a request in this not-yet-scheduled consumer's
+    // window.  The host-zeroed +1 encoding arms the mailbox, and the consumer
+    // clears each request after accepting it.
+    pipe.bcastWindow = GridPayloadWindow{};
+
+    const uint32_t slotRegionBytes = static_cast<uint32_t>(Pipe::ChanCount) * static_cast<uint32_t>(Pipe::SlotCount) *
+                                     static_cast<uint32_t>(Pipe::SlotStride);
+    uint32_t producerOff = kSlotRegionOffset + slotRegionBytes;
+
+    // TBROADCAST region (scheme-② 真·同时 MPSC).  Only wired when the pipe
+    // opted in (GroupMax > 0); a unicast-only pipe leaves these null and pays
+    // zero window bytes for broadcast.  Offsets are computed inline from the
+    // constexpr variable + the pipe's static members (see the note above).
+    if constexpr (Pipe::GroupMax > 0) {
+        const uint32_t ringOff = kSlotRegionOffset + slotRegionBytes;
+        const uint32_t readyOff =
+            ringOff + static_cast<uint32_t>(Pipe::BcastSlotCount) * static_cast<uint32_t>(Pipe::SlotStride);
+        const uint32_t freeOff = readyOff + static_cast<uint32_t>(Pipe::GroupMax) *
+                                                grid_mock::kBcastLaneStride; // ready region = GroupMax lanes * 64 B
+        pipe.bcastRingBase = window + ringOff;
+        pipe.bcastReadyLanes = reinterpret_cast<__gm__ uint32_t*>(window + readyOff);
+        pipe.bcastFreeLanes = reinterpret_cast<__gm__ uint32_t*>(window + freeOff);
+        producerOff = freeOff + static_cast<uint32_t>(Pipe::GroupMax) * grid_mock::kBcastLaneStride;
+    }
+
+    // One synchronous outbound transfer uses this slot at a time.  It is appended
+    // after all receive-side rings/lanes so a producer can never alias a payload
+    // that this same cell is concurrently waiting to consume.
+    pipe.producerSlotBase = window + producerOff;
+}
+
+// Host-side helper: total bytes per rank for a single GridPipe (broadcast
+// region included when the pipe opted in).
+template <typename Pipe>
+inline constexpr uint32_t WindowBytes()
+{
+    if constexpr (Pipe::GroupMax > 0) {
+        return kWindowBytesWithBcast<
+            Pipe::SlotStride, Pipe::SlotCount, Pipe::BcastSlotCount, Pipe::GroupMax, Pipe::ChanCount>();
+    } else {
+        return kWindowBytes<Pipe::SlotStride, Pipe::SlotCount, Pipe::ChanCount>();
+    }
 }
 
 } // namespace a2a3_grid

@@ -21,8 +21,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //
 // ReduceSum pattern (I split across all 32 cells, x broadcast, full-H down partial
 // per cell, partials reduced EAST 8-way then SOUTH 4-way):
-//   - TREDUCE  : the fused TREDUCE<Dir, Sum> collective.
-//   - TPUSH    : the explicit TPOP<Dir> + TADD + TPUSH<Dir> lowering of TREDUCE.
+//   - TREDUCE  : the fused TREDUCE<GridGroup, Sum> collective.
+//   - TPUSH    : explicit peer-id TPOP + TADD + TPUSH with time-division rebinding.
 //
 // AllGather pattern (I split across all 32 cells, hidden AllGathered before down):
 //   - TBROADCAST : the TBROADCAST<GridGroup> MPSC collective (every cell broadcasts).

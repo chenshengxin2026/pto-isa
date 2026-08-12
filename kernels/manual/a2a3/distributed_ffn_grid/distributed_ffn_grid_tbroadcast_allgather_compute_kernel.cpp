@@ -51,6 +51,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "common.hpp"
 #include "ffn_config.hpp"
 #include "gridpipe_payload_inl.hpp"
+#include "single_vector_sync_inl.hpp"
 #include "tpipe_tmov_inl.hpp"
 
 #ifdef __CCE_AICORE__
@@ -80,34 +81,39 @@ constexpr int kRowBlock = FFN_NCUT_ROW_BLOCK; // 768 (Phase-1 gather output widt
 constexpr int kIfull = FFN_NCUT_I;            // 3072 (full intermediate / down K)
 constexpr int kHfull = FFN_NCUT_H;            // 7168 (gate/up K)
 
-// The gather is spelled with the PTO instructions TBROADCAST / TPOP<srcRank>,
-// not the A2/A3 backend's GRID_TRY_*_IMPL entry points, so this demo exercises
-// the ISA surface itself (the is_grid_group_pipe_v overload selection against the
-// unicast TPUSH/TPOP, the target-profile guard) and not just the lowering.  The
-// instructions carry no spin bound -- they block like the hardware WAIT_SPR -- so
-// a handshake mis-wire shows up as a hang rather than a kFaultWaitReadyTimeout
-// sentinel.  That is safe here because the host waves each group wholly into one
-// launch (see main_tbroadcast_allgather).  To bound the spin while debugging,
-// build with -DPTO_GRID_MOCK_WFE_MAX_SPINS=N and call GRID_TRY_TBROADCAST_IMPL /
-// GRID_TRY_TBPOP_IMPL directly.
+// DEBUG: bound the gather handshake spin so a mis-wire surfaces as a fault
+// sentinel instead of an infinite hang.  Generous enough that a correct (us-
+// latency) gather never trips it.  Set 0 to restore block-forever behaviour.
+#ifndef FFN_NCUT_GATHER_MAX_SPINS
+#define FFN_NCUT_GATHER_MAX_SPINS 100000000u
+#endif
+constexpr uint32_t kGatherMaxSpins = FFN_NCUT_GATHER_MAX_SPINS;
 
 // fp32 partials carried cube->vec through the C2V TPipe (phase A).
 using GatePipe = TPipe<0, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 using UpPipe = TPipe<2, Direction::DIR_C2V, FFN_NCUT_GATE_PARTIAL_BYTES, 1>;
 
-// Group-pipe types for the two AllGather phases.  P1 carries the [8,96] hidden
-// shard over the ROW group (8 members); P2 the [8,768] row block over the COL
-// group (4 members).  The group is part of the pipe type: switching from a row
-// group to a column group switches every peer, so the two phases are two pipes.
-// Each source contributes one tile (single-shot, no slot reuse), hence a shared
-// ring depth equal to the group size.
+// GridPipe types for the two AllGather phases.  P1 carries the [8,96] hidden
+// shard (row group of 8); P2 carries the [8,768] row block (col group of 4).
+// Each source contributes one tile (single-shot, no slot reuse).
 using HiddenShardTile = Tile<TileType::Vec, half, kT, kIShard, BLayout::RowMajor>;
 using RowBlockTile = Tile<TileType::Vec, half, kT, kRowBlock, BLayout::RowMajor>;
 using HiddenFullTile = Tile<TileType::Vec, half, kT, kIfull, BLayout::RowMajor>;
-using FfnGatherPipeP1 =
-    GridGroupPipe<HiddenShardTile, GridGroup::ROW, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1>;
-using FfnGatherPipeP2 =
-    GridGroupPipe<RowBlockTile, GridGroup::COL, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2>;
+// ChanCount = 0: both phases move their payload through the broadcast ring only
+// (TBROADCAST + TPOP<GridGroup>), never unicast TPUSH/TPOP, so the concurrency
+// array allocates no slot rings at all.
+using FfnGatherPipeP1 = GridPipe<
+    HiddenShardTile, FFN_NCUT_SLOT_BYTES_P1, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P1, FFN_NCUT_GROUP_P1,
+    /*ChanCount=*/0>;
+using FfnGatherPipeP2 = GridPipe<
+    RowBlockTile, FFN_NCUT_SLOT_BYTES_P2, FFN_NCUT_SLOT_COUNT, FFN_NCUT_BCAST_SLOTS_P2, FFN_NCUT_GROUP_P2,
+    /*ChanCount=*/0>;
+static_assert(
+    a2a3_grid::WindowBytes<FfnGatherPipeP1>() == static_cast<uint32_t>(FFN_NCUT_WIN_P1),
+    "P1 host/device GridPipe window layout mismatch");
+static_assert(
+    a2a3_grid::WindowBytes<FfnGatherPipeP2>() == static_cast<uint32_t>(FFN_NCUT_WIN_P2),
+    "P2 host/device GridPipe window layout mismatch");
 
 // Cube GEMM accumulator tiles (L0C): gate/up [16,96] (8 valid), down [16,224].
 using GateAccTile = TileAcc<float, kBaseM, kIShard, kT, kIShard>;
@@ -204,6 +210,17 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
     __gm__ uint8_t* gatePartialBlock = gatePartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
     __gm__ uint8_t* upPartialBlock = upPartialBuf + cell * FFN_NCUT_GATE_PARTIAL_BYTES;
     __gm__ uint8_t* yBlock = yFull + cell * kHShard * static_cast<int>(sizeof(float));
+
+    if constexpr (DAV_VEC) {
+        if (get_subblockid() != FFN_ACTIVE_VECTOR_SUBBLOCK_ID) {
+            // AIV1 is control-only. Phase A still needs both physical AIVs in
+            // the C2V mode-2 handshake; every other phase can return directly.
+            if (phase == 0) {
+                FfnInactiveVectorC2vHandshake<GatePipe, UpPipe>(gatePartialBlock, upPartialBlock);
+            }
+            return;
+        }
+    }
 
     // =========================== phase A: gate + up + SwiGLU ===========================
     if (phase == 0) {
@@ -341,6 +358,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             __gm__ uint8_t* window = p1Window + cell * FFN_NCUT_WIN_P1;
             a2a3_grid::InitGridPipeFromWindow(
                 gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p1CtxRaw), /*pipeId=*/0);
+            using pto::GridGroup;
 
             // Place own shard into its column slot of the row block, then broadcast.
             TINSERT(rowBlock, shardOwn, 0, static_cast<uint16_t>(col * kIShard));
@@ -351,7 +369,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
 #endif
 
             // 真·同时 MPSC: every cell TBROADCASTs its own shard concurrently.
-            TBROADCAST(gatherPipe, shardOwn);
+            (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::ROW>(gatherPipe, shardOwn, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
@@ -363,7 +381,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
                 if (srcCol == col) {
                     continue; // own shard already placed
                 }
-                TPOP(gatherPipe, shardRecv, srcCol);
+                (void)GRID_TRY_TBPOP_IMPL<GridGroup::ROW>(gatherPipe, shardRecv, srcCol, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -419,6 +437,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             __gm__ uint8_t* window = p2Window + cell * FFN_NCUT_WIN_P2;
             a2a3_grid::InitGridPipeFromWindow(
                 gatherPipe, shape, coord, window, reinterpret_cast<__gm__ void*>(p2CtxRaw), /*pipeId=*/0);
+            using pto::GridGroup;
 
             // Place own row block at its row slot of the full hidden, then broadcast.
             // cell (row, col) holds row `row`'s I-segment -> offset row*768.
@@ -428,7 +447,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             pipe_barrier(PIPE_V);
 #endif
-            TBROADCAST(gatherPipe, blockOwn);
+            (void)GRID_TRY_TBROADCAST_IMPL<GridGroup::COL>(gatherPipe, blockOwn, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
             pipe_barrier(PIPE_ALL);
 #endif
@@ -440,7 +459,7 @@ __global__ AICORE void DistributedFfnGridTbroadcastAllGatherMixedKernel(
                 if (srcRow == row) {
                     continue; // own block already placed
                 }
-                TPOP(gatherPipe, blockRecv, srcRow);
+                (void)GRID_TRY_TBPOP_IMPL<GridGroup::COL>(gatherPipe, blockRecv, srcRow, kGatherMaxSpins);
 #ifndef __PTO_AUTO__
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -529,11 +548,10 @@ void launchDistributedFfnGridTbroadcastAllGatherMixedKernel(
     uint8_t* gatePartialBuf, uint8_t* upPartialBuf, uint8_t* yFull, uint8_t* p1Ctx, uint8_t* p2Ctx, int phase,
     int rowStart, int colStart, int waveCols, int gridRows, int gridCols, int blockCount, void* stream)
 {
-    if (blockCount <= 0) {
-        return;
+    if (blockCount > 0) {
+        DistributedFfnGridTbroadcastAllGatherMixedKernel<<<blockCount, nullptr, stream>>>(
+            ffts, p1Window, p2Window, xFull, wGateShards, wUpShards, wDownShards, hiddenShardBuf, rowBlockBuf,
+            hiddenFullBuf, gatePartialBuf, upPartialBuf, yFull, p1Ctx, p2Ctx, phase, rowStart, colStart, waveCols,
+            gridRows, gridCols);
     }
-    DistributedFfnGridTbroadcastAllGatherMixedKernel<<<blockCount, nullptr, stream>>>(
-        ffts, p1Window, p2Window, xFull, wGateShards, wUpShards, wDownShards, hiddenShardBuf, rowBlockBuf,
-        hiddenFullBuf, gatePartialBuf, upPartialBuf, yFull, p1Ctx, p2Ctx, phase, rowStart, colStart, waveCols, gridRows,
-        gridCols);
 }
