@@ -4,6 +4,9 @@
 
 # PTO Tile Library
 
+Experimental [WSE Calendar A3 simulation](docs/wse-mock/README.md):
+native PTO kernels, mock Calendar transport, constraints, and FFN validation.
+
 Parallel Tile Operation (PTO) is a virtual ISA for tile-oriented programming defined by Ascend CANN. This repository provides PTO Tile instruction implementations, examples, tests, and documentation to help developers migrate and optimize operators more smoothly across different Ascend generations.
 
 [![License](https://img.shields.io/badge/License-CANN%20Open%20Software%20License%202.0-blue.svg)](LICENSE)
