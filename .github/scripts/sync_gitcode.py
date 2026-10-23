@@ -119,14 +119,22 @@ def guard_open_pr(pr):
         )
 
 
-def resolve_cut(upstream, base, head, source_ref, bootstrap):
-    query = urlencode({"state": "closed", "base": base, "head": head, "per_page": 100})
+def matching_prs(upstream, base, head, state):
+    # gh pr list --head does not support owner:branch. The REST endpoint does.
+    query = urlencode({"state": state, "base": base, "head": head, "per_page": 100})
     pages = gh("api", "--paginate", "--slurp", f"repos/{upstream}/pulls?{query}")
-    merged = [pr for page in pages for pr in page if pr.get("merged_at")]
     owner, branch = head.split(":", 1)
+    return [
+        pr
+        for page in pages
+        for pr in page
+        if pr["head"]["ref"] == branch and pr["head"]["user"]["login"].lower() == owner.lower()
+    ]
+
+
+def resolve_cut(upstream, base, head, source_ref, bootstrap):
+    merged = [pr for pr in matching_prs(upstream, base, head, "closed") if pr.get("merged_at")]
     for pr in sorted(merged, key=lambda p: p["merged_at"], reverse=True):
-        if pr["head"]["ref"] != branch or pr["head"]["user"]["login"].lower() != owner.lower():
-            continue
         body = pr.get("body") or ""
         match = re.search(r"^Source ref:\s*`?([^`\s]+)", body, re.MULTILINE)
         if (match.group(1) if match else "master") != source_ref:
@@ -197,20 +205,10 @@ def sync():
     publishing = config["dry"] == "false"
     if publishing and not os.environ.get("UPSTREAM_PR_TOKEN"):
         raise SyncError("Missing UPSTREAM_PR_TOKEN for branch push and cross-repository PR publication.")
-    open_prs = gh(
-        "pr",
-        "list",
-        "--repo",
-        upstream,
-        "--base",
-        config["target"],
-        "--head",
-        head,
-        "--state",
-        "open",
-        "--json",
-        "number,url,body,headRefOid",
-    )
+    open_prs = [
+        {"number": pr["number"], "body": pr.get("body") or "", "headRefOid": pr["head"]["sha"]}
+        for pr in matching_prs(upstream, config["target"], head, "open")
+    ]
     if len(open_prs) > 1:
         raise SyncError("Multiple matching open PRs; review them before syncing.")
     existing = open_prs[0] if open_prs else None

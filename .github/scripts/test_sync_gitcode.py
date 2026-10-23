@@ -182,6 +182,16 @@ class SyncTests(unittest.TestCase):
             )
         self.assertIn("--paginate", api.call_args.args)
 
+    def test_open_pr_query_filters_cross_repository_owner(self):
+        def pr(owner, number):
+            return {"number": number, "head": {"ref": "gitcode-sync", "user": {"login": owner}}}
+
+        with patch.object(sync, "gh", return_value=[[pr("other", 1)], [pr("fork", 368)]]) as api:
+            matches = sync.matching_prs("up/repo", "main", "fork:gitcode-sync", "open")
+        self.assertEqual([pr["number"] for pr in matches], [368])
+        self.assertEqual(api.call_args.args[0], "api")
+        self.assertIn("head=fork%3Agitcode-sync", api.call_args.args[-1])
+
     def exercise_publication(self, dry, existing=None):
         self.source_change()
         original_git, original_command = sync.git, sync.command
@@ -194,8 +204,18 @@ class SyncTests(unittest.TestCase):
             return original_git(*args)
 
         def gh(*args):
-            if args[:2] == ("pr", "list"):
-                return [existing] if existing else []
+            if args[0] == "api":
+                if not existing:
+                    return [[]]
+                return [
+                    [
+                        {
+                            "number": existing["number"],
+                            "body": existing["body"],
+                            "head": {"ref": "gitcode-sync", "user": {"login": "fork"}, "sha": existing["headRefOid"]},
+                        }
+                    ]
+                ]
             if args[:2] == ("pr", "view"):
                 return {"state": "OPEN", "headRefOid": existing["headRefOid"], "body": existing["body"]}
             raise AssertionError(args)
