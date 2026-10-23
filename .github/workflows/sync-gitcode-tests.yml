@@ -1,0 +1,19 @@
+name: Sync workflow tests
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/*sync_gitcode*'
+      - '.github/workflows/sync*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise isolated Git histories without network or credentials
+        run: python3 -m unittest discover -s .github/scripts -p 'test_sync_gitcode.py' -v
