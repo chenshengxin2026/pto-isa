@@ -74,6 +74,14 @@ $$
 | `stepKb`      | 4     |
 | `stepN`       | 1     |
 
+注意：上表仅描述默认的 `m=k=n=6144` 配置。修改 `m/k/n` 时，需要**同时**更新 host 与 device 两侧，并保证两处 tiling 常量一致：
+
+- `main.cpp`（host 侧）：`m/k/n` 决定缓冲区/文件大小（`cElementCount = m * n`）与结果校验；`main.cpp` 中声明的 tiling 参数会作为模板实参传入 host 入口，需与 device 侧保持一致。
+- `gemm_performance_kernel.cpp`（`LaunchGEMME2E`）：其中另有独立的一套 `m/k/n`、`singleCoreM/singleCoreK/singleCoreN` 及 base/step 常量，决定设备端实际计算与 tiling；`singleCoreK` 也需与 `k` 一致（`kLoop = singleCoreK / baseK`）。
+- `scripts/gen_data.py`：同步修改用例尺寸，并重新执行 `python3 scripts/gen_data.py` 生成数据。
+
+重新计算 tiling 时保证 `m % singleCoreM == 0` 且 `n % singleCoreN == 0`（见下文 Checklist）。性能表中其他尺寸的 tiling 参数本文档未提供，请勿把 6144³ 的取值直接套用到其他尺寸。
+
 ## 实测性能（参考）
 
 以下数据在 Ascend A3（24 核）上测得，覆盖多个 `m=k=n` 尺寸（fp16 输入 → fp32 输出）。

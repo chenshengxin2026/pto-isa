@@ -48,6 +48,7 @@ setgetval
 tabs
 tadd
 tadds
+tassign
 tand
 tands
 targreduceop

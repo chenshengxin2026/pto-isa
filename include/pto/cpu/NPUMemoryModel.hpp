@@ -260,6 +260,31 @@ public:
         return GetPointer<TileDef>(static_cast<std::size_t>(addr));
     }
 
+    // An instruction may access more than a static view's valid rectangle.
+    // Check its actual access against the backing storage, before forming the
+    // offset pointer. Unregistered storage (such as auto-mode internal buffers)
+    // remains the responsibility of its owner.
+    void CheckAccess(const void* ptr, std::size_t byteOffset, std::size_t accessBytes) const
+    {
+        const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+        for (const auto& buffer : buffers_) {
+            const auto start = reinterpret_cast<std::uintptr_t>(buffer.data());
+            if (addr >= start && addr - start < buffer.size()) {
+                const std::size_t remainingBytes = buffer.size() - (addr - start);
+                PTO_CPU_ASSERT(
+                    byteOffset <= remainingBytes && accessBytes <= remainingBytes - byteOffset,
+                    "Tile access exceeds memory region capacity.");
+                return;
+            }
+        }
+        if (const auto* hostRange = FindHostStorageRange(addr)) {
+            const std::size_t remainingBytes = hostRange->sizeBytes - (addr - hostRange->baseAddress);
+            PTO_CPU_ASSERT(
+                byteOffset <= remainingBytes && accessBytes <= remainingBytes - byteOffset,
+                "Tile access exceeds host storage capacity.");
+        }
+    }
+
     // Get raw buffer bases (for debugging/direct access)
     char* GetREGBase()
     {
@@ -368,9 +393,23 @@ private:
     }
 
     template <typename TileDef>
-    static constexpr std::size_t GetTileSizeInBytes()
+    static std::size_t GetTileSizeInBytes()
     {
         if constexpr (is_tile_data_v<TileDef>) {
+            // A static, unpadded view keeps its parent's physical strides but
+            // binds its valid rectangle. Requiring the whole parent's
+            // allocation again at a nonzero view offset rejects legal windows
+            // near the end of L0C/UB. Include stride gaps and packed elements;
+            // validRows * validCols is not the backing-storage span.
+            // Instructions that also write padding or whole source blocks must
+            // check their actual access with CheckAccess before those writes.
+            if constexpr (TileDef::ValidRow > 0 && TileDef::ValidCol > 0 && TileDef::PadVal == PadValue::Null) {
+                const std::size_t lastElement =
+                    GetTileElementOffset<TileDef>(TileDef::ValidRow - 1, TileDef::ValidCol - 1);
+                return (lastElement / TileDef::kPackedElementsPerByte + 1) * sizeof(typename TileDef::DType);
+            }
+            // Dynamic views can later expand, and padded loads can write the
+            // physical box, so retain the full-allocation check for both.
             return TileDef::GetSizeInBytes();
         } else {
             return static_cast<std::size_t>(TileDef::bufferSize);
@@ -403,7 +442,7 @@ private:
     {
         EnsureInitialized();
 
-        constexpr std::size_t tileBytes = GetTileSizeInBytes<TileDef>();
+        const std::size_t tileBytes = GetTileSizeInBytes<TileDef>();
         PTO_CPU_ASSERT(
             byteOffset <= sizes_[region] && tileBytes <= sizes_[region] - byteOffset,
             "Tile assignment exceeds memory region capacity.");

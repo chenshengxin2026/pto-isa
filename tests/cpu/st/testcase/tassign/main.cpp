@@ -14,7 +14,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 //   - TAssignWindowTest: a windowed sub-view (full block shape, smaller valid
 //     shape, non-zero byte offset) resolves against its valid-region footprint.
 
+#include <algorithm>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <pto/pto-inst.hpp>
@@ -130,8 +133,8 @@ TEST_F(TAssignWindowTest, windowed_strip_offsets_stay_in_bounds)
         auto* ptr = reinterpret_cast<char*>(strip.data());
         EXPECT_EQ(ptr, base + byteOffset) << "strip offset " << byteOffset;
         // The strip's whole valid-region footprint must lie within the L0C buffer.
-        const std::size_t footprintBytes =
-            (static_cast<std::size_t>(GetTileOffset<AccStrip>(kStripRows - 1, kCols - 1)) + 1) * sizeof(int32_t);
+        // Fifteen 128x16 column-block pitches followed by one 16x16 strip.
+        constexpr std::size_t footprintBytes = 15 * 8192 + 1024;
         EXPECT_LE(byteOffset + footprintBytes, kL0CBytes) << "strip offset " << byteOffset;
     }
 }
@@ -152,3 +155,224 @@ TEST_F(TAssignWindowTest, windowed_strip_roundtrips_through_backing_storage)
     strip.data()[0] = 0x5a5a5a5a;
     EXPECT_EQ(base[elemOffset], 0x5a5a5a5a);
 }
+
+TEST_F(TAssignWindowTest, every_strip_reads_the_parent_layout)
+{
+    AccFull full(kRows, kCols);
+    TASSIGN(full, 0);
+    for (int row = 0; row < kRows; ++row) {
+        for (int col = 0; col < kCols; ++col) {
+            full.SetElement(row, col, row * kCols + col);
+        }
+    }
+    for (int rowStart = 0; rowStart < kRows; rowStart += kStripRows) {
+        const std::size_t offset = GetTileOffset<AccFull>(rowStart, 0);
+        AccStrip strip;
+        AccStrip alias;
+        TASSIGN(strip, offset * sizeof(int32_t));
+        TASSIGN(alias, reinterpret_cast<std::uintptr_t>(full.data() + offset));
+        for (int row = 0; row < kStripRows; ++row) {
+            for (int col = 0; col < kCols; ++col) {
+                EXPECT_EQ(strip.GetElement(row, col), full.GetElement(rowStart + row, col));
+                EXPECT_EQ(alias.GetElement(row, col), full.GetElement(rowStart + row, col));
+            }
+        }
+    }
+}
+
+TEST_F(TAssignWindowTest, rejects_a_view_that_reaches_past_l0c)
+{
+    // The last legal strip ends exactly at the L0C boundary. Advancing it by
+    // one element must still fail, including when the address is a host alias.
+    const std::size_t offset = GetTileOffset<AccFull>(kRows - kStripRows, 0) * sizeof(int32_t);
+    AccStrip strip;
+    EXPECT_DEATH(TASSIGN(strip, offset + sizeof(int32_t)), "exceeds memory region capacity");
+    auto* base = NPUMemoryModel::Instance().GetL0CBase();
+    EXPECT_DEATH(
+        TASSIGN(strip, reinterpret_cast<std::uintptr_t>(base + offset + sizeof(int32_t))),
+        "exceeds memory region capacity");
+}
+
+TEST_F(TAssignWindowTest, dynamic_and_padded_tiles_still_require_the_full_box)
+{
+    AccFull dynamic(kStripRows, kCols);
+    EXPECT_DEATH(TASSIGN(dynamic, sizeof(int32_t)), "exceeds memory region capacity");
+
+    using Padded = Tile<TileType::Vec, float, 16, 64, BLayout::RowMajor, 1, 64, SLayout::NoneBox, 512, PadValue::Zero>;
+    Padded padded;
+    // A padded load can touch all 16 rows even with one valid row.
+    EXPECT_DEATH(TASSIGN(padded, 192 * 1024 - 64 * sizeof(float)), "exceeds memory region capacity");
+}
+
+TEST_F(TAssignWindowTest, host_storage_views_use_the_same_span_check)
+{
+    auto storage = std::make_shared<std::vector<int32_t>>(kRows * kCols);
+    NPUMemoryModel::Instance().RegisterHostStorage(storage);
+    const std::size_t offset = GetTileOffset<AccFull>(kRows - kStripRows, 0);
+    AccStrip strip;
+    TASSIGN(strip, reinterpret_cast<std::uintptr_t>(storage->data() + offset));
+    strip.SetElement(kStripRows - 1, kCols - 1, 42);
+    EXPECT_EQ(storage->back(), 42);
+    EXPECT_DEATH(
+        TASSIGN(strip, reinterpret_cast<std::uintptr_t>(storage->data() + offset + 1)),
+        "exceeds host storage capacity");
+}
+
+TEST_F(TAssignWindowTest, packed_view_span_counts_bytes_instead_of_logical_elements)
+{
+    using Packed = Tile<TileType::Vec, float4_e2m1x2_t, 4, 64, BLayout::RowMajor, 1, 64>;
+    static_assert(Packed::kPackedElementsPerByte == 2);
+    const std::size_t offset = 192 * 1024 - 32;
+    Packed view;
+    TASSIGN(view, offset);
+    EXPECT_EQ(reinterpret_cast<char*>(view.data()), NPUMemoryModel::Instance().GetUBBase() + offset);
+    EXPECT_DEATH(TASSIGN(view, offset + 1), "exceeds memory region capacity");
+}
+
+namespace {
+template <typename TileData, typename GlobalData>
+void CheckMatLoadTail(std::size_t validSpanBytes, std::size_t loadSpanBytes, int loadedRows, int loadedCols)
+{
+    constexpr std::size_t kL1Bytes = 512 * 1024;
+    constexpr std::size_t kPrefixElements = 16;
+    std::vector<int16_t> input(TileData::ValidRow * TileData::ValidCol, 7);
+    GlobalData src(input.data());
+    TileData dst;
+    auto* base = NPUMemoryModel::Instance().GetL1Base();
+
+    // The valid rectangle fits, but the mandatory DMA tail does not.
+    const std::size_t invalidOffset = kL1Bytes - validSpanBytes;
+    TASSIGN(dst, invalidOffset);
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds memory region capacity");
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(base + invalidOffset));
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds memory region capacity");
+
+    // Reserve exactly the transfer span, still less than the full physical box.
+    TASSIGN(dst, kL1Bytes - loadSpanBytes);
+    TLOAD(dst, src);
+    EXPECT_EQ(dst.GetElement(TileData::ValidRow - 1, TileData::ValidCol - 1), 7);
+    EXPECT_EQ(dst.GetElement(loadedRows - 1, loadedCols - 1), 0);
+
+    auto shortStorage = std::make_shared<std::vector<int16_t>>(kPrefixElements + validSpanBytes / sizeof(int16_t));
+    NPUMemoryModel::Instance().RegisterHostStorage(shortStorage);
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(shortStorage->data() + kPrefixElements));
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds host storage capacity");
+
+    auto storage =
+        std::make_shared<std::vector<int16_t>>(kPrefixElements + loadSpanBytes / sizeof(int16_t), int16_t(1234));
+    NPUMemoryModel::Instance().RegisterHostStorage(storage);
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(storage->data() + kPrefixElements));
+    TLOAD(dst, src);
+    EXPECT_EQ(dst.GetElement(TileData::ValidRow - 1, TileData::ValidCol - 1), 7);
+    EXPECT_EQ(storage->back(), 0);
+    EXPECT_EQ((*storage)[kPrefixElements - 1], 1234);
+}
+
+template <typename T, int Groups, int Blocks>
+void CheckA5NzLoad()
+{
+    NPU_MEMORY_INIT(NPUArch::A5);
+    NPU_MEMORY_CLEAR();
+    constexpr int kC0 = 32 / sizeof(T) * (IsTwinType<T>() ? 2 : 1);
+    using DstTile =
+        Tile<TileType::Vec, T, 32, Groups * Blocks * kC0, BLayout::ColMajor, 16, kC0, SLayout::RowMajor, 512>;
+    using SrcGlobal = GlobalTensor<
+        T, Shape<Groups, Blocks, 1, 16, kC0>, Stride<Blocks * 16 * kC0, 16 * kC0, 16 * kC0, kC0, 1>, Layout::NZ>;
+    // Each GM block supplies 16 rows of 32 bytes; UB block pitch is 32 rows.
+    constexpr std::size_t kBurstBytes = 512;
+    constexpr std::size_t kBlockPitch = 1024;
+    constexpr std::size_t kLoadSpan = (Groups * Blocks - 1) * kBlockPitch + kBurstBytes;
+    constexpr std::size_t kUBBytes = 256 * 1024;
+    constexpr std::size_t kPrefixBytes = 32;
+    std::vector<T> input(Groups * Blocks * kBurstBytes / sizeof(T));
+    std::fill_n(reinterpret_cast<uint8_t*>(input.data()), input.size() * sizeof(T), uint8_t(0x12));
+    SrcGlobal src(input.data());
+    DstTile dst;
+    auto* base = NPUMemoryModel::Instance().GetUBBase();
+
+    TASSIGN(dst, kUBBytes - kBurstBytes);
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds memory region capacity");
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(base + kUBBytes - kBurstBytes));
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds memory region capacity");
+    // Also reject a transfer whose final block exceeds capacity by just one byte.
+    TASSIGN(dst, kUBBytes - kLoadSpan + 1);
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds memory region capacity");
+
+    auto checkContents = [&]() {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(dst.data());
+        for (std::size_t i = 0; i < kLoadSpan; ++i) {
+            const uint8_t expected = i % kBlockPitch < kBurstBytes ? 0x12 : 0x5a;
+            ASSERT_EQ(bytes[i], expected) << "byte " << i;
+        }
+    };
+    TASSIGN(dst, kUBBytes - kLoadSpan);
+    std::fill_n(reinterpret_cast<uint8_t*>(dst.data()), kLoadSpan, uint8_t(0x5a));
+    TLOAD(dst, src);
+    checkContents();
+
+    auto shortStorage = std::make_shared<std::vector<T>>((kPrefixBytes + kBurstBytes) / sizeof(T));
+    NPUMemoryModel::Instance().RegisterHostStorage(shortStorage);
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(shortStorage->data()) + kPrefixBytes);
+    EXPECT_DEATH(TLOAD(dst, src), "Tile access exceeds host storage capacity");
+
+    auto storage = std::make_shared<std::vector<T>>((kPrefixBytes + kLoadSpan) / sizeof(T));
+    std::fill_n(reinterpret_cast<uint8_t*>(storage->data()), kPrefixBytes + kLoadSpan, uint8_t(0x5a));
+    NPUMemoryModel::Instance().RegisterHostStorage(storage);
+    TASSIGN(dst, reinterpret_cast<std::uintptr_t>(storage->data()) + kPrefixBytes);
+    TLOAD(dst, src);
+    checkContents();
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(storage->data())[kPrefixBytes - 1], 0x5a);
+}
+} // namespace
+
+TEST_F(TAssignWindowTest, mat_nd_to_nz_load_checks_column_tail)
+{
+    using Dst = Tile<TileType::Mat, int16_t, 16, 48, BLayout::ColMajor, 2, 17, SLayout::RowMajor, 512>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 2, 17>, Stride<34, 34, 34, 17, 1>>;
+    // Valid last element: second C0 block, row 1, column 0 (byte 544).
+    // DMA completes that row's 32-byte C0 block through byte 575.
+    CheckMatLoadTail<Dst, Src>(546, 576, 2, 32);
+}
+
+TEST_F(TAssignWindowTest, mat_dn_to_zn_load_checks_row_tail)
+{
+    using Dst = Tile<TileType::Mat, int16_t, 48, 16, BLayout::RowMajor, 17, 2, SLayout::ColMajor, 512>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 17, 2>, Stride<34, 34, 34, 1, 17>, Layout::DN>;
+    CheckMatLoadTail<Dst, Src>(546, 576, 32, 2);
+}
+
+TEST_F(TAssignWindowTest, a2a3_single_row_mat_load_checks_column_tail)
+{
+    using Dst = Tile<TileType::Mat, int16_t, 1, 48, BLayout::RowMajor, 1, 17>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 1, 17>, Stride<17, 17, 17, 17, 1>>;
+    CheckMatLoadTail<Dst, Src>(34, 64, 1, 32);
+}
+
+TEST_F(TAssignWindowTest, a2a3_single_column_mat_load_checks_row_tail)
+{
+    using Dst = Tile<TileType::Mat, int16_t, 48, 1, BLayout::ColMajor, 17, 1>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 17, 1>, Stride<17, 17, 17, 1, 17>, Layout::DN>;
+    CheckMatLoadTail<Dst, Src>(34, 64, 32, 1);
+}
+
+TEST_F(TAssignWindowTest, a5_mat_nd_load_checks_column_tail)
+{
+    NPU_MEMORY_INIT(NPUArch::A5);
+    using Dst = Tile<TileType::Mat, int16_t, 4, 48, BLayout::RowMajor, 2, 17>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 2, 17>, Stride<34, 34, 34, 17, 1>>;
+    CheckMatLoadTail<Dst, Src>(130, 160, 2, 32);
+}
+
+TEST_F(TAssignWindowTest, a5_mat_dn_load_checks_row_tail)
+{
+    NPU_MEMORY_INIT(NPUArch::A5);
+    using Dst = Tile<TileType::Mat, int16_t, 48, 4, BLayout::ColMajor, 17, 2>;
+    using Src = GlobalTensor<int16_t, Shape<1, 1, 1, 17, 2>, Stride<34, 34, 34, 1, 17>, Layout::DN>;
+    CheckMatLoadTail<Dst, Src>(130, 160, 32, 2);
+}
+
+TEST_F(TAssignWindowTest, a5_nz_load_checks_all_source_column_blocks) { CheckA5NzLoad<int16_t, 1, 2>(); }
+
+TEST_F(TAssignWindowTest, a5_nz_load_checks_all_source_groups) { CheckA5NzLoad<int16_t, 2, 2>(); }
+
+TEST_F(TAssignWindowTest, a5_nz_packed_load_checks_byte_spans) { CheckA5NzLoad<float4_e2m1x2_t, 2, 2>(); }

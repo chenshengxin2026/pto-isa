@@ -74,6 +74,14 @@ This example uses a 24-core A3 platform as the performance validation platform.
 | `stepKb`      | 4     |
 | `stepN`       | 1     |
 
+Note: the table above describes the default `m=k=n=6144` configuration only. When you change `m/k/n`, update **both** the host and the device side, and keep the tiling constants consistent between them:
+
+- `main.cpp` (host): `m/k/n` determine buffer/file sizes (`cElementCount = m * n`) and result validation; the tiling parameters declared in `main.cpp` are passed to the host entry as template arguments and must stay consistent with the device side.
+- `gemm_performance_kernel.cpp` (`LaunchGEMME2E`): a separate set of `m/k/n`, `singleCoreM/singleCoreK/singleCoreN` and base/step constants determines the actual device-side computation and tiling; `singleCoreK` must also match `k` (`kLoop = singleCoreK / baseK`).
+- `scripts/gen_data.py`: update the case size to match and regenerate the data with `python3 scripts/gen_data.py`.
+
+Recompute tiling so that `m % singleCoreM == 0` and `n % singleCoreN == 0` (see the checklist below). Tiling values for the other sizes in the performance table are not provided by this document; do not copy the `6144³` values to another size.
+
 ## Measured Performance (Reference)
 
 The following measurements were collected on Ascend A3 (24 cores) for several `m=k=n` sizes (fp16 inputs → fp32 output).
