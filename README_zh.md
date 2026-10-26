@@ -10,6 +10,8 @@ PTO（Parallel Tile Operation）是昇腾 CANN 定义的一套面向 tile 编程
 [![Platform](https://img.shields.io/badge/Platform-Ascend%20A2%20%7C%20A3%20%7C%20A5%20%7C%20CPU-green.svg)](#️-平台支持)
 [![Docs](https://img.shields.io/badge/Docs-文档-blue.svg)](docs/README_zh.md)
 
+[WSE Calendar 与 A3 CCE mock](docs/wse-calendar.md)：`wse-sim-1026` 的同步契约、真实 DMA 传输和 FFN 端到端复现入口。
+
 ## 📰 新闻
 
 - 🎉 **2025-12-27**：PTO Tile Library 正式开源发布。

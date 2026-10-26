@@ -10,6 +10,8 @@ Parallel Tile Operation (PTO) is a virtual ISA for tile-oriented programming def
 [![Platform](https://img.shields.io/badge/Platform-Ascend%20A2%20%7C%20A3%20%7C%20A5%20%7C%20CPU-green.svg)](#-platform-support)
 [![Docs](https://img.shields.io/badge/Docs-Documentation-blue.svg)](docs/README.md)
 
+[WSE Calendar and A3 CCE mock](docs/wse-calendar.md): the `wse-sim-1026` synchronous contract, native DMA transport and end-to-end FFN guide.
+
 ## 📰 News
 
 - 🎉 **2025-12-27**: PTO Tile Library is officially open-sourced.
