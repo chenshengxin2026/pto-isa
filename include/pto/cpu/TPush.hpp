@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef TPUSH_HPP
 #define TPUSH_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <atomic>
 #include <array>
 #include <condition_variable>
@@ -37,6 +39,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <pto/cpu/tile_offsets.hpp>
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 namespace cpu_pipe {
 
@@ -1299,7 +1302,7 @@ PTO_INTERNAL void TPush_v2c(Pipe& pipe, TileProd& tile, size_t slotIndex)
         std::is_same_v<typename TileProd::DType, float8_e8m0_t> && std::is_same_v<DstT, float8_e8m0_t> &&
         TileProd::isRowMajor && TileProd::SFractal == SLayout::RowMajor && TileProd::SFractalSize == 32 &&
         TileProd::Rows > 0 && TileProd::Cols > 0 && TileProd::Rows % 16 == 0 && TileProd::Cols % 2 == 0) {
-        if (NPUMemoryModel::Instance().GetArch() == NPUArch::A5 && rows == TileProd::Rows && cols == TileProd::Cols) {
+        if (GetCpuSimArch() == NPUArch::A5 && rows == TileProd::Rows && cols == TileProd::Cols) {
             // Publish only after the copy succeeds. Bounds checking and overlap
             // removal leave room for this entry: it occupies at least 32 bytes,
             // disjoint from every retained record in the SlotSize-byte slot.
@@ -1351,6 +1354,7 @@ PTO_INTERNAL void TPUSH_IMPL(Pipe& pipe, TileProd& tile)
     TPush_impl<Pipe, TileProd, TConfig, TileSplitAxis::TILE_NO_SPLIT>(pipe, tile);
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif

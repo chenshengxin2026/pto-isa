@@ -61,16 +61,14 @@ PTO_INTERNAL typename TileSrc::DType rowSumModular(typename TileSrc::TileDType s
 }
 } // namespace cpu
 
-template <typename TileDst, typename TileSrc>
-void TRowSum(typename TileDst::TileDType dst, typename TileSrc::TileDType src, uint32_t M, uint32_t N)
+PTO_CPU_TARGET_NAMESPACE_BEGIN
+
+template <NPUArch Arch, typename TileDst, typename TileSrc>
+void TRowSumForArch(typename TileDst::TileDType dst, typename TileSrc::TileDType src, uint32_t M, uint32_t N)
 {
-    auto& memory = NPUMemoryModel::Instance();
-    memory.EnsureInitialized();
-    const bool useA5Reduction = memory.GetArch() == NPUArch::A5;
-    // Workers have separate memory models; use the calling thread's architecture.
-    cpu::parallel_for_1d(0, M, static_cast<std::size_t>(M) * N, [&, useA5Reduction](std::size_t i) {
+    cpu::parallel_for_1d(0, M, static_cast<std::size_t>(M) * N, [&](std::size_t i) {
         TypeSum<TileDst> sum = 0;
-        if (useA5Reduction) {
+        if constexpr (Arch == NPUArch::A5) {
             using T = typename TileSrc::DType;
             if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
                 sum = cpu::rowSumTree<TileSrc>(src, i, N);
@@ -96,8 +94,8 @@ void TRowSum(typename TileDst::TileDType dst, typename TileSrc::TileDType src, u
     });
 }
 
-template <typename TileDst, typename TileSrc>
-PTO_INTERNAL void CheckRSValid(NPUArch arch, uint32_t srcRows, uint32_t srcCols, uint32_t dstRows)
+template <NPUArch Arch, typename TileDst, typename TileSrc>
+PTO_INTERNAL void CheckRSValid(uint32_t srcRows, uint32_t srcCols, uint32_t dstRows)
 {
     using SrcType = typename TileSrc::DType;
     using DstType = typename TileDst::DType;
@@ -117,7 +115,7 @@ PTO_INTERNAL void CheckRSValid(NPUArch arch, uint32_t srcRows, uint32_t srcCols,
         (std::is_same_v<SrcType, half> || std::is_same_v<SrcType, float> || std::is_same_v<SrcType, int16_t> ||
          std::is_same_v<SrcType, int32_t> || std::is_same_v<SrcType, int64_t> || std::is_same_v<SrcType, uint64_t>);
     static_assert(legacySupported || a5Supported, "Not supported data type");
-    if (arch == NPUArch::A5) {
+    if constexpr (Arch == NPUArch::A5) {
         PTO_CPU_ASSERT(a5Supported, "A5 TROWSUM requires matching half, float, int16, int32, int64 or uint64 types.");
         PTO_CPU_ASSERT(
             (TileSrc::Loc == TileType::Vec && TileDst::Loc == TileType::Vec),
@@ -134,18 +132,37 @@ PTO_INTERNAL void CheckRSValid(NPUArch arch, uint32_t srcRows, uint32_t srcCols,
     }
 }
 
-template <typename TileDataOut, typename TileDataIn, typename TileDataTmp>
+template <typename TileDst, typename TileSrc, CpuSimTarget Target = CPU_SIM_TARGET>
+void TRowSum(typename TileDst::TileDType dst, typename TileSrc::TileDType src, uint32_t rows, uint32_t cols)
+{
+    if constexpr (Target == CpuSimTarget::A5) {
+        TRowSumForArch<NPUArch::A5, TileDst, TileSrc>(dst, src, rows, cols);
+    } else if constexpr (Target == CpuSimTarget::A2A3) {
+        TRowSumForArch<NPUArch::A2A3, TileDst, TileSrc>(dst, src, rows, cols);
+    } else if (GetCpuSimArch<Target>() == NPUArch::A5) {
+        TRowSumForArch<NPUArch::A5, TileDst, TileSrc>(dst, src, rows, cols);
+    } else {
+        TRowSumForArch<NPUArch::A2A3, TileDst, TileSrc>(dst, src, rows, cols);
+    }
+}
+
+template <typename TileDataOut, typename TileDataIn, typename TileDataTmp, CpuSimTarget Target = CPU_SIM_TARGET>
 PTO_INTERNAL void TROWSUM_IMPL(TileDataOut& dstTile, TileDataIn& srcTile, TileDataTmp& tmp)
 {
-    auto& memory = NPUMemoryModel::Instance();
-    memory.EnsureInitialized();
-    CheckRSValid<TileDataOut, TileDataIn>(
-        memory.GetArch(), srcTile.GetValidRow(), srcTile.GetValidCol(), dstTile.GetValidRow());
-
-    uint32_t m = srcTile.GetValidRow();
-    uint32_t n = srcTile.GetValidCol();
-
-    TRowSum<TileDataOut, TileDataIn>(dstTile.data(), srcTile.data(), m, n);
+    uint32_t rows = srcTile.GetValidRow();
+    uint32_t cols = srcTile.GetValidCol();
+    uint32_t dstRows = dstTile.GetValidRow();
+    if constexpr (Target == CpuSimTarget::A5) {
+        CheckRSValid<NPUArch::A5, TileDataOut, TileDataIn>(rows, cols, dstRows);
+    } else if constexpr (Target == CpuSimTarget::A2A3) {
+        CheckRSValid<NPUArch::A2A3, TileDataOut, TileDataIn>(rows, cols, dstRows);
+    } else if (GetCpuSimArch<Target>() == NPUArch::A5) {
+        CheckRSValid<NPUArch::A5, TileDataOut, TileDataIn>(rows, cols, dstRows);
+    } else {
+        CheckRSValid<NPUArch::A2A3, TileDataOut, TileDataIn>(rows, cols, dstRows);
+    }
+    TRowSum<TileDataOut, TileDataIn, Target>(dstTile.data(), srcTile.data(), rows, cols);
 }
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif

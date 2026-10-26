@@ -10,6 +10,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #ifndef TTILE_ASSIGN
 #define TTILE_ASSIGN
+
+#include <pto/cpu/target_config.hpp>
 #include <cstdint>
 #include <pto/common/pto_tile.hpp>
 
@@ -18,6 +20,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #endif
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 template <typename T, typename AddrType>
 PTO_INTERNAL void TASSIGN_IMPL(T& obj, AddrType addr)
@@ -38,10 +41,10 @@ PTO_INTERNAL void TASSIGN_IMPL(T& obj, AddrType addr)
 
 #ifdef __CPU_SIM
 // Initialize NPU memory model with specific architecture
-// Call once at program start (optional, defaults to A2A3)
+// Call once at program start (optional; defaults to the compiled family, or A2A3 in legacy mode)
 // Sets the default arch for all threads, and initializes the calling thread's instance.
 // Other threads auto-initialize via EnsureInitialized() on first use.
-inline void NPU_MEMORY_INIT(NPUArch arch = NPUArch::A2A3)
+inline void NPU_MEMORY_INIT(NPUArch arch = CPU_SIM_TARGET == CpuSimTarget::A5 ? NPUArch::A5 : NPUArch::A2A3)
 {
     NPUMemoryModel::SetDefaultArch(arch);
     NPUMemoryModel::Instance().Initialize(arch);
@@ -51,5 +54,6 @@ inline void NPU_MEMORY_INIT(NPUArch arch = NPUArch::A2A3)
 inline void NPU_MEMORY_CLEAR() { NPUMemoryModel::Instance().Clear(); }
 #endif
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif

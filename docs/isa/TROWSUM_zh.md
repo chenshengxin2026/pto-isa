@@ -69,7 +69,8 @@ PTO_INST RecordEvent TROWSUM(TileDataOut &dst, TileDataIn &src, TileDataTmp &tmp
 
 ### CPU_SIM实现检查
 
-目标架构取自调用线程的内存模型，不取决于宿主机硬件；设置方式见
+目标架构由编译期 CPU 架构标志选择；未设置标志的兼容模式取自调用线程的内存模型，
+均不取决于宿主机硬件。设置方式见
 [选择模拟目标架构](../coding/cpu_sim_zh.md#选择模拟目标架构)。
 
 - **A5**：输入输出类型必须相同，支持 `half`、`float`、`int16_t`、`int32_t`、
@@ -118,8 +119,8 @@ PTO_INST RecordEvent TROWSUM(TileDataOut &dst, TileDataIn &src, TileDataTmp &tmp
 
 以下片段仅展示调用和存储绑定方式，不是完整可执行程序；归约前须先初始化源数据。
 在 CPU_SIM 下编译时需定义 `__CPU_SIM`，自动模式示例还需定义 `__PTO_AUTO__`。
-要验证 A5 路径，应按 CPU_SIM 指南在应用启动阶段选择 A5；这两个函数自身不选择架构，
-否则使用已配置的默认架构（初始为 A2A3）。
+要验证 A5 路径，可额外定义 `PTO_CPU_SIM_TARGET_A5`，或按 CPU_SIM 指南在应用启动阶段
+通过兼容接口选择 A5。未指定编译期架构或运行期选择时，默认为 A2A3。
 
 ### 自动（Auto）
 

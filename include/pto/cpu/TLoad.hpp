@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef TLOAD_HPP
 #define TLOAD_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +25,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "nz_utils.hpp"
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 template <typename TileData>
 AICORE constexpr typename TileData::DType getPadValue()
 {
@@ -73,7 +76,7 @@ PTO_INLINE void CheckTileData(TileData& dst, GlobalData& src)
         if constexpr (
             TileData::Loc == TileType::Vec && !TileData::isRowMajor && TileData::SFractal == SLayout::RowMajor) {
             // A5 NZ-to-UB DMA takes its row count from the tile and column blocks from GM.
-            if (NPUMemoryModel::Instance().GetArch() == NPUArch::A5) {
+            if (GetCpuSimArch() == NPUArch::A5) {
                 [[maybe_unused]] constexpr size_t C0_ELEMENTS =
                     C0_SIZE_BYTE / sizeof(typename TileData::DType) * (IsTwinType<typename TileData::DType>() ? 2 : 1);
                 assert(
@@ -119,7 +122,7 @@ PTO_INLINE void CheckTileData(TileData& dst, GlobalData& src)
             const int64_t matrixCols = src.GetShape(dnToZn ? GlobalTensorDim::DIM_3 : GlobalTensorDim::DIM_4);
             const int validRows = dnToZn ? dst.GetValidCol() : dst.GetValidRow();
             const int validCols = dnToZn ? dst.GetValidRow() : dst.GetValidCol();
-            partialMultiNd = NPUMemoryModel::Instance().GetArch() == NPUArch::A5 &&
+            partialMultiNd = GetCpuSimArch() == NPUArch::A5 &&
                              (!dnToZn || src.GetStride(GlobalTensorDim::DIM_3) == 1) &&
                              src.GetShape(GlobalTensorDim::DIM_0) == 1 && src.GetShape(GlobalTensorDim::DIM_1) == 1 &&
                              src.GetShape(GlobalTensorDim::DIM_2) > 0 &&
@@ -238,7 +241,7 @@ PTO_INTERNAL void FillTLoadPadding(TileData& dst, size_t validRow, size_t validC
         }
 
         // A2/A3 uses ND-to-NZ DMA for the single-row/single-column Mat special case.
-        if (NPUMemoryModel::Instance().GetArch() == NPUArch::A2A3) {
+        if (GetCpuSimArch() == NPUArch::A2A3) {
             if constexpr (
                 tileLayout == TileLayoutCustom::ND && GlobalData::layout == Layout::ND && TileData::Rows == 1) {
                 const size_t padCols = (TileData::Cols - validCol) % blockSizeElem;
@@ -299,7 +302,7 @@ PTO_INTERNAL void TLOAD_TILE_IMPL(TileData& dst, GlobalData& src)
     if constexpr (
         GlobalData::layout == Layout::NZ && TileData::Loc == TileType::Vec && !TileData::isRowMajor &&
         TileData::SFractal == SLayout::RowMajor) {
-        if (NPUMemoryModel::Instance().GetArch() == NPUArch::A5) {
+        if (GetCpuSimArch() == NPUArch::A5) {
             loadA5VecNz(dst, src);
             return;
         }
@@ -536,5 +539,6 @@ PTO_INTERNAL void TLOAD_IMPL(TileData& dst, GlobalData& src)
     }
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif

@@ -11,11 +11,17 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef ARCH_CAPABILITY_HPP
 #define ARCH_CAPABILITY_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <type_traits>
 #include <pto/common/arch_macro.hpp>
 #include <pto/common/type.hpp>
+#ifdef __CPU_SIM
+#include <pto/cpu/MXTypes.hpp>
+#endif
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 enum class ChipArch : uint8_t {
     A2A3 = 0,
@@ -56,9 +62,9 @@ struct ArchTraits;
 
 // Common capability/alias block shared by A5 and A6 (both support FP4+FP8 cube
 // + TQuant + MxLayout). Specializations only add per-arch fields (e.g. A5's
-// SupportsComm). Gated by A5/A6 to avoid referencing the fp8/fp4 builtin types
-// on CPU sim / A2A3 / Kirin paths where they don't exist.
-#if defined(PTO_NPU_ARCH_A5) || defined(PTO_NPU_ARCH_A6)
+// SupportsComm). Fixed A5 CPU builds use the corresponding modeled MX types;
+// A2A3 and Kirin builds do not expose these type aliases.
+#if defined(PTO_NPU_ARCH_A5) || defined(PTO_NPU_ARCH_A6) || defined(PTO_CPU_SIM_TARGET_A5)
 template <ChipArch Arch>
 struct ArchTraitsFp4Capable : ArchTraitsBase<Arch> {
     static constexpr bool SupportsBf16 = true;
@@ -80,7 +86,7 @@ struct ArchTraitsFp4Capable : ArchTraitsBase<Arch> {
 };
 #endif
 
-#if defined(PTO_NPU_ARCH_A2A3)
+#if defined(PTO_NPU_ARCH_A2A3) || defined(PTO_CPU_SIM_TARGET_A2A3)
 template <>
 struct ArchTraits<ChipArch::A2A3> : ArchTraitsBase<ChipArch::A2A3> {
     static constexpr bool SupportsBf16 = true;
@@ -93,7 +99,7 @@ struct ArchTraits<ChipArch::A2A3> : ArchTraitsBase<ChipArch::A2A3> {
 };
 using CurrArch = ArchTraits<ChipArch::A2A3>;
 
-#elif defined(PTO_NPU_ARCH_A5)
+#elif defined(PTO_NPU_ARCH_A5) || defined(PTO_CPU_SIM_TARGET_A5)
 template <>
 struct ArchTraits<ChipArch::A5> : ArchTraitsFp4Capable<ChipArch::A5> {
     static constexpr bool SupportsComm = true;
@@ -376,6 +382,7 @@ PTO_INTERNAL constexpr bool IsTypeSupported()
 }
 
 } // namespace caps
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif // ARCH_CAPABILITY_HPP

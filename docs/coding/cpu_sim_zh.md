@@ -41,6 +41,34 @@ CPU_SIM 会为每个线程分配以下内存区域：
 A2A3 和 A5 表示要模拟的目标架构，不是宿主机安装的 NPU 型号；CPU_SIM 执行不需要 NPU。
 该选择影响内存配置及 `TROWSUM` 等具有架构分支的指令，不代表所有 CPU 指令都已分别实现两种架构的逐位模拟。
 
+模拟器集成可以在编译期固定计算架构：
+
+| CPU 编译标志 | 计算架构和初始内存配置 |
+| --- | --- |
+| `-D__CPU_SIM -DPTO_CPU_SIM_TARGET_A2A3` | A2A3；192 KiB UB、128 KiB L0C |
+| `-D__CPU_SIM -DPTO_CPU_SIM_TARGET_A5` | A5；256 KiB UB、256 KiB L0C |
+| 仅 `-D__CPU_SIM`，不指定架构标志 | 下述兼容模式的运行期选择 |
+
+`pto/cpu/target_config.hpp` 按标志是否定义来识别架构。每个 kernel 产物的所有编译单元应使用同一标志。
+集成方还应传递 `-include pto/cpu/target_config.hpp`，让不提供该接口的旧版 ISA 在编译时明确报错。
+同时定义两个架构标志、缺少 `__CPU_SIM`，或混用 `__NPU_ARCH__` / `PTO_NPU_ARCH_*` 都会报错。
+不要用 NPU 架构宏选择 CPU 模拟目标。
+
+固定架构模式在编译期选择具有架构差异的指令路径及能力查询，内存仍按线程延迟分配。
+`GetArch()` 在分配前后均报告编译目标；无参数 `Initialize()` 和 `NPU_MEMORY_INIT()` 默认使用该目标。
+显式调用 `Initialize`、`SetDefaultArch` 或 `NPU_MEMORY_INIT` 请求其他架构时抛出 `std::invalid_argument`，
+定义 `NDEBUG` 也不会关闭此检查。该模式忽略 `PTO_CPU_SIM_ARCH`，但仍支持内存容量覆盖。
+
+固定架构的 Tile、指令入口及内存模型使用与其他架构和兼容模式不同的 C++ 符号。
+A2A3、A5 kernel 动态库可以共存于同一进程并复用调用线程；不同架构之间不要传递 C++ Tile 或 pipe 对象，
+应以普通指针和标量作为 kernel 接口。修改架构或 ISA 头文件后需要重建预编译产物，并把架构标志纳入缓存标识。
+无需在 kernel 入口注入初始化调用。
+
+A5 选择现有 CPU 模拟计算及内存配置，不对应某个具体 A5 芯片型号，也不定义 `PTO_URMA_SUPPORTED`、
+引入 NPU 头文件或新增通信引擎；已有 CPU 通信功能保留。模拟容量不是所有 A5 型号的硬件规格。
+
+未定义架构标志时，原有运行期选择仍然可用：
+
 - 无需修改 kernel 或驱动代码：在进程启动前设置 `PTO_CPU_SIM_ARCH=a5`。支持 `a2a3`/`A2A3` 和
   `a5`/`A5`。尚未显式选择默认架构时，未设置或为空的值默认为 A2A3，其他值在首次查询架构或自动初始化模型时
   抛出 `std::invalid_argument`。
@@ -57,7 +85,8 @@ A2A3 和 A5 表示要模拟的目标架构，不是宿主机安装的 NPU 型号
 尚未显式选择默认架构时，各线程在模型初始化前读取环境配置；修改环境变量不会重新配置已初始化的模型。
 应在启动工作线程前设置，并在执行期间保持不变。内存分配前调用 `GetArch()` 也遵循此配置，包括将 Tile 直接绑定到主机指针的 kernel。
 
-外部模拟器集成需要在 kernel 执行前设置目标；集成层的 `a5sim` 名称本身不是 pto-isa 内部的架构选择开关。
+外部模拟器集成需要在编译期固定架构，或在 kernel 执行前通过兼容接口设置目标；
+集成层的 `a5sim` 名称本身不是 pto-isa 内部的架构选择开关。
 更多信息请参考 `include/pto/cpu/NPUMemoryModel.hpp` 和 `include/pto/cpu/TAssign.hpp`。
 
 外部 A5 CPU 测试应统一使用目标仓库或安装版本的头文件：
@@ -130,7 +159,7 @@ CPU_SIM 默认采用架构对应的 UB 容量：A2A3 为 192 KiB，A5 为 256 Ki
   该规则适用于 `TMATMUL`、`TMATMUL_ACC`、`TMATMUL_BIAS` 及对应的 `TGEMV` 入口；
   类型和精度约束见 [TMATMUL](../isa/TMATMUL_zh.md)。这些路径的架构检查在定义 `NDEBUG` 时关闭。
 - `hifloat8_t` 编码和解码使用共用查找表，按前缀长度确定指数和尾数字段；例如原始编码 `0x18` 表示 0.5。
-- CPU_SIM `TROWSUM` 根据调用线程已初始化的架构选择计算及检查路径，两种路径均接受但不访问 `tmp`。类型、布局和数值边界见 [TROWSUM](../isa/TROWSUM_zh.md#cpu_sim实现检查)，计算方式见下文 [TROWSUM 实现说明](#trowsum-实现说明)。
+- CPU_SIM `TROWSUM` 根据编译期目标选择计算及检查路径；兼容模式使用调用线程已初始化的架构，两种路径均接受但不访问 `tmp`。类型、布局和数值边界见 [TROWSUM](../isa/TROWSUM_zh.md#cpu_sim实现检查)，计算方式见下文 [TROWSUM 实现说明](#trowsum-实现说明)。
 - 当各操作数的元素类型及运行时有效形状一致时，CPU_SIM `TADD` 和 `TABS` 支持操作数使用不同的 Tile 类型，包括混用静态和动态 `ValidRow`/`ValidCol` 模板参数。CPU_SIM 按每个操作数自身的 Tile 布局和物理形状计算索引；运行时有效形状不一致会触发断言。
 - CPU_SIM 同时实现 `TCI(dst, start)` 和 `TCI(dst, start, tmp)`。三参数形式接受 `tmp` 但不访问其存储，其升序或降序序列语义与两参数形式相同。编写跨后端 kernel 时，仍须保留目标 NPU 后端要求的临时空间分配。
 - CPU_SIM 实现了 `TCVT` 带或不带临时 Tile、显式或省略 `SaturationMode` 的全部四种重载。带临时 Tile 的形式接受但不访问 `tmp`，并与对应的不带临时 Tile 形式保持相同转换结果。CPU_SIM 默认使用 `SaturationMode::OFF`；跨后端 kernel 仍须保留 NPU 所需的临时空间。
@@ -166,8 +195,9 @@ CPU_SIM 默认采用架构对应的 UB 容量：A2A3 为 192 KiB，A5 为 256 Ki
 - CPU 归约入口及执行函数均以 `uint32_t` 传递有效行、列数，避免 16 位截断；
   这不代表支持任意 32 位大小。Tile 维度及 `Numel` 仍为 `int`，
   布局、元素数可表示范围及可用存储约束仍然适用。
-- 调用线程确保自身内存模型已初始化后选择架构，内部行并行工作线程按值接收该选择，
-  不读取自身线程局部模型的默认架构；这不会初始化其他调用线程或模拟核工作线程。
+- 固定架构归约不查询可变运行期状态。兼容模式在调用线程初始化内存模型后选择架构专用归约，
+  内部行并行工作线程执行该选择，不读取自身线程局部模型的默认架构；
+  这不会初始化其他调用线程或模拟核工作线程。
   线程配置见[多核执行](#多核执行)。
 
 A5 实现模拟特定归约顺序，不构成完整的 A5 真机逐位验证；

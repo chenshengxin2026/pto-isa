@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef TMATMUL_HPP
 #define TMATMUL_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <cassert>
 #include <cmath>
 #include <type_traits>
@@ -21,6 +23,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "pto/cpu/tile_offsets.hpp"
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 template <typename A, typename B>
 constexpr bool isSupportedFp8Combo = (std::is_same_v<A, float8_e4m3_t> && std::is_same_v<B, float8_e4m3_t>) ||
@@ -45,7 +48,7 @@ PTO_INTERNAL void CheckMadValid()
             (IS_FP8_OR_HIF8_INPUT && std::is_same_v<CType, float>),
         "Not supported data type");
     if constexpr (IS_FP8_OR_HIF8_INPUT) {
-        assert(NPUMemoryModel::Instance().GetArch() == NPUArch::A5 && "FP8/HIF8 TMATMUL requires A5");
+        assert(GetCpuSimArch() == NPUArch::A5 && "FP8/HIF8 TMATMUL requires A5");
     }
     static_assert(
         (TileLeft::Rows == TileAcc::Rows) && (TileLeft::Cols == TileRight::Rows) && (TileRight::Cols == TileAcc::Cols),
@@ -324,5 +327,6 @@ PTO_INTERNAL void TGEMV_MX_IMPL(
     (void)bScaleMatrix;
     TMATMUL_MX_IMPL(cMatrix, aMatrix, aScaleMatrix, bMatrix, bScaleMatrix, biasData);
 }
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif

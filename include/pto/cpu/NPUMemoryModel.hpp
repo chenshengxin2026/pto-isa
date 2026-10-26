@@ -28,6 +28,8 @@
 #ifndef PTO_NPU_MEMORY_MODEL_HPP
 #define PTO_NPU_MEMORY_MODEL_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -44,10 +46,10 @@
 #include <pto/common/pto_tile.hpp>
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
-enum class NPUArch { A2A3, A5 };
-
-class NPUMemoryModel {
+template <CpuSimTarget Target>
+class NPUMemoryModelImpl {
 private:
     enum MemoryRegion {
         REG,    // Registers - simulates NPU registers
@@ -68,6 +70,11 @@ public:
 private:
     static NPUArch GetDefaultArch()
     {
+        if constexpr (Target == CpuSimTarget::A5) {
+            return NPUArch::A5;
+        } else if constexpr (Target == CpuSimTarget::A2A3) {
+            return NPUArch::A2A3;
+        }
         if (defaultArch_.has_value()) {
             return *defaultArch_;
         }
@@ -137,19 +144,26 @@ private:
 public:
     // Each thread gets its own NPUMemoryModel instance, accurately modeling
     // the hardware where each AICore has physically separate memory.
-    static NPUMemoryModel& Instance()
+    static NPUMemoryModelImpl& Instance()
     {
-        thread_local NPUMemoryModel instance;
+        thread_local NPUMemoryModelImpl instance;
         return instance;
     }
 
     // Set the default architecture for all threads.
     // Call once before any thread uses Instance().
-    static void SetDefaultArch(NPUArch arch) { defaultArch_ = arch; }
+    static void SetDefaultArch(NPUArch arch)
+    {
+        CheckArch(arch);
+        if constexpr (Target == CpuSimTarget::Legacy) {
+            defaultArch_ = arch;
+        }
+    }
 
     // Initialize with specific architecture (call once per thread at startup)
-    void Initialize(NPUArch arch)
+    void Initialize(NPUArch arch = GetDefaultArch())
     {
+        CheckArch(arch);
         switch (arch) {
             case NPUArch::A2A3:
                 // Yes, we know about memcpy, but CI does not allow it
@@ -278,8 +292,17 @@ public:
         return buffers_[MemoryRegion::L0C].data();
     }
 
-    const NPUMemoryModel::ArchMemorySizes& GetSizes() const { return sizes_; }
-    NPUArch GetArch() const { return initialized_ ? arch_ : GetDefaultArch(); }
+    const ArchMemorySizes& GetSizes() const { return sizes_; }
+    constexpr NPUArch GetArch() const
+    {
+        if constexpr (Target == CpuSimTarget::A5) {
+            return NPUArch::A5;
+        } else if constexpr (Target == CpuSimTarget::A2A3) {
+            return NPUArch::A2A3;
+        } else {
+            return initialized_ ? arch_ : GetDefaultArch();
+        }
+    }
     bool IsInitialized() const { return initialized_; }
 
     // Returns true when rawAddr points into this thread's simulated on-chip
@@ -387,9 +410,18 @@ private:
         return reinterpret_cast<typename TileDef::DType*>(buffers_[region].data() + byteOffset);
     }
 
-    NPUMemoryModel() = default;
-    NPUMemoryModel(const NPUMemoryModel&) = delete;
-    NPUMemoryModel(const NPUMemoryModel&&) = delete;
+    static void CheckArch(NPUArch arch)
+    {
+        if constexpr (Target != CpuSimTarget::Legacy) {
+            if (arch != GetDefaultArch()) {
+                throw std::invalid_argument("CPU simulator architecture conflicts with the compiled target family");
+            }
+        }
+    }
+
+    NPUMemoryModelImpl() = default;
+    NPUMemoryModelImpl(const NPUMemoryModelImpl&) = delete;
+    NPUMemoryModelImpl(const NPUMemoryModelImpl&&) = delete;
 
     // Explicit selection takes precedence over the environment for subsequent auto-initialization.
     static inline std::optional<NPUArch> defaultArch_;
@@ -406,6 +438,22 @@ private:
     bool initialized_ = false;
 };
 
+using NPUMemoryModel = NPUMemoryModelImpl<CPU_SIM_TARGET>;
+
+template <CpuSimTarget Target = CPU_SIM_TARGET>
+constexpr NPUArch GetCpuSimArch()
+{
+    if constexpr (Target == CpuSimTarget::A5) {
+        return NPUArch::A5;
+    } else if constexpr (Target == CpuSimTarget::A2A3) {
+        return NPUArch::A2A3;
+    } else {
+        auto& memory = NPUMemoryModelImpl<Target>::Instance();
+        memory.EnsureInitialized();
+        return memory.GetArch();
+    }
+}
+
 constexpr uint32_t SHIFT_MX_ADDR = 4;
 template <typename T>
 uint64_t GetScaleAddr(T* dst)
@@ -414,6 +462,7 @@ uint64_t GetScaleAddr(T* dst)
     return addr >> SHIFT_MX_ADDR;
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif // PTO_NPU_MEMORY_MODEL_HPP

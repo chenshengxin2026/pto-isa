@@ -11,7 +11,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef SET_QUANT_SCALAR_HPP
 #define SET_QUANT_SCALAR_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 template <typename OutType>
 PTO_INTERNAL void SET_QUANT_SCALAR_IMPL(float preQuantScalar)
@@ -27,6 +30,7 @@ PTO_INTERNAL void SET_QUANT_SCALAR_IMPL(float preQuantScalar)
     std::copy(quantSrc, quantSrc + sizeof(quantConfig), scalarReg);
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif // SET_QUANT_SCALAR_HPP

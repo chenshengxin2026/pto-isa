@@ -11,7 +11,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef SET_QUANT_VECTOR_HPP
 #define SET_QUANT_VECTOR_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 template <typename FpTileData>
 __tf__ PTO_INTERNAL void SET_QUANT_VECTOR(typename FpTileData::TileDType __in__ fp)
@@ -30,6 +33,7 @@ PTO_INTERNAL void SET_QUANT_VECTOR_IMPL(FpTileData& fpTile)
     SET_QUANT_VECTOR<FpTileData>(fpTile.data());
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif // SET_QUANT_VECTOR_HPP

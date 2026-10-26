@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef PTO_INST_HPP
 #define PTO_INST_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <pto/common/type.hpp>
 #include <pto/common/kernel_meta.hpp>
 #if defined(__CPU_SIM)

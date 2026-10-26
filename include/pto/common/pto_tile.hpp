@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef PTO_TILE_HPP
 #define PTO_TILE_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #include <type_traits>
 
 #include <pto/common/arch_macro.hpp>
@@ -28,6 +30,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #endif
 
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 constexpr int DYNAMIC = -1;
 
@@ -2016,6 +2019,7 @@ PTO_INTERNAL size_t GetTileOffset(int row, int col)
     }
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif

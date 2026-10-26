@@ -303,6 +303,8 @@ PTO_INTERNAL void TCvt_Impl(TileDataD& dst, TileDataS& src, unsigned validRow, u
     }
 }
 
+PTO_CPU_TARGET_NAMESPACE_BEGIN
+
 template <typename TileDataD, typename TileDataS>
 PTO_INTERNAL void TCVT_IMPL(TileDataD& dst, TileDataS& src, RoundMode mode, bool needSetCtrl = true)
 {
@@ -338,5 +340,6 @@ PTO_INTERNAL void TCVT_IMPL(TileDataD& dst, TileDataS& src, TmpTileData& tmp, Ro
     TCVT_IMPL(dst, src, mode, needSetCtrl);
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif

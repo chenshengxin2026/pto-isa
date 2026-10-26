@@ -69,7 +69,8 @@ The following constraints describe the NPU backends. CPU_SIM checks and compatib
 
 ### CPU_SIM implementation checks
 
-The target comes from the calling thread's memory model, not from host hardware. See
+The target is the compiled CPU family, or the calling thread's memory model in legacy builds; it does not
+come from host hardware. See
 [Selecting the simulated architecture](../coding/cpu_sim.md#selecting-the-simulated-architecture).
 
 - **A5**: Input and output types must match and be one of `half`, `float`, `int16_t`, `int32_t`,
@@ -123,8 +124,8 @@ still provide any scratch storage required by their NPU backend.
 
 These snippets illustrate invocation and storage binding, not complete runnable programs. Initialize source
 values before the reduction. For CPU_SIM, compile with `__CPU_SIM`; the Auto example also needs `__PTO_AUTO__`.
-To exercise the A5 path, select A5 at application startup as described in the CPU_SIM guide; these functions do
-not choose the architecture themselves and otherwise use the configured default (initially A2A3).
+To exercise the A5 path, also define `PTO_CPU_SIM_TARGET_A5`, or use legacy runtime selection at application
+startup as described in the CPU_SIM guide. Without a family flag or runtime selection, the default is A2A3.
 
 ### Auto
 

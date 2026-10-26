@@ -28,6 +28,38 @@ A2A3 and A5 identify the simulated target, not the NPU installed on the host. CP
 The selection controls memory configuration and architecture-aware instruction paths such as `TROWSUM`; it does
 not mean that every CPU instruction has separate, bit-exact implementations for both architectures.
 
+Simulator integrations can select a fixed compute family at compilation:
+
+| CPU compilation flags | Compute family and initial memory profile |
+| --- | --- |
+| `-D__CPU_SIM -DPTO_CPU_SIM_TARGET_A2A3` | A2A3; 192 KiB UB and 128 KiB L0C |
+| `-D__CPU_SIM -DPTO_CPU_SIM_TARGET_A5` | A5; 256 KiB UB and 256 KiB L0C |
+| `-D__CPU_SIM` without a family flag | Legacy runtime selection described below |
+
+The presence-based family flags are recognized by `pto/cpu/target_config.hpp`. Define exactly one, on every
+translation unit of a kernel artifact. Integrations should also pass `-include pto/cpu/target_config.hpp` so an
+older ISA without this interface fails at compilation. Defining both families, defining a family without
+`__CPU_SIM`, or combining a family with `__NPU_ARCH__` or `PTO_NPU_ARCH_*` fails with a diagnostic.
+Do not use NPU architecture macros to select a CPU family.
+
+Fixed-family builds select architecture-dependent instruction paths and capability queries at compile time.
+Memory allocation remains lazy and thread-local. `GetArch()` reports the compiled family before and after
+allocation; `Initialize()` and `NPU_MEMORY_INIT()` default to that family. Explicit `Initialize`, `SetDefaultArch`
+and `NPU_MEMORY_INIT` requests for a different family throw `std::invalid_argument`, including with `NDEBUG`.
+`PTO_CPU_SIM_ARCH` is ignored in fixed-family builds; memory-capacity overrides still apply.
+
+Fixed-family Tile types, instruction entry points and memory models have distinct C++ symbols from the other
+family and from legacy CPU code. A2A3 and A5 kernel libraries may coexist in a process and reuse caller threads;
+do not pass C++ Tile or pipe objects between different families. Use ordinary pointer/scalar kernel interfaces
+at that boundary. Rebuild precompiled CPU artifacts when changing the family or ISA headers, and include the
+family flags in cache identity. No kernel-entry initialization wrapper is needed.
+
+A5 selects the existing CPU simulator compute profile, not an A5 hardware variant. It does not define
+`PTO_URMA_SUPPORTED`, enable NPU headers, or add communication engines. Existing supported CPU communication
+remains available. The simulator memory profile is not a specification of every A5 device variant.
+
+With neither family flag, the existing runtime selection remains available:
+
 - To select the target without changing kernel or driver code, set `PTO_CPU_SIM_ARCH=a5` before starting the
   process. When no default has been selected explicitly, accepted values are `a2a3`/`A2A3` and `a5`/`A5`.
   An unset or empty value defaults to A2A3; other values raise `std::invalid_argument` when the architecture
@@ -49,8 +81,8 @@ initialized. Changing it does not reconfigure an initialized model; set it befor
 it unchanged during execution. `GetArch()` also respects this selection before memory allocation, including
 kernels that bind Tiles directly to host pointers.
 
-External simulator integrations must select the target before running kernels. An integration's `a5sim` name
-alone is not an architecture selector inside pto-isa. See **include/pto/cpu/NPUMemoryModel.hpp** and
+External simulator integrations must select the family at compilation or use the legacy runtime selection before
+running kernels. An integration's `a5sim` name alone is not an architecture selector inside pto-isa. See **include/pto/cpu/NPUMemoryModel.hpp** and
 **include/pto/cpu/TAssign.hpp**.
 
 For an external A5 CPU test, use the intended repository or installed version consistently:
@@ -144,7 +176,8 @@ correctness testing and does not model a specific on-chip address.
   Architecture assertions on these paths are disabled when `NDEBUG` is defined.
 - `hifloat8_t` encoding and decoding share a lookup table. Exponent and mantissa fields depend on the
   prefix length; for example, raw encoding `0x18` represents 0.5.
-- CPU_SIM `TROWSUM` selects its reduction and validation path from the calling thread's initialized architecture.
+- CPU_SIM `TROWSUM` selects its reduction and validation path from the compiled family, or from the calling
+  thread's initialized architecture in legacy builds.
   Both paths accept but do not access `tmp`. See [TROWSUM](../isa/TROWSUM.md#cpu_sim-implementation-checks) for
   types, layouts, and numerical limits, and [TROWSUM implementation notes](#trowsum-implementation-notes) below
   for the computation.
@@ -285,8 +318,9 @@ layout, and valid-region constraints. The following describes the
 - CPU reduction entry points and execution functions carry valid-row and valid-column counts as `uint32_t`
   to avoid 16-bit truncation. This does not support arbitrary 32-bit sizes: Tile dimensions and `Numel`
   still use `int`, and layout, representable element counts, and available storage constraints still apply.
-- The calling thread ensures its memory model is initialized before selecting the architecture. Internal
-  row-parallel workers receive that decision by value rather than reading their own thread-local default.
+- Fixed-family row sums use an architecture-specialized reduction without consulting mutable runtime state.
+  Legacy builds initialize the calling thread's memory model before choosing an architecture-specialized reduction.
+  Internal row-parallel workers execute that selection without reading their own thread-local default.
   This does not initialize unrelated caller threads or simulated-core workers.
   See [Multicore execution](#multicore-execution) for thread configuration.
 

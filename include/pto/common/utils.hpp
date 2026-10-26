@@ -84,8 +84,10 @@ PTO_INTERNAL uint32_t CeilAlignment(uint32_t num1, uint32_t num2)
     return (num1 + num2 - 1) / num2 * num2;
 }
 
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 template <typename T, typename AddrType>
 PTO_INTERNAL void TASSIGN_IMPL(T& obj, AddrType addr);
+PTO_CPU_TARGET_NAMESPACE_END
 
 namespace detail {
 // Internal helper retained for PTO implementation code after the public TSUBVIEW

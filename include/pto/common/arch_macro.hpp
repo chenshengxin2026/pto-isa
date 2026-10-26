@@ -11,6 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef ARCH_MACRO_HPP
 #define ARCH_MACRO_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 #if defined(__CPU_SIM) && !defined(__DAV_CUBE__) && !defined(__DAV_VEC__)
 #define PTO_COMPILE_CUBE
 #define PTO_COMPILE_VEC

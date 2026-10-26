@@ -11,7 +11,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #ifndef GET_QUANT_SCALAR_HPP
 #define GET_QUANT_SCALAR_HPP
 
+#include <pto/cpu/target_config.hpp>
+
 namespace pto {
+PTO_CPU_TARGET_NAMESPACE_BEGIN
 
 PTO_INTERNAL uint64_t GET_QUANT_SCALAR_IMPL()
 {
@@ -23,6 +26,7 @@ PTO_INTERNAL uint64_t GET_QUANT_SCALAR_IMPL()
     return quantConfig;
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 
 #endif // GET_QUANT_SCALAR_HPP

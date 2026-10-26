@@ -104,6 +104,8 @@ PTO_INTERNAL void PtoWaitEvents(WaitEvents&... events)
 
 } // namespace detail
 
+PTO_CPU_TARGET_NAMESPACE_BEGIN
+
 template <typename T, typename AddrType>
 PTO_INST void TASSIGN(T& obj, AddrType addr)
 {
@@ -3087,5 +3089,6 @@ PTO_INST RecordEvent TQUANT(
     return {};
 }
 
+PTO_CPU_TARGET_NAMESPACE_END
 } // namespace pto
 #endif
