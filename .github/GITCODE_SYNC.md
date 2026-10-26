@@ -11,21 +11,37 @@ branches, a full cut-point SHA, and dry-run mode. Publishing requires the fork's
 A merged PR's `Source SHA` identifies the processed source revision. It does not
 prove that the GitHub tree contains every earlier GitCode dependency. Before
 replaying changes, the script compares the GitHub base with the GitCode cut point
-for touched `include/` paths. When shared architecture headers change, it also
+for paths touched by any replayed first-parent commit, including intermediate
+edits reverted later in the range. When shared architecture headers change, it also
 checks their architecture forwarding entries, even if those entries are absent
-from the incoming delta. Existing target corrections and missing historical
-headers both cause a failure requiring review; files are not silently replaced.
+from the incoming delta. Missing historical literal `pto/` includes are restored
+recursively, but unrelated existing dependencies are not replaced.
+
+When these paths differ, the script starts a sync branch from the GitHub target
+and restores their GitCode **cut-point** versions, including additions, deletions
+and file modes. It records those changes in a dedicated historical baseline
+commit, then replays incoming GitCode commits on top. Both parts are pushed
+together and submitted as **one sync PR**. The PR body records the reconciliation
+commit, affected paths, source SHA and generated head SHA. Existing GitHub edits
+in the selected paths are intentionally replaced with the GitCode baseline;
+unrelated target paths remain unchanged. The combined PR is the review boundary.
 
 PR #368 exposed this distinction: GitCode's A5 `TCvt.hpp` already forwarded to
 `common/arch/register/tcvt_common.hpp`, while GitHub still used the standalone
 implementation. The fix adopts that forwarding entry so the common FP4 LUT
 implementation and its tests use the same path.
 
-These checks are deliberately conservative. Reconcile the reported differences
-in an upstream PR before retrying. A dry run applies the same guards and does not
-bypass them. The include check covers literal `pto/` dependencies in incoming
+Use `dry_run=true` to build both the baseline commit and incoming commits without
+pushing or editing a PR. The include check covers literal `pto/` dependencies in incoming
 code; it is not a compiler or a proof of semantic equivalence. A5 and CPU CI
 remain required.
+
+Before publication, selected paths must exactly match the source tip and
+unrelated paths must still match the GitHub target. Whitespace checks accept
+GitCode's existing CRLF line endings without rewriting files. Other whitespace
+already present in the verified source is reported in the log and PR body, so
+formatting alone does not prevent creating the combined PR. Added conflict
+markers still stop publication. PR CI remains responsible for formatting checks.
 
 ## Branch and PR protection
 
@@ -47,9 +63,10 @@ remain required.
 - No new commits or no net difference means no publication. A no-op does not
   automatically close an existing PR.
 
-Do not remove historical baseline checks merely to get a scheduled run to pass.
-When GitHub intentionally diverges from GitCode, either reconcile the dependency
-or perform a reviewed manual port. Diagnostics are retained as an Actions artifact.
+Historical alignment always uses the cut point, not the final source tip, so
+incoming commits retain their order and messages. Reconciliation does not relax
+the manual-PR or push-lease guards. Unexpected replay conflicts still stop before
+publication. Diagnostics are retained as an Actions artifact.
 
 Run the offline regression tests with:
 

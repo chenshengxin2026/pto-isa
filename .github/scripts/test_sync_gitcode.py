@@ -6,13 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-"""Exercise the sync guards and replay against real, isolated Git histories."""
+"""Exercise baseline reconciliation, replay and publication in isolated Git histories."""
 
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("sync_gitcode", Path(__file__).with_name("sync_gitcode.py"))
@@ -56,21 +58,29 @@ class SyncTests(unittest.TestCase):
 
     def test_matching_baseline_and_replay(self):
         source = self.source_change()
-        paths = sync.check_baseline(self.cut, self.cut, source)
+        paths, mismatches, reconciliation = sync.reconcile_baseline(self.cut, self.cut, source)
         self.assertEqual(paths, {"include/pto/example.hpp"})
+        self.assertEqual(mismatches, [])
+        self.assertIsNone(reconciliation)
         self.assertEqual(sync.replay(self.cut, source, self.cut), (1, 0))
         self.assertEqual(sync.git("rev-parse", "HEAD^{tree}"), sync.git("rev-parse", f"{source}^{{tree}}"))
 
-    def test_historical_drift_stops_before_checkout(self):
+    def test_historical_drift_is_committed_before_replay(self):
         source = self.source_change()
         sync.git("checkout", "-b", "target", self.cut)
         self.write("include/pto/example.hpp", "// divergent target\n")
+        self.write("target-only.txt", "preserve unrelated work\n")
         base = self.commit("target-only")
-        with self.assertRaisesRegex(sync.SyncError, "Historical header baseline differs"):
-            sync.check_baseline(base, self.cut, source)
-        self.assertEqual(sync.git("rev-parse", "HEAD"), base)
+        paths, mismatches, reconciliation = sync.reconcile_baseline(base, self.cut, source)
+        self.assertEqual(mismatches, ["include/pto/example.hpp"])
+        self.assertEqual(sync.git("rev-parse", f"{reconciliation}^"), base)
+        self.assertEqual(Path("include/pto/example.hpp").read_text(), "// baseline\n")
+        self.assertEqual(sync.replay(self.cut, source, reconciliation), (1, 0))
+        self.assertEqual(Path("include/pto/example.hpp").read_text(), "// incoming\n")
+        self.assertEqual(Path("target-only.txt").read_text(), "preserve unrelated work\n")
+        self.assertEqual(sync.git("rev-list", "--count", f"{base}..HEAD"), "2")
 
-    def test_unchanged_architecture_entry_is_checked(self):
+    def test_unchanged_architecture_entry_is_reconciled(self):
         wrapper = "include/pto/npu/a5/TCvt.hpp"
         shared = "include/pto/common/arch/register/tcvt_common.hpp"
         self.write(shared, "// shared baseline\n")
@@ -81,16 +91,79 @@ class SyncTests(unittest.TestCase):
         sync.git("checkout", "-b", "legacy-target", cut)
         self.write(wrapper, "// old standalone implementation\n")
         base = self.commit("old entry still exists")
-        with self.assertRaisesRegex(sync.SyncError, wrapper):
-            sync.check_baseline(base, cut, source)
+        paths, mismatches, reconciliation = sync.reconcile_baseline(base, cut, source)
+        self.assertEqual(mismatches, [wrapper])
+        sync.replay(cut, source, reconciliation)
+        self.assertEqual(sync.git("rev-parse", "HEAD^{tree}"), sync.git("rev-parse", f"{source}^{{tree}}"))
 
-    def test_missing_historical_shared_header_is_checked(self):
+    def test_missing_historical_shared_header_is_restored(self):
         self.write("include/pto/common/arch/register/operation.hpp", "// baseline\n")
         cut = self.commit("historical shared header")
         self.write("include/pto/common/arch/register/operation.hpp", "// feature\n")
         source = self.commit("feature")
-        with self.assertRaisesRegex(sync.SyncError, "GitHub=missing"):
-            sync.check_baseline(self.cut, cut, source)
+        paths, mismatches, reconciliation = sync.reconcile_baseline(self.cut, cut, source)
+        self.assertEqual(mismatches, ["include/pto/common/arch/register/operation.hpp"])
+        sync.replay(cut, source, reconciliation)
+        self.assertEqual(sync.git("rev-parse", "HEAD^{tree}"), sync.git("rev-parse", f"{source}^{{tree}}"))
+
+    def test_missing_transitive_historical_dependencies_are_restored(self):
+        self.write("include/pto/leaf.hpp", "// historical leaf\n")
+        self.write("include/pto/dependency.hpp", '#include "pto/leaf.hpp"\n')
+        cut = self.commit("historical dependencies")
+        self.write("example.cpp", '#include "pto/dependency.hpp"\n')
+        source = self.commit("consumer")
+        paths, mismatches, reconciliation = sync.reconcile_baseline(self.cut, cut, source)
+        self.assertEqual(mismatches, ["include/pto/dependency.hpp", "include/pto/leaf.hpp"])
+        sync.replay(cut, source, reconciliation)
+        sync.check_includes(source, paths)
+        self.assertEqual(sync.git("rev-parse", "HEAD^{tree}"), sync.git("rev-parse", f"{source}^{{tree}}"))
+
+    def test_add_delete_rename_and_modes_match_the_cut_before_replay(self):
+        self.write("old.txt", "baseline\n")
+        self.write("delete.txt", "baseline\n")
+        self.write("tool.sh", "#!/bin/sh\nexit 0\n")
+        cut = self.commit("historical paths")
+        sync.git("mv", "old.txt", "renamed.txt")
+        sync.git("rm", "delete.txt")
+        Path("tool.sh").chmod(0o755)
+        self.write("added.txt", "incoming\n")
+        source = self.commit("rename, delete, add, and chmod")
+        sync.git("checkout", "-b", "target", cut)
+        self.write("old.txt", "target drift\n")
+        self.write("delete.txt", "target drift\n")
+        self.write("added.txt", "target-only collision\n")
+        self.write("tool.sh", "#!/bin/sh\nexit 1\n")
+        base = self.commit("divergent paths")
+        paths, mismatches, reconciliation = sync.reconcile_baseline(base, cut, source)
+        self.assertFalse(Path("added.txt").exists())
+        sync.replay(cut, source, reconciliation)
+        self.assertEqual(sync.git("rev-parse", "HEAD^{tree}"), sync.git("rev-parse", f"{source}^{{tree}}"))
+
+    def test_intermediate_changes_with_no_net_source_diff_are_reconciled(self):
+        self.source_change()
+        self.write("include/pto/example.hpp", "// baseline\n")
+        source = self.commit("revert incoming")
+        sync.git("checkout", "-b", "target", self.cut)
+        self.write("include/pto/example.hpp", "// target drift\n")
+        base = self.commit("target drift")
+        paths, mismatches, reconciliation = sync.reconcile_baseline(base, self.cut, source)
+        self.assertEqual(mismatches, ["include/pto/example.hpp"])
+        self.assertEqual(sync.replay(self.cut, source, reconciliation), (2, 0))
+        self.assertEqual(Path("include/pto/example.hpp").read_text(), "// baseline\n")
+
+    def test_file_directory_transition_can_be_reconciled(self):
+        self.write("node", "old file\n")
+        cut = self.commit("historical file")
+        sync.git("rm", "node")
+        self.write("node/child", "source child\n")
+        source = self.commit("replace file with directory")
+        self.write("node/child", "target child\n")
+        base = self.commit("target drift")
+        paths, mismatches, reconciliation = sync.reconcile_baseline(base, cut, source)
+        self.assertEqual(Path("node").read_text(), "old file\n")
+        sync.replay(cut, source, reconciliation)
+        sync.validate_result(base, source, paths)
+        self.assertEqual(Path("node/child").read_text(), "source child\n")
 
     def test_merge_replays_side_change_exactly_once(self):
         sync.git("checkout", "-b", "side", self.cut)
@@ -130,6 +203,40 @@ class SyncTests(unittest.TestCase):
         sync.replay(dependency, source, self.cut)
         with self.assertRaisesRegex(sync.SyncError, "Missing historical include"):
             sync.check_includes(source, {"example.cpp"})
+
+    def test_source_crlf_is_preserved_and_validated(self):
+        Path("example.cpp").write_bytes(b"// source uses CRLF\r\n")
+        source = self.commit("CRLF source")
+        paths, mismatches, reconciliation = sync.reconcile_baseline(self.cut, self.cut, source)
+        sync.replay(self.cut, source, reconciliation or self.cut)
+        sync.validate_result(self.cut, source, paths)
+        self.assertEqual(Path("example.cpp").read_bytes(), b"// source uses CRLF\r\n")
+
+    def test_verified_source_whitespace_is_preserved_and_reported(self):
+        self.write("example.cpp", "// trailing space \n")
+        source = self.commit("invalid whitespace")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(sync.validate_result(self.cut, source, {"example.cpp"}))
+        self.assertIn("trailing whitespace", output.getvalue())
+        self.assertEqual(Path("example.cpp").read_text(), "// trailing space \n")
+
+    def test_source_conflict_markers_still_stop_publication(self):
+        self.write("example.cpp", "<<<<<<< source\nours\n=======\ntheirs\n>>>>>>> target\n")
+        source = self.commit("bad source")
+        with self.assertRaisesRegex(sync.SyncError, "leftover conflict marker"):
+            sync.validate_result(self.cut, source, {"example.cpp"})
+
+    def test_result_validation_rejects_source_drift_and_unrelated_changes(self):
+        source = self.source_change()
+        self.write("include/pto/example.hpp", "// incorrect merge result\n")
+        self.commit("incorrect result")
+        with self.assertRaisesRegex(sync.SyncError, "Replayed paths differ"):
+            sync.validate_result(self.cut, source, {"include/pto/example.hpp"})
+        self.write("include/pto/example.hpp", "// incoming\n")
+        self.write("unrelated.txt", "must not change\n")
+        self.commit("unrelated result")
+        with self.assertRaisesRegex(sync.SyncError, "Unrelated target paths changed"):
+            sync.validate_result(self.cut, source, {"include/pto/example.hpp"})
 
     def test_manual_or_legacy_pr_is_preserved(self):
         pr = {"number": 368, "body": "Source SHA:\n`" + self.cut + "`", "headRefOid": self.cut}
@@ -192,8 +299,12 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(api.call_args.args[0], "api")
         self.assertIn("head=fork%3Agitcode-sync", api.call_args.args[-1])
 
-    def exercise_publication(self, dry, existing=None):
+    def exercise_publication(self, dry, existing=None, drift=False):
         self.source_change()
+        if drift:
+            sync.git("checkout", "main")
+            self.write("include/pto/example.hpp", "// divergent target\n")
+            self.commit("historical drift")
         original_git, original_command = sync.git, sync.command
         edits = []
 
@@ -245,8 +356,19 @@ class SyncTests(unittest.TestCase):
         return edits
 
     def test_dry_run_does_not_publish(self):
-        self.assertEqual(self.exercise_publication("true"), [])
+        self.assertEqual(self.exercise_publication("true", drift=True), [])
         self.assertEqual(sync.git("ls-remote", "--heads", "origin", "refs/heads/gitcode-sync"), "")
+        self.assertEqual(sync.git("rev-list", "--count", "main..HEAD"), "2")
+
+    def test_reconciliation_and_source_commits_are_published_in_one_pr(self):
+        edits = self.exercise_publication("false", drift=True)
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0][0][1:3], ("pr", "create"))
+        reconciliation = sync.recorded_sha(edits[0][1], "Historical baseline commit")
+        self.assertEqual(sync.git("rev-parse", "HEAD^"), reconciliation)
+        self.assertEqual(sync.git("rev-parse", f"{reconciliation}^"), sync.git("rev-parse", "main"))
+        self.assertIn("include/pto/example.hpp", edits[0][1])
+        self.assertEqual(Path("include/pto/example.hpp").read_text(), "// incoming\n")
 
     def test_publish_records_source_and_generated_head(self):
         edits = self.exercise_publication("false")
@@ -259,9 +381,10 @@ class SyncTests(unittest.TestCase):
     def test_existing_pr_metadata_is_refreshed(self):
         sync.git("push", "origin", f"{self.cut}:refs/heads/gitcode-sync")
         existing = {"number": 368, "body": f"Sync head SHA:\n`{self.cut}`", "headRefOid": self.cut}
-        edits = self.exercise_publication("false", existing)
+        edits = self.exercise_publication("false", existing, drift=True)
         self.assertEqual(edits[0][0][1:4], ("pr", "edit", "368"))
         self.assertEqual(sync.recorded_sha(edits[0][1], "Source SHA"), sync.git("rev-parse", "source"))
+        self.assertEqual(sync.recorded_sha(edits[0][1], "Historical baseline commit"), sync.git("rev-parse", "HEAD^"))
 
     def test_lease_rejects_concurrent_branch_update(self):
         sync.git("push", "origin", f"{self.cut}:refs/heads/gitcode-sync")

@@ -21,7 +21,7 @@ on:
         description: Full source SHA, or auto to continue from the last merged sync PR
         default: auto
       dry_run:
-        description: Validate and replay without pushing or changing a PR
+        description: Reconcile the baseline and replay without pushing or changing a PR
         type: choice
         default: 'false'
         options: ['true', 'false']
@@ -63,7 +63,7 @@ jobs:
           cp .github/scripts/sync_gitcode.py "$RUNNER_TEMP/gitcode-sync/"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-      - name: Validate dependencies, replay commits, and publish
+      - name: Reconcile historical baseline, replay commits, and publish one PR
         shell: bash
         run: |
           set -euo pipefail
