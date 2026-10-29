@@ -21,6 +21,7 @@ class DataFormat(Enum):
     NCDHW2C1DHWN1N0C0 = 6
     NCHW2C1HWN1N0C0 = 7
     NCHW2C1DHWN1N0C0 = 8
+    GNC1HWC02GNCHW = 9
 
 
 def pack_matrix_to_fp4(matrix):
@@ -88,15 +89,15 @@ def golden_NC1HWC02NCHW(g_info):
 
     c = g_info.dst_shape_1
     assert c == c1 * c0
-
+    
     input_arr = np.random.randint(1, 5, size=(n, c1, h, w, c0)).astype(g_info.data_type)
     input_arr.tofile("./input.bin")
-
+     
     output_arr = input_arr.transpose(0, 1, 4, 2, 3).reshape(n, c, h, w)
-
+    
     output_arr.tofile("./golden.bin")
     print(f"Golden - {output_arr.shape}")
-
+    
     return input_arr, output_arr
 
 
@@ -219,73 +220,28 @@ def golden_NCDHW2C1DHWN1N0C0(g_info):
     n0 = g_info.dst_shape_2
     c0 = g_info.dst_shape_3
 
-    c1 = c1dhw // (d * w * h)
+    c1 = c1dhw // (d*w*h)
     dtype_size = np.dtype(g_info.data_type).itemsize
 
     assert c0 == 32 // dtype_size
     assert n1 == (n + n0 - 1) // n0
     assert c1 == (c + c0 - 1) // c0
-
+        
     input_arr = np.random.randint(1, 5, size=(n, c, d, h, w)).astype(g_info.data_type)
     input_arr.tofile("./input.bin")
-
+    
     padded_n = n1 * n0
     padding_n = padded_n - n
     padded_c = c1 * c0
     padding_c = padded_c - c
     if padding_n > 0 or padding_c > 0:
         input_arr = np.pad(input_arr, ((0, padding_n), (0, padding_c), (0, 0), (0, 0), (0, 0)), mode='constant')
-
+        
     output_arr = input_arr.reshape(n1, n0, c1, c0, d, h, w).transpose(4, 2, 5, 6, 0, 1, 3)
-
+    
     output_arr.tofile("./golden.bin")
     print(f"Golden - {output_arr.shape}")
-
-    return input_arr, output_arr
-
-
-def golden_NCHW2C1HWN1N0C0(g_info):
-    # NCHW (N, C, H, W) -> FRACTAL_Z / FRACTAL_Z_3D (C1HW, N1, N0, C0)
-    # For a 4D source, FRACTAL_Z_3D uses an implicit D = 1, so both share this layout.
-    n = g_info.src_shape_0
-    c = g_info.src_shape_1
-    h = g_info.src_shape_2
-    w = g_info.src_shape_3
-
-    c1hw = g_info.dst_shape_0
-    n1 = g_info.dst_shape_1
-    n0 = g_info.dst_shape_2
-    c0 = g_info.dst_shape_3
-
-    c1 = c1hw // (h * w)
-    dtype_size = np.dtype(g_info.data_type).itemsize
-
-    assert c0 == 32 // dtype_size
-    assert n1 == (n + n0 - 1) // n0
-    assert c1 == (c + c0 - 1) // c0
-
-    input_arr = np.random.randint(1, 5, size=(n, c, h, w)).astype(g_info.data_type)
-    input_arr.tofile("./input.bin")
-
-    padded_c = c1 * c0
-    padding_c = padded_c - c
-    if padding_c > 0:
-        input_arr = np.pad(input_arr, ((0, 0), (0, padding_c), (0, 0), (0, 0)), mode='constant')
-
-    # NCHW -> NC1HWC0: (n, c, h, w) -> (n, c1, h, w, c0)
-    nc1hwc0 = input_arr.reshape(n, c1, c0, h, w).transpose(0, 1, 3, 4, 2)
-
-    # NC1HWC0 -> FRACTAL_Z: pad N, then (n, c1, h, w, c0) -> (c1, h, w, n1, n0, c0)
-    padded_n = n1 * n0
-    padding_n = padded_n - n
-    if padding_n > 0:
-        nc1hwc0 = np.pad(nc1hwc0, ((0, padding_n), (0, 0), (0, 0), (0, 0), (0, 0)), mode='constant')
-
-    output_arr = nc1hwc0.reshape(n1, n0, c1, h, w, c0).transpose(2, 3, 4, 0, 1, 5)
-
-    output_arr.tofile("./golden.bin")
-    print(f"Golden - {output_arr.shape}")
-
+    
     return input_arr, output_arr
 
 
@@ -594,6 +550,23 @@ def golden_NCHW2C1HWN1N0C0_Valid(g_info):
     print(f"Golden - {output_arr.shape} (src valid = {g_info.src_valid_shape}, dst valid = {g_info.dst_valid_shape})")
 
 
+def golden_GNC1HWC02GNCHW(g_info):
+    # GNC1HWC0 [G, N, C1, H, W, C0] -> GNCHW [G, N, C1 * C0, H, W]
+    g = g_info.group_n
+    sn, sc1, sh, sw, sc0 = (
+        g_info.src_shape_0, g_info.src_shape_1, g_info.src_shape_2, g_info.src_shape_3, g_info.src_shape_4,
+    )
+    dn, dc, dh, dw = g_info.dst_shape_0, g_info.dst_shape_1, g_info.dst_shape_2, g_info.dst_shape_3
+    assert sc0 == 32 // np.dtype(g_info.data_type).itemsize, "C0 是格式常量"
+    assert (g, sn, sc1 * sc0, sh, sw) == (g, dn, dc, dh, dw)
+
+    input_arr = np.random.randint(1, 5, size=(g, sn, sc1, sh, sw, sc0)).astype(g_info.data_type)
+    input_arr.tofile("./input.bin")
+
+    output_arr = input_arr.transpose(0, 1, 2, 5, 3, 4).reshape(g, dn, dc, dh, dw)
+    output_arr.tofile("./golden.bin")
+
+
 def gen_golden_data(g_info):
     """
     Generates aligned runtime raw binaries for C++ unit test validation suites.
@@ -670,6 +643,12 @@ def gen_golden_data(g_info):
             golden_NCHW2C1HWN1N0C0_Valid(g_info)
         else:
             golden_NCHW2C1HWN1N0C0(g_info)
+
+    # -------------------------------------------------------------
+    # MODE 9: GNC1HWC0 -> GNCHW
+    # -------------------------------------------------------------
+    elif mode == DataFormat.GNC1HWC02GNCHW.value:
+        golden_GNC1HWC02GNCHW(g_info)
 
     else:
         pass
@@ -808,6 +787,10 @@ test_cases_registry = [
         "valid_NCHW2C1DHWN1N0C0_all_dims_differ", np.float32, DataFormat.NCHW2C1DHWN1N0C0.value,
         6, 18, 6, 5, 1, 32, 2, 24, 16, 1, 1, 1,
         src_valid_shape=(5, 16, 4, 3), dst_valid_shape=(24, 1, 16, 8)
+    ),
+    TTRANSParams(
+        "GNC1HWC02GNCHW_1", np.float32, DataFormat.GNC1HWC02GNCHW.value,
+        1, 1, 2, 4, 8, 1, 8, 2, 4, 1, 1
     )
 ]
 
