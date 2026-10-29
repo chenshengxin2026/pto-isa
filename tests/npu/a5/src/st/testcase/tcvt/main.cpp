@@ -307,6 +307,8 @@ GENERATE_TCVT_TESTS(int32_t, aclFloat16, bf16_int32)
 // GENERATE_TCVT_TESTS(aclFloat16, bfloat16_t, bf16_fp16)
 GENERATE_TCVT_TESTS_FP4(fp4_e1m2x2_wrapper, bf16_wrapper, bf16_fp4_e1m2x2)
 GENERATE_TCVT_TESTS_FP4(fp4_e2m1x2_wrapper, bf16_wrapper, bf16_fp4_e2m1x2)
+TEST_F(TCVTTest, case_bf16_fp4_e1m2x2_4x64_4x53) { test_tcvt<fp4_e1m2x2_wrapper, bf16_wrapper, 4, 64, 4, 64, 4, 53>(); }
+TEST_F(TCVTTest, case_bf16_fp4_e2m1x2_4x64_4x53) { test_tcvt<fp4_e2m1x2_wrapper, bf16_wrapper, 4, 64, 4, 64, 4, 53>(); }
 
 // FP4 Source → bf16
 GENERATE_TCVT_TESTS_FP4(bf16_wrapper, fp4_e1m2x2_wrapper, fp4_e1m2x2_bf16)

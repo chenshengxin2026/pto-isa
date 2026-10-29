@@ -193,6 +193,10 @@ INSTANTIATE_TCVT(int32_t, bfloat16_t)
 // INSTANTIATE_TCVT(aclFloat16, bfloat16_t)
 INSTANTIATE_TCVT_FP4(fp4_e1m2x2_wrapper, bf16_wrapper)
 INSTANTIATE_TCVT_FP4(fp4_e2m1x2_wrapper, bf16_wrapper)
+template void launchTCVT<fp4_e1m2x2_wrapper, bf16_wrapper, 4, 64, 4, 64, 4, 53>(
+    fp4_e1m2x2_wrapper* dst, bf16_wrapper* src, void* stream);
+template void launchTCVT<fp4_e2m1x2_wrapper, bf16_wrapper, 4, 64, 4, 64, 4, 53>(
+    fp4_e2m1x2_wrapper* dst, bf16_wrapper* src, void* stream);
 
 // FP4 Source → bf16
 INSTANTIATE_TCVT_FP4(bf16_wrapper, fp4_e1m2x2_wrapper)
