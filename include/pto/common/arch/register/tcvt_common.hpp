@@ -2993,6 +2993,9 @@ __tf__ PTO_INTERNAL OP_NAME(TCVT) OP_TYPE(element_wise) void implTCVTFp4E2M1ToE4
     if constexpr (TileDataD::SFractal != SLayout::NoneBox && TileDataD::Compact == CompactMode::Normal) {
         panelRows = CeilDivision(validRows, static_cast<uint32_t>(FRACTAL_NZ_ROW)) * FRACTAL_NZ_ROW;
     }
+    if constexpr (TileDataD::Compact == CompactMode::RowPlusOne) {
+        panelRows = CeilDivision(validRows, static_cast<uint32_t>(FRACTAL_NZ_ROW)) * FRACTAL_NZ_ROW + 1u;
+    }
     __ubuf__ uint8_t* dstPtr = (__ubuf__ uint8_t*)__cce_get_tile_ptr(dst);
     __ubuf__ uint8_t* srcPtr = (__ubuf__ uint8_t*)__cce_get_tile_ptr(src);
     __VEC_SCOPE__
@@ -3091,17 +3094,18 @@ PTO_INTERNAL void tcvtFp4E2M1ToE4M3(TileDataD& dst, TileDataS& src)
                            TileDataD::SFractalSize == TileConfig::fractalABSize;
     static_assert(dstND || dstNZ, "TCVT FP4 E2M1 -> FP8 E4M3 destination must be ND or standard 512-byte NZ.");
     static_assert(
-        TileDataD::Compact != CompactMode::RowPlusOne,
-        "TCVT FP4 E2M1 -> FP8 E4M3 does not support RowPlusOne extra-row storage.");
+        TileDataD::Compact == CompactMode::Null ||
+            (dstNZ && (TileDataD::Compact == CompactMode::Normal || TileDataD::Compact == CompactMode::RowPlusOne)),
+        "TCVT FP4 E2M1 -> FP8 E4M3 supports Null, or Normal/RowPlusOne for NZ.");
     static_assert(
-        TileDataD::Compact == CompactMode::Null || (dstNZ && TileDataD::Compact == CompactMode::Normal),
-        "TCVT FP4 E2M1 -> FP8 E4M3 supports Null, or Normal for NZ.");
-    static_assert(
-        !dstNZ || TileDataD::Rows % FRACTAL_NZ_ROW == 0, "TCVT FP8 NZ physical rows must be a multiple of 16.");
-    static_assert(!dstNZ || TileDataD::Rows <= 0xFFFF, "TCVT FP8 NZ row pitch must fit the 16-bit block stride.");
+        !dstNZ || TileDataD::Compact == CompactMode::RowPlusOne || TileDataD::Rows % FRACTAL_NZ_ROW == 0,
+        "TCVT FP8 NZ physical rows must be a multiple of 16 unless RowPlusOne is used.");
+    constexpr uint64_t maxPanelRows =
+        static_cast<uint64_t>(TileDataD::StorageNumel) / static_cast<uint64_t>(TileDataD::Cols);
+    static_assert(!dstNZ || maxPanelRows <= 0xFFFF, "TCVT FP8 NZ row pitch must fit the 16-bit block stride.");
     static_assert(
         static_cast<uint64_t>(TileDataS::Rows) * (TileDataS::Cols / 2) <= 0x7FFFFFFF &&
-            static_cast<uint64_t>(TileDataD::Rows) * TileDataD::Cols <= 0x7FFFFFFF,
+            TileDataD::StorageBytes <= 0x7FFFFFFF,
         "TCVT FP4 E2M1 -> FP8 E4M3 byte offsets must fit signed 32 bits.");
     static_assert(
         TileDataD::ValidRow == DYNAMIC || TileDataS::ValidRow == DYNAMIC || TileDataD::ValidRow == TileDataS::ValidRow,

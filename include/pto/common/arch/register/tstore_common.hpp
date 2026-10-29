@@ -379,8 +379,19 @@ PTO_INTERNAL void TStoreVecNZ(
     uint32_t nBurst = gShape1;
     uint32_t lenBurst = validRow * C0_SIZE_BYTE;
     uint64_t burstDstStride = GetByteSize<typename TileData::DType>(gStride1);
-    uint32_t burstSrcStride = TileData::Rows * C0_SIZE_BYTE;
-    int64_t tileStride = gShape1 * TileData::Rows * gShape4;
+    uint32_t srcPanelRows = TileData::Rows;
+    if constexpr (TileData::Compact == CompactMode::Normal) {
+        srcPanelRows = CeilDivision(validRow, static_cast<uint32_t>(FRACTAL_NZ_ROW)) * FRACTAL_NZ_ROW;
+    } else if constexpr (TileData::Compact == CompactMode::RowPlusOne) {
+        srcPanelRows = CeilDivision(validRow, static_cast<uint32_t>(FRACTAL_NZ_ROW)) * FRACTAL_NZ_ROW + 1;
+    }
+    // Compact NZ consumers must use the same validRow as the producer. StorageNumel
+    // covers both the dynamic maximum envelope and legacy statically padded Rows.
+    PTO_ASSERT(
+        srcPanelRows <= TileData::StorageNumel / TileData::Cols,
+        "The compact NZ source pitch exceeds TileData storage capacity; preserve the producer validRow!");
+    uint32_t burstSrcStride = srcPanelRows * C0_SIZE_BYTE;
+    int64_t tileStride = gShape1 * srcPanelRows * gShape4;
     if constexpr (caps::IsFP4<typename TileData::DType>()) {
         tileStride = tileStride >> 1; // fp4 srcAddr offset need divide 2 as use b8 to move
         gStride0 = gStride0 >> 1;     // fp4 dstAddr offset need divide 2 as use b8 to move
