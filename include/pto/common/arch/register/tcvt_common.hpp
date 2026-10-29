@@ -1677,6 +1677,31 @@ inline AICORE void castData_2D_NoPostUpdate(
  * all dst byte offsets are >> 1 (nibble count → byte count).
  */
 #if defined(PTO_NPU_ARCH_A5) || defined(PTO_NPU_ARCH_A6)
+template <typename DST_VEC>
+inline AICORE void storePackedFp4(__ubuf__ uint8_t* dst, DST_VEC& packed, uint32_t byteOffset, uint32_t validElements)
+{
+    uint32_t completeBytes = validElements >> 1;
+    MaskReg completeMask = CreatePredicate<uint8_t>(completeBytes);
+    vsts((RegTensor<uint8_t>&)packed, dst, byteOffset, NORM_B8, completeMask);
+
+    // An odd trailing element occupies the low nibble of the next byte. Write that
+    // byte with the unused high nibble cleared, without disturbing complete pairs.
+    if (validElements & 1u) {
+        MaskReg allBytes = pset_b8(PAT_ALL);
+        RegTensor<uint8_t> lowNibbleMask;
+        RegTensor<uint8_t> lowNibbles;
+        vdup(lowNibbleMask, static_cast<uint8_t>(0x0F), allBytes, MODE_ZEROING);
+        vand(lowNibbles, (RegTensor<uint8_t>&)packed, lowNibbleMask, allBytes);
+        uint32_t previousBytes = validElements >> 1;
+        uint32_t inclusiveBytes = previousBytes + 1;
+        MaskReg previousMask = CreatePredicate<uint8_t>(previousBytes);
+        MaskReg inclusiveMask = CreatePredicate<uint8_t>(inclusiveBytes);
+        MaskReg lastByteMask;
+        pnot(lastByteMask, previousMask, inclusiveMask);
+        vsts(lowNibbles, dst, byteOffset, NORM_B8, lastByteMask);
+    }
+}
+
 template <typename R, typename DST_VEC, typename DST>
 inline AICORE void castBf16toFp4(
     __ubuf__ DST* dst, __ubuf__ bfloat16_t* src, uint32_t validRows, uint32_t validCols, uint32_t dstCols,
@@ -1691,8 +1716,8 @@ inline AICORE void castBf16toFp4(
     vmuls((RegTensor<int16_t>&)v_idx, (RegTensor<int16_t>&)v_idx, (int16_t)4, preg_idx);
 
     // Zero-fill destination to clear padding bytes (UB is uninitialized on hardware).
-    // BF16→FP4 writes only validCols/2 complete packed bytes per row; bytes beyond
-    // that (including the boundary byte for odd validCols) must be zero.
+    // BF16→FP4 writes ceil(validCols/2) packed bytes per row. Clear all padding
+    // bytes before conversion, including the unused high nibble of an odd tail.
     {
         RegTensor<uint8_t> v_zeros;
         MaskReg pg_fill = pset_b8(PAT_ALL);
@@ -1712,14 +1737,12 @@ inline AICORE void castBf16toFp4(
     RegTensor<bfloat16_t> v_input;
     DST_VEC v_output_p0, v_output;
     uint32_t preg_len = (idx == repeatTimes - 1) ? preg_len_tail : ELE_CNT_B16;
-    uint32_t byte_len = preg_len >> 1; // nibbles → FP4x2 bytes
-    MaskReg preg_b8 = CreatePredicate<uint8_t>(byte_len);
 
     vlds(v_input, src, srcOffset, NORM);
     vcvt(v_output_p0, v_input, preg_b16, R(), PART_P0);
     vselr((RegTensor<uint8_t>&)v_output, (RegTensor<uint8_t>&)v_output_p0, (RegTensor<uint8_t>&)v_idx);
     mem_bar(VST_VST);
-    vsts((RegTensor<uint8_t>&)v_output, (__ubuf__ uint8_t*)dst, dstOffset >> 1, NORM_B8, preg_b8);
+    storePackedFp4((__ubuf__ uint8_t*)dst, v_output, dstOffset >> 1, preg_len);
     END_FOR_ELEMENTS
     END_FOR_ROWS
 }
@@ -1831,8 +1854,8 @@ inline AICORE void castBf16toFp4_1D_NoPostUpdate(
     vmuls((RegTensor<int16_t>&)v_idx, (RegTensor<int16_t>&)v_idx, (int16_t)4, preg_idx);
 
     // Zero-fill destination to clear padding bytes (UB is uninitialized on hardware).
-    // BF16→FP4 writes only complete packed bytes; the boundary byte for odd element
-    // counts and all trailing bytes must be zero.
+    // Clear trailing bytes before converting complete pairs and a possible
+    // final low nibble.
     {
         MaskReg pg_fill = pset_b8(PAT_ALL);
         RegTensor<uint8_t> v_zeros;
@@ -1849,16 +1872,14 @@ inline AICORE void castBf16toFp4_1D_NoPostUpdate(
     for (uint16_t i = 0; i < repeatTimes; ++i) {
         RegTensor<bfloat16_t> v_input;
         DST_VEC v_output_p0, v_output;
-        uint32_t cur_len = sReg;
-        uint32_t byte_len = cur_len >> 1;               // nibbles → FP4x2 bytes
+        uint32_t cur_len = sReg < ELE_CNT_B16 ? sReg : ELE_CNT_B16;
         MaskReg preg_b16 = CreatePredicate<half>(sReg); // post-updates sReg
-        MaskReg preg_b8 = CreatePredicate<uint8_t>(byte_len);
 
         vlds(v_input, src, i * ELE_CNT_B16, NORM);
         vcvt(v_output_p0, v_input, preg_b16, R(), PART_P0);
         vselr((RegTensor<uint8_t>&)v_output, (RegTensor<uint8_t>&)v_output_p0, (RegTensor<uint8_t>&)v_idx);
         mem_bar(VST_VST);
-        vsts((RegTensor<uint8_t>&)v_output, (__ubuf__ uint8_t*)dst, (i * ELE_CNT_B16) >> 1, NORM_B8, preg_b8);
+        storePackedFp4((__ubuf__ uint8_t*)dst, v_output, (i * ELE_CNT_B16) >> 1, cur_len);
         // sReg is decremented by CreatePredicate<half> with POST_UPDATE
     }
 }

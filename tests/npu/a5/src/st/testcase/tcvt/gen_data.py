@@ -166,14 +166,16 @@ def gen_golden(case_name, param):
         x1_bf16_bits = _float32_to_bf16_bits(x1_f32)
         x1_bf16_vals = _bf16_bits_to_float32(x1_bf16_bits)
 
-        packed = _bf16_to_fp4x2_array(x1_bf16_vals, pos_grid)  # shape (m, n//2)
-        # Apply valid region mask (zero out rows/cols outside valid range)
+        packed = _bf16_to_fp4x2_array(x1_bf16_vals, pos_grid)  # shape (m, (n+1)//2)
+        # Apply valid region mask (zero out rows/cols outside valid range).
+        # For odd valid_n the odd element lives in the low nibble of the boundary
+        # byte; clear its unused high nibble instead of dropping the whole byte.
         if valid_m < m or valid_n < n:
-            # Hardware TCVT BF16->FP4 keeps only complete packed bytes in partial mode.
-            # For odd valid_n, the boundary byte is zeroed (effective truncation to even cols).
-            valid_n_packed = valid_n // 2
+            valid_n_packed = (valid_n + 1) // 2
             full = np.zeros((m, (n + 1) // 2), dtype=np.uint8)
             full[:valid_m, :valid_n_packed] = packed[:valid_m, :valid_n_packed]
+            if valid_n % 2:
+                full[:valid_m, valid_n // 2] &= 0x0F
             packed = full
         x1_bf16_bits.tofile("./x1_gm.bin")
         packed.tofile("./golden.bin")
@@ -512,6 +514,9 @@ if __name__ == "__main__":
             case_name = f"case_{type_name}_{m}x{n}_{valid_m}x{valid_n}"
             case_name_list.append(f"TCVTTest.{case_name}")
             case_params_list.append(tcvtParams(src, dst, m, n, "RoundMode::CAST_RINT", valid_m, valid_n))
+        if type_name in ("bf16_fp4_e1m2x2", "bf16_fp4_e2m1x2"):
+            case_name_list.append(f"TCVTTest.case_{type_name}_4x64_4x53")
+            case_params_list.append(tcvtParams(src, dst, 4, 64, "RoundMode::CAST_RINT", 4, 53))
 
     for i, case_name in enumerate(case_name_list):
         if not os.path.exists(case_name):
