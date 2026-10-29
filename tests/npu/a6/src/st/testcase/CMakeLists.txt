@@ -87,6 +87,7 @@ set(ALL_TESTCASES
     tshls
     tshr
     tshrs
+    syncall
 )
 
 if (AUTO_MODE)
