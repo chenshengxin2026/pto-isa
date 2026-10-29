@@ -76,6 +76,7 @@ textract
 textract_small_m_a5
 textract_conv
 textract_quant
+textract_ndto2xnz
 tfillpad
 tflashattn
 tfmod
