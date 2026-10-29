@@ -205,7 +205,7 @@ PTO_INTERNAL constexpr uint8_t GetDualDstCtl()
         static_assert(
             mode != AccToVecMode::DualModeSplitM && mode != AccToVecMode::DualModeSplitN,
             "A6 (dav-9201) does not support dual-destination Acc->Vec moves "
-            "(DualModeSplitM/DualModeSplitN); use SingleModeVec0/1 or a software split.");
+            "(DualModeSplitM/DualModeSplitN); use SingleModeVec0 or a software split.");
 #endif
         static_assert(quantPre == QuantMode_t::NoQuant, "Quant is not support in dual Dst Mode.");
         static_assert(

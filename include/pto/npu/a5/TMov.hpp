@@ -199,6 +199,9 @@ __tf__ AICORE void TMovCcToUb(
 {
     using dstType = typename DstTileData::DType;
     using srcType = typename SrcTileData::DType;
+#if defined(PTO_NPU_ARCH_A6)
+    static_assert(mode == AccToVecMode::SingleModeVec0, "A6 L0C2UB TMOV only supports AccToVecMode::SingleModeVec0.");
+#endif
     constexpr int32_t c0Size = BLOCK_BYTE_SIZE / sizeof(dstType);
     constexpr bool subBlockId = (mode == AccToVecMode::SingleModeVec1);
     constexpr uint8_t dualDstCtl = GetDualDstCtl<DstTileData, SrcTileData, mode, quantPre>();
@@ -256,6 +259,9 @@ __tf__ AICORE void TMovCcToUb(
 {
     using dstType = typename DstTileData::DType;
     using srcType = typename SrcTileData::DType;
+#if defined(PTO_NPU_ARCH_A6)
+    static_assert(mode == AccToVecMode::SingleModeVec0, "A6 L0C2UB TMOV only supports AccToVecMode::SingleModeVec0.");
+#endif
     constexpr bool subBlockId = (mode == AccToVecMode::SingleModeVec1);
     constexpr uint8_t unitFlagCtrl = static_cast<uint8_t>(Phase);
     SetLoop3Para();

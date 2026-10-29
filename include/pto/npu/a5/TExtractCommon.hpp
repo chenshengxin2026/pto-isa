@@ -537,6 +537,10 @@ __tf__ PTO_INTERNAL void TExtractAccToVec(
 {
     using dstType = typename DstTileData::DType;
     using srcType = typename SrcTileData::DType;
+#if defined(PTO_NPU_ARCH_A6)
+    static_assert(
+        mode == AccToVecMode::SingleModeVec0, "A6 L0C2UB TEXTRACT only supports AccToVecMode::SingleModeVec0.");
+#endif
     constexpr int32_t c0Size = BLOCK_BYTE_SIZE / sizeof(dstType);
     constexpr bool subBlockId = (mode == AccToVecMode::SingleModeVec1);
     constexpr uint8_t dualDstCtl = GetDualDstCtl<DstTileData, SrcTileData, mode, quantPre>();
@@ -623,6 +627,10 @@ __tf__ PTO_INTERNAL void TExtractAccToVec(
 {
     using dstType = typename DstTileData::DType;
     using srcType = typename SrcTileData::DType;
+#if defined(PTO_NPU_ARCH_A6)
+    static_assert(
+        mode == AccToVecMode::SingleModeVec0, "A6 L0C2UB TEXTRACT only supports AccToVecMode::SingleModeVec0.");
+#endif
     constexpr int32_t c0Size = BLOCK_BYTE_SIZE / sizeof(dstType);
     constexpr bool subBlockId = (mode == AccToVecMode::SingleModeVec1);
     PTO_ASSERT(
