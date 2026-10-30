@@ -28,11 +28,11 @@ inline bool WorkspaceManager::Init(
     const std::vector<uint64_t>& peerSymAddrs, void* symmetricAddr, uint64_t symmetricSize, uint32_t qpNum)
 {
     if (HasOwnedResources() && !Finalize()) {
-        std::cerr << "[RoCE] previous session cleanup reported errors; continuing with a fresh HCOMM session"
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] previous session cleanup reported errors; continuing with a fresh HCOMM session");
     }
     if (qpNum == 0 || static_cast<uint64_t>(rankCount) * qpNum > UINT32_MAX) {
-        std::cerr << "[RoCE] invalid QP count or queue index overflow" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] invalid QP count or queue index overflow");
         return false;
     }
     if (!ValidateInitArguments(
@@ -57,8 +57,7 @@ inline bool WorkspaceManager::Init(
         return false;
     }
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] connect DONE: workspace(RdmaInfo)=0x" << std::hex
-                  << reinterpret_cast<uint64_t>(rdmaInfoDevice_) << std::dec << std::endl;
+        PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] connect DONE");
     }
     initialized_ = true;
     Trace(
@@ -123,18 +122,21 @@ inline bool WorkspaceManager::Finalize()
 }
 
 template <typename... Args>
+inline void WorkspaceManager::Log(Args&&... args) const
+{
+    std::ostringstream stream;
+    stream << "[RoCE][case " << traceId_ << "][rank " << rankId_ << "] ";
+    (stream << ... << std::forward<Args>(args));
+    PTO_HOST_LOG_INFO("RDMA", stream.str());
+}
+
+template <typename... Args>
 inline void WorkspaceManager::Trace(Args&&... args) const
 {
     if (!Verbose()) {
         return;
     }
-    std::ostringstream stream;
-    stream << "[RoCE][case " << traceId_ << "][rank " << rankId_ << "] ";
-    (stream << ... << std::forward<Args>(args));
-    stream << '\n';
-    const std::string line = stream.str();
-    (void)std::fwrite(line.data(), 1, line.size(), stderr);
-    std::fflush(stderr);
+    Log(std::forward<Args>(args)...);
 }
 
 inline uint64_t WorkspaceManager::ElapsedUs(const std::chrono::steady_clock::time_point& start)
@@ -172,13 +174,16 @@ inline void WorkspaceManager::LogInitConfiguration() const
     if (!Verbose()) {
         return;
     }
-    std::cerr << "[RoCE][rank " << rankId_ << "/" << rankCount_ << "] connect start: phyId=" << phyId_
-              << " localIp=" << localIp_ << " basePort=" << basePort_ << " symAddr=0x" << std::hex
-              << reinterpret_cast<uint64_t>(symmetricAddr_) << std::dec << " symSize=" << symmetricSize_ << std::endl;
+    PTO_HOST_LOG_INFO(
+        "RDMA", "[RoCE][rank " << rankId_ << "/" << rankCount_ << "] connect start: phyId=" << phyId_
+                               << " localIp=" << localIp_ << " basePort=" << basePort_ << " symAddr=0x" << std::hex
+                               << reinterpret_cast<uint64_t>(symmetricAddr_) << std::dec
+                               << " symSize=" << symmetricSize_);
     for (uint32_t rank = 0; rank < rankCount_; ++rank) {
-        std::cerr << "[RoCE][rank " << rankId_ << "]   peer[" << rank << "] ip=" << peerIps_[rank]
-                  << " phyId=" << peerPhyIds_[rank] << " symAddr=0x" << std::hex << peerSymAddrs_[rank] << std::dec
-                  << std::endl;
+        PTO_HOST_LOG_INFO(
+            "RDMA", "[RoCE][rank " << rankId_ << "]   peer[" << rank << "] ip=" << peerIps_[rank]
+                                   << " phyId=" << peerPhyIds_[rank] << " symAddr=0x" << std::hex << peerSymAddrs_[rank]
+                                   << std::dec);
     }
 }
 
@@ -210,7 +215,7 @@ inline bool WorkspaceManager::DestroyChannels()
         return true;
     }
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] HcommChannelDestroy n=" << valid.size() << std::endl;
+        PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] HcommChannelDestroy n=" << valid.size());
     }
     for (size_t index = 0; index < channelHandles_.size(); ++index) {
         const ChannelHandle handle = channelHandles_[index];
@@ -224,11 +229,11 @@ inline bool WorkspaceManager::DestroyChannels()
     channelHandles_.clear();
     channelPeer_.clear();
     if (result != 0) {
-        std::cerr << "[RoCE] HcommChannelDestroy failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommChannelDestroy failed: " << result);
         return false;
     }
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] HcommChannelDestroy ok" << std::endl;
+        PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] HcommChannelDestroy ok");
     }
     Trace("DESTROY channels API returned success");
     return true;
@@ -245,7 +250,7 @@ inline bool WorkspaceManager::UnregisterMemory()
             continue;
         }
         if (endpoint_ == nullptr || HcommMemUnreg(endpoint_, memory) != 0) {
-            std::cerr << "[RoCE] HcommMemUnreg failed" << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommMemUnreg failed");
             ok = false;
         } else {
             Trace("DESTROY mem-unreg API returned success handle=", memory);
@@ -263,7 +268,7 @@ inline bool WorkspaceManager::DestroyEndpoint()
     endpoint_ = nullptr;
     const HcommResult result = HcommEndpointDestroy(endpoint);
     if (result != 0) {
-        std::cerr << "[RoCE] HcommEndpointDestroy failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommEndpointDestroy failed: " << result);
         return false;
     }
     Trace("DESTROY endpoint API returned success handle=", endpoint);
@@ -278,7 +283,7 @@ inline bool WorkspaceManager::FreeDeviceInfo()
     bool ok = true;
     for (void* allocation : allocations) {
         if (allocation != nullptr && aclrtFree(allocation) != ACL_SUCCESS) {
-            std::cerr << "[RoCE] workspace allocation release failed" << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] workspace allocation release failed");
             ok = false;
         }
     }
@@ -298,16 +303,16 @@ inline bool WorkspaceManager::ValidateBasicInitArguments(
 {
     if (rankCount == 0 || rankId >= rankCount || peerIps.size() != rankCount || peerPhyIds.size() != rankCount ||
         peerSymAddrs.size() != rankCount || localIp.empty() || symmetricAddr == nullptr || symmetricSize == 0) {
-        std::cerr << "[RoCE] invalid rank, peer, IP, or symmetric-memory arguments" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] invalid rank, peer, IP, or symmetric-memory arguments");
         return false;
     }
     if (peerIps[rankId] != localIp || peerPhyIds[rankId] != phyId ||
         peerSymAddrs[rankId] != reinterpret_cast<uint64_t>(symmetricAddr)) {
-        std::cerr << "[RoCE] local IP/phyId/address does not match this rank's gathered peer entry" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] local IP/phyId/address does not match this rank's gathered peer entry");
         return false;
     }
     if (basePort > UINT16_MAX - (kMaxRanksPerNic * kMaxRanksPerNic - 1)) {
-        std::cerr << "[RoCE] basePort leaves no room for the per-rank channel port range" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] basePort leaves no room for the per-rank channel port range");
         return false;
     }
     return true;
@@ -319,8 +324,8 @@ inline bool WorkspaceManager::ValidatePeerPortMapping(
 {
     for (uint32_t rank = 0; rank < rankCount; ++rank) {
         if (peerIps[rank].empty() || peerPhyIds[rank] == UINT32_MAX || peerSymAddrs[rank] == 0) {
-            std::cerr << "[RoCE] peer " << rank << " has an empty IP, invalid phyId, or null symmetric address"
-                      << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "RDMA", "[RoCE] peer " << rank << " has an empty IP, invalid phyId, or null symmetric address");
             return false;
         }
         uint32_t ranksOnNic = 0;
@@ -332,15 +337,17 @@ inline bool WorkspaceManager::ValidatePeerPortMapping(
             ++ranksOnNic;
             const uint32_t slot = peer % kMaxRanksPerNic;
             if (occupiedSlots[slot]) {
-                std::cerr << "[RoCE] ranks sharing NIC IP " << peerIps[rank]
-                          << " collide after modulo port mapping at slot " << slot << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "RDMA", "[RoCE] ranks sharing NIC IP " << peerIps[rank]
+                                                           << " collide after modulo port mapping at slot " << slot);
                 return false;
             }
             occupiedSlots[slot] = true;
         }
         if (ranksOnNic > kMaxRanksPerNic) {
-            std::cerr << "[RoCE] more than " << kMaxRanksPerNic << " ranks share NIC IP " << peerIps[rank]
-                      << "; the channel port mapping would collide" << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "RDMA", "[RoCE] more than " << kMaxRanksPerNic << " ranks share NIC IP " << peerIps[rank]
+                                            << "; the channel port mapping would collide");
             return false;
         }
     }

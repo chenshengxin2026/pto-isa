@@ -211,5 +211,75 @@ PTO_INTERNAL void TEXTRACT_IMPL(DstTileData& dst, SrcTileData& src, FpTileData& 
     TExtract_Impl<DstTileData, SrcTileData, quantPre, useRelu>(dst, src, idxRow, idxCol, scalars);
 }
 
+// Structural checks for the two-destination ND->2xNZ overload. The CPU simulator is
+// layout-aware through GetElement/SetElement (tile_offsets.hpp maps the logical (r, c)
+// to the NZ physical offset), so the copy itself is element-wise; these checks pin the
+// interface to the same ND source / NZ destination contract as the A5/A2A3 backends
+// (see docs/isa/TEXTRACT.md, "ND -> 2xNZ extraction path").
+template <typename T, typename DstTileData, typename SrcTileData>
+PTO_INTERNAL void CheckTExtractNdToNzCpu()
+{
+    static_assert(
+        SrcTileData::Loc == TileType::Vec && DstTileData::Loc == TileType::Vec,
+        "TEXTRACT ND->2xNZ (CPU): Source and destinations must be Vec (UB) tiles.");
+    static_assert(
+        SrcTileData::isRowMajor && SrcTileData::SFractal == SLayout::NoneBox,
+        "TEXTRACT ND->2xNZ (CPU): Source must be ND (RowMajor, NoneBox).");
+    static_assert(
+        !DstTileData::isRowMajor && DstTileData::SFractal == SLayout::RowMajor,
+        "TEXTRACT ND->2xNZ (CPU): Destination must be NZ (ColMajor, RowMajor fractal).");
+    static_assert(
+        std::is_same_v<typename DstTileData::DType, typename SrcTileData::DType>,
+        "TEXTRACT ND->2xNZ (CPU): Source and destination data types must match.");
+    constexpr uint32_t c0Size = BLOCK_BYTE_SIZE / sizeof(T);
+    static_assert(DstTileData::Cols % c0Size == 0, "TEXTRACT ND->2xNZ (CPU): Destination cols must be c0-aligned.");
+    static_assert(
+        (SrcTileData::RowStride * sizeof(T)) % BLOCK_BYTE_SIZE == 0,
+        "TEXTRACT ND->2xNZ (CPU): Source row stride must be 32-byte aligned.");
+}
+
+// Two-destination ND->2xNZ extraction: extracts two independent ND sub-windows from a
+// single ND source and writes each as a separate NZ destination. Each window k copies
+// dst_k[r][c] = src[indexRow_k + r][indexCol_k + c] for the valid window, leaving the
+// rest of the destination tile untouched (callers zero the padding, e.g. ZeroDst).
+template <typename Dst0TileData, typename Dst1TileData, typename SrcTileData>
+PTO_INTERNAL void TEXTRACT_ND2XNZ_IMPL(
+    Dst0TileData& dst0, Dst1TileData& dst1, SrcTileData& src, uint16_t indexRow0, uint16_t indexCol0,
+    uint16_t indexRow1, uint16_t indexCol1)
+{
+    using T = typename SrcTileData::DType;
+    CheckTExtractNdToNzCpu<T, Dst0TileData, SrcTileData>();
+    CheckTExtractNdToNzCpu<T, Dst1TileData, SrcTileData>();
+
+    const uint32_t validRow0 = dst0.GetValidRow();
+    const uint32_t validCol0 = dst0.GetValidCol();
+    const uint32_t validRow1 = dst1.GetValidRow();
+    const uint32_t validCol1 = dst1.GetValidCol();
+
+    PTO_CPU_ASSERT(
+        indexRow0 + validRow0 <= SrcTileData::Rows,
+        "TEXTRACT ND->2xNZ (CPU): window0 indexRow + validRow exceeds srcRows!");
+    PTO_CPU_ASSERT(
+        indexCol0 + validCol0 <= SrcTileData::Cols,
+        "TEXTRACT ND->2xNZ (CPU): window0 indexCol + validCol exceeds srcCols!");
+    PTO_CPU_ASSERT(
+        indexRow1 + validRow1 <= SrcTileData::Rows,
+        "TEXTRACT ND->2xNZ (CPU): window1 indexRow + validRow exceeds srcRows!");
+    PTO_CPU_ASSERT(
+        indexCol1 + validCol1 <= SrcTileData::Cols,
+        "TEXTRACT ND->2xNZ (CPU): window1 indexCol + validCol exceeds srcCols!");
+
+    for (size_t c = 0; c < validCol0; c++) {
+        for (size_t r = 0; r < validRow0; r++) {
+            dst0.SetElement(r, c, src.GetElement(r + indexRow0, c + indexCol0));
+        }
+    }
+    for (size_t c = 0; c < validCol1; c++) {
+        for (size_t r = 0; r < validRow1; r++) {
+            dst1.SetElement(r, c, src.GetElement(r + indexRow1, c + indexCol1));
+        }
+    }
+}
+
 } // namespace pto
 #endif // TEXTRACT_HPP

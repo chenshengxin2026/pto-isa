@@ -59,6 +59,8 @@ ST不会生成或修改这两个拓扑文件，也不提供路径覆盖变量。
 | `PTO_ROCE_IPS` | 最终兜底列表，按MPI rank排序且IPv4数量必须等于rank数。|
 | `PTO_ROCE_BASE_PORT` | 各rank一致的channel base port，默认 `60032`。|
 | `PTO_ROCE_VERBOSE` | 设为 `1`，打印端点、MR、channel和释放进度。|
+| `PTO_ISA_GLOBAL_LOG_LEVEL` | `0` DEBUG、`1` INFO、`2` WARNING、`3` ERROR（默认）；`4` 关闭PTO文件/stdout业务日志。|
+| `PTO_ISA_SLOG_PRINT_TO_STDOUT` | 设为 `1` 时库日志输出到stdout，否则写入plog目录下的PTO文件。|
 | `HCCL_RDMA_TC` | HCOMM traffic class，默认 `132`。|
 | `HCCL_RDMA_SL` | HCOMM service level，默认 `4`。|
 
@@ -69,4 +71,5 @@ ST不会生成或修改这两个拓扑文件，也不提供路径覆盖变量。
 - CMake提示RDMA未使能时，设置 `PTO_RDMA_BACKEND=HNS_1825`，并在不使用 `-w` 的情况下重新配置。
 - 端点发现失败时，检查物理设备映射以及root-info或virtual topology中的CLOS IPv4，必要时使用测试专用IP变量兜底。
 - HCOMM无法从默认路径加载HNS1825 verbs provider时，将 `IBV_EXTEND_DRIVERS` 指向驱动提供的 `libhrn5-rdmav34.so`。
-- 设置 `PTO_ROCE_VERBOSE=1`，可区分端点发现、MR注册、channel建链和释放阶段的错误。
+- 设置 `PTO_ROCE_VERBOSE=1`、`PTO_ISA_GLOBAL_LOG_LEVEL=1` 和 `PTO_ISA_SLOG_PRINT_TO_STDOUT=1`，在终端查看 INFO 级别的端点、MR、channel 和释放日志。
+- 日志路径和文件管理规则见[Host日志](../../../../../../../include/pto/comm/logger/README_zh.md)。

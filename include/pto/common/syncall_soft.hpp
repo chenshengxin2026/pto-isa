@@ -11,8 +11,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 // Software SYNCALL: GM shared-counter barrier. Include from backend SyncAll.hpp
 // after TSync.hpp. Arrival/poll primitives differ by arch; the epoch barrier and
 // SOFT_*_IMPL wrappers are shared.
-//   PTO_NPU_ARCH_A5   — atomicAdd(counter, 1) arrive + atomicAdd(counter, 0) poll
-//   PTO_NPU_ARCH_A2A3 — set_st_atomic_cfg / st_atomic arrive + ld_dev poll
+//   PTO_NPU_ARCH_A5/A6 — atomicAdd(counter, 1) arrive + atomicAdd(counter, 0) poll
+//   PTO_NPU_ARCH_A2A3  — set_st_atomic_cfg / st_atomic arrive + ld_dev poll
 
 #ifndef PTO_SYNCALL_SOFT_HPP
 #define PTO_SYNCALL_SOFT_HPP
@@ -22,7 +22,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 namespace pto {
 
-#if defined(PTO_NPU_ARCH_A5)
+#if defined(PTO_NPU_ARCH_A5) || defined(PTO_NPU_ARCH_A6)
 PTO_INTERNAL int32_t SYNCALL_SOFT_ATOMIC_LOAD(__gm__ int32_t* counter)
 {
     return atomicAdd(counter, static_cast<int32_t>(0));

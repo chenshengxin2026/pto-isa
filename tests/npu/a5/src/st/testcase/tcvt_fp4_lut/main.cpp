@@ -22,9 +22,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 namespace {
 constexpr size_t kGuardBytes = 32;
 constexpr uint8_t kCanary = 0xA5;
-constexpr std::array<Fp4LutCaseId, 6> kBulkRowCases = {Fp4LutCaseId::Bulk64ND,        Fp4LutCaseId::Bulk64NZ,
-                                                       Fp4LutCaseId::Bulk64CompactNZ, Fp4LutCaseId::Bulk128ND,
-                                                       Fp4LutCaseId::Bulk128NZ,       Fp4LutCaseId::Bulk128CompactNZ};
+constexpr std::array<Fp4LutCaseId, 8> kBulkRowCases = {Fp4LutCaseId::Bulk64ND,         Fp4LutCaseId::Bulk64NZ,
+                                                       Fp4LutCaseId::Bulk64CompactNZ,  Fp4LutCaseId::Bulk128ND,
+                                                       Fp4LutCaseId::Bulk128NZ,        Fp4LutCaseId::Bulk128CompactNZ,
+                                                       Fp4LutCaseId::RowPlusOneBulk64, Fp4LutCaseId::RowPlusOneBulk128};
 
 float decodeFp4(uint8_t code)
 {
@@ -108,7 +109,8 @@ protected:
     }
     void runBytes(
         int caseId, std::vector<uint8_t>& source, const std::vector<uint8_t>& expected, int rows, int cols, int round,
-        int api, int regressionPair = -1, int primitiveSourceOffset = 0, bool primitiveRotation = false)
+        int api, int regressionPair = -1, int primitiveSourceOffset = 0, bool primitiveRotation = false,
+        int nativeStore = 0)
     {
         DeviceBuffer input, output;
         ASSERT_EQ(input.allocate(source.size()), ACL_SUCCESS) << "aclrtMalloc input";
@@ -121,7 +123,9 @@ protected:
         status = aclrtMemcpy(output.data, actual.size(), actual.data(), actual.size(), ACL_MEMCPY_HOST_TO_DEVICE);
         healthy = status == ACL_SUCCESS;
         ASSERT_EQ(status, ACL_SUCCESS) << "aclrtMemcpy output H2D";
-        if (regressionPair < 0) {
+        if (nativeStore) {
+            launchFp4LutStore(output.data, input.data, nativeStore, stream);
+        } else if (regressionPair < 0) {
             launchFp4Lut(caseId, output.data, input.data, rows, cols, round, api, stream);
         } else if (regressionPair == 2) {
             launchFp4LutBulkPrimitive(output.data, input.data, primitiveSourceOffset, primitiveRotation, stream);
@@ -166,8 +170,14 @@ protected:
                 source[byte] = static_cast<uint8_t>(byte * 37 + (byte / 256) * 11);
             }
         }
-        std::vector<uint8_t> expected(test.destinationRows * test.destinationCols + 2 * kGuardBytes, kCanary);
-        size_t panelRows = test.compact ? ((rows + 15) / 16) * 16 : test.destinationRows;
+        // Mirror Destination::StorageNumel: the maximum envelope aligns physical Rows,
+        // while a legacy static padded Rows declaration already includes the gap row.
+        const bool rowPlusOnePadded =
+            test.compact == 2 && !test.dynamic && test.destinationRows == ((test.validRows + 15) / 16) * 16 + 1;
+        const size_t storageRows =
+            test.compact == 2 && !rowPlusOnePadded ? ((test.destinationRows + 15) / 16) * 16 + 1 : test.destinationRows;
+        std::vector<uint8_t> expected(storageRows * test.destinationCols + 2 * kGuardBytes, kCanary);
+        size_t panelRows = test.compact ? ((rows + 15) / 16) * 16 + (test.compact == 2 ? 1 : 0) : test.destinationRows;
         std::array<bool, 256> seen{};
         for (int row = 0; row < rows; ++row) {
             for (int col = 0; col < cols; ++col) {
@@ -180,15 +190,54 @@ protected:
                 expected[kGuardBytes + physical] = encodeE4M3(decodeFp4(nibble));
             }
         }
-        bool fullBulkFixture =
-            id >= static_cast<int>(Fp4LutCaseId::Bulk64ND) && rows == test.validRows && cols == test.validCols;
+        bool fullBulkFixture = id >= static_cast<int>(Fp4LutCaseId::Bulk64ND) &&
+                               id <= static_cast<int>(Fp4LutCaseId::Bulk128CompactNZ) && rows == test.validRows &&
+                               cols == test.validCols;
+        bool fullRowPlusOneFixture = (id == static_cast<int>(Fp4LutCaseId::RowPlusOneFull) ||
+                                      id == static_cast<int>(Fp4LutCaseId::RowPlusOneDynamicFull)) &&
+                                     rows == test.validRows && cols == test.validCols;
         if (id == static_cast<int>(Fp4LutCaseId::MainND) || id == static_cast<int>(Fp4LutCaseId::MainNZ) ||
-            fullBulkFixture) {
+            fullBulkFixture || fullRowPlusOneFixture) {
             for (int packed = 0; packed < 256; ++packed) {
                 ASSERT_TRUE(seen[packed]) << "Missing packed FP4 byte " << packed;
             }
         }
         ASSERT_NO_FATAL_FAILURE(runBytes(id, source, expected, rows, cols, round, api));
+    }
+    void runNativeStore(int compactMode)
+    {
+        ASSERT_TRUE(compactMode == 1 || compactMode == 2);
+        constexpr int sourceRows = kFp4LutStoreSourceRows;
+        constexpr int columns = kFp4LutStoreColumns;
+        constexpr int storeRows = kFp4LutStoreRows;
+        constexpr int panelColumns = kFp4LutStorePanelColumns;
+        constexpr size_t sourcePitch = columns / 2;
+        std::vector<uint8_t> source(sourceRows * sourcePitch);
+        for (int row = 0; row < sourceRows; ++row) {
+            for (size_t col = 0; col < sourcePitch; ++col) {
+                source[row * sourcePitch + col] = static_cast<uint8_t>(row * 73 + col * 37 + (col / 256) * 11);
+            }
+        }
+
+        // TSTORE consumes the compact source pitch and emits four standard NZ panels;
+        // RowPlusOne additionally removes the one-row source gap per panel.
+        std::vector<uint8_t> expected(storeRows * columns + 2 * kGuardBytes, kCanary);
+        for (int panel = 0; panel < columns / panelColumns; ++panel) {
+            for (int row = 0; row < storeRows; ++row) {
+                for (int col = 0; col < panelColumns; ++col) {
+                    size_t physical = panel * storeRows * panelColumns + row * panelColumns + col;
+                    if (row < sourceRows) {
+                        int logicalCol = panel * panelColumns + col;
+                        uint8_t packed = source[row * sourcePitch + logicalCol / 2];
+                        uint8_t nibble = (logicalCol & 1) ? (packed >> 4) : (packed & 15);
+                        expected[kGuardBytes + physical] = encodeE4M3(decodeFp4(nibble));
+                    } else {
+                        expected[kGuardBytes + physical] = 0x7f;
+                    }
+                }
+            }
+        }
+        ASSERT_NO_FATAL_FAILURE(runBytes(-1, source, expected, sourceRows, columns, 1, 0, -1, 0, false, compactMode));
     }
     aclrtStream stream = nullptr;
     inline static aclrtContext context = nullptr;
@@ -249,17 +298,51 @@ TEST_F(Fp4LutTest, BulkRowsPublicOverloadsRoundSaturation)
     }
 }
 
+TEST_F(Fp4LutTest, RowPlusOnePublicOverloadsRoundSaturation)
+{
+    for (auto id :
+         {Fp4LutCaseId::RowPlusOneFull, Fp4LutCaseId::RowPlusOneDynamicFull, Fp4LutCaseId::RowPlusOneTail,
+          Fp4LutCaseId::RowPlusOneBulk64, Fp4LutCaseId::RowPlusOneBulk128, Fp4LutCaseId::RowPlusOneRegisterTail}) {
+        for (int round = 0; round <= 6; ++round) {
+            for (int api = 0; api < 6; ++api) {
+                ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(id), round, api));
+            }
+        }
+    }
+}
+
+TEST_F(Fp4LutTest, RowPlusOneDynamicBoundaries)
+{
+    for (int rows : {0, 1, 3, 15, 16, 17, 19, 31, 32, 33, 63, 64, 65, 127, 128}) {
+        for (int cols : {0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256}) {
+            SCOPED_TRACE(testing::Message() << "valid rows " << rows << ", valid columns " << cols);
+            ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(Fp4LutCaseId::RowPlusOneDynamicFull), 1, 0, rows, cols));
+        }
+    }
+}
+
 TEST_F(Fp4LutTest, EveryMinimumRowTail)
 {
     for (int cols = 1; cols <= 64; ++cols) {
         ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(Fp4LutCaseId::SingleNibbleND), 1, 0, 1, cols));
         ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(Fp4LutCaseId::SingleNibbleNZ), 1, 0, 1, cols));
+        ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(Fp4LutCaseId::RowPlusOneMinimum), 1, 0, 1, cols));
+    }
+}
+
+TEST_F(Fp4LutTest, RowPlusOneRegisterBoundary)
+{
+    for (int rows : {0, 1, 2}) {
+        for (int cols : {0, 1, 255, 256, 257, 511, 512}) {
+            SCOPED_TRACE(testing::Message() << "valid rows " << rows << ", valid columns " << cols);
+            ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(Fp4LutCaseId::RowPlusOneRegisterTail), 1, 0, rows, cols));
+        }
     }
 }
 
 TEST_F(Fp4LutTest, EmptyDynamicRegions)
 {
-    for (auto id : {Fp4LutCaseId::StridedDynamicND, Fp4LutCaseId::CompactDynamicNZ}) {
+    for (auto id : {Fp4LutCaseId::StridedDynamicND, Fp4LutCaseId::CompactDynamicNZ, Fp4LutCaseId::RowPlusOneTail}) {
         ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(id), 1, 0, 0, 579));
         ASSERT_NO_FATAL_FAILURE(runCase(static_cast<int>(id), 1, 0, 3, 0));
     }
@@ -319,4 +402,6 @@ TEST_F(Fp4LutTest, BulkPrimitiveQualification)
         }
     }
 }
+TEST_F(Fp4LutTest, NativeStoreNormal) { ASSERT_NO_FATAL_FAILURE(runNativeStore(1)); }
+TEST_F(Fp4LutTest, NativeStoreRowPlusOne) { ASSERT_NO_FATAL_FAILURE(runNativeStore(2)); }
 } // namespace

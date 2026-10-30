@@ -82,7 +82,7 @@ inline bool WorkspaceManager::InitializeQueueMirrors(
         " readOk=", readOk, " sqMirror=", Hex(roceSq.headAddr), "/", Hex(roceSq.tailAddr),
         " cqMirror=", Hex(roceCq.headAddr), "/", Hex(roceCq.tailAddr));
     if (!readOk) {
-        std::cerr << "[RoCE] peer " << peer << " queue mirror D2H read failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] peer " << peer << " queue mirror D2H read failed");
         return false;
     }
     // HCOMM exposes freshly allocated PI/CI mirrors but does not guarantee the
@@ -93,7 +93,7 @@ inline bool WorkspaceManager::InitializeQueueMirrors(
         WriteU32Device(roceSq.headAddr, kInitialQueueIndex) && WriteU32Device(roceSq.tailAddr, kInitialQueueIndex) &&
         WriteU32Device(roceCq.headAddr, kInitialQueueIndex) && WriteU32Device(roceCq.tailAddr, kInitialQueueIndex);
     if (!writeOk) {
-        std::cerr << "[RoCE] peer " << peer << " queue mirror initialization failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] peer " << peer << " queue mirror initialization failed");
         return false;
     }
     Trace("QUEUE reset peer=", peer, " sq(head/tail)=0/0 cq(head/tail)=0/0");
@@ -112,7 +112,7 @@ inline bool WorkspaceManager::InitializeSqOwners(const host::SqContext& sq, uint
     if (aclrtMemcpy(
             reinterpret_cast<void*>(context.sqVa), ring.size(), ring.data(), ring.size(), ACL_MEMCPY_HOST_TO_DEVICE) !=
         ACL_SUCCESS) {
-        std::cerr << "[RoCE] peer " << peer << " SQ owner initialization failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] peer " << peer << " SQ owner initialization failed");
         return false;
     }
     return true;
@@ -125,7 +125,7 @@ inline bool WorkspaceManager::PrepareRdmaInfoLayout(std::vector<uint8_t>& hostBu
     const uint64_t memBytes = sizeof(RdmaMemInfo) * static_cast<uint64_t>(rankCount_);
     if (memBytes > SIZE_MAX - sizeof(RdmaInfo) - sizeof(QueueState) ||
         queueCount > (SIZE_MAX - sizeof(RdmaInfo) - sizeof(QueueState) - memBytes) / bytesPerQueue) {
-        std::cerr << "[RoCE] RDMA workspace size overflow" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] RDMA workspace size overflow");
         return false;
     }
     const size_t sqBytes = sizeof(RoceSqCtx) * static_cast<size_t>(queueCount);
@@ -135,7 +135,7 @@ inline bool WorkspaceManager::PrepareRdmaInfoLayout(std::vector<uint8_t>& hostBu
     layout.totalSize = stateOffset + sizeof(QueueState) * static_cast<size_t>(queueCount);
     workspaceBytes_ = static_cast<uint64_t>(layout.totalSize);
     if (aclrtMalloc(&rdmaInfoDevice_, layout.totalSize, ACL_MEM_MALLOC_HUGE_FIRST) != 0 || rdmaInfoDevice_ == nullptr) {
-        std::cerr << "[RoCE] aclrtMalloc(rdmaInfo) failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] aclrtMalloc(rdmaInfo) failed");
         return false;
     }
     hostBuffer.assign(layout.totalSize, 0);
@@ -171,12 +171,12 @@ inline bool WorkspaceManager::FillLocalMemoryInfo(RdmaMemInfo* memory)
     for (size_t channel = 0; channel < channelHandles_.size() && !localMrRead; ++channel) {
         host::ChannelEntity entity{};
         if (!ReadChannelEntity(channelHandles_[channel], entity)) {
-            std::cerr << "[RoCE] failed to read ChannelEntity while resolving the local MR" << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] failed to read ChannelEntity while resolving the local MR");
             return false;
         }
         if (!ValidateChannelEntity(entity, channelPeer_[channel]) || entity.localBufferNum < 2 ||
             entity.localBufferAddr == nullptr) {
-            std::cerr << "[RoCE] local registered buffer is absent for peer " << channelPeer_[channel] << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] local registered buffer is absent for peer " << channelPeer_[channel]);
             return false;
         }
         host::RegedBufferEntity localBuffer{};
@@ -200,7 +200,7 @@ inline bool WorkspaceManager::FillLocalMemoryInfo(RdmaMemInfo* memory)
         localMrRead = true;
     }
     if (!localMrRead) {
-        std::cerr << "[RoCE] failed to read the local registered buffer from any channel" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] failed to read the local registered buffer from any channel");
         return false;
     }
     return true;
@@ -212,14 +212,14 @@ inline bool WorkspaceManager::FillPeerRdmaInfo(size_t channelIndex, RdmaInfoHost
     const size_t queueIndex = static_cast<size_t>(peer) * qpNum_ + channelIndex % qpNum_;
     host::ChannelEntity entity{};
     if (!ReadChannelEntity(channelHandles_[channelIndex], entity)) {
-        std::cerr << "[RoCE] read ChannelEntity failed for peer " << peer << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] read ChannelEntity failed for peer " << peer);
         return false;
     }
     if (!ValidateChannelEntity(entity, peer)) {
         return false;
     }
     if (entity.remoteBufferNum == 0 || entity.remoteBufferAddr == nullptr) {
-        std::cerr << "[RoCE] peer " << peer << " has no exchanged remote registered buffer" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] peer " << peer << " has no exchanged remote registered buffer");
         return false;
     }
     host::RegedBufferEntity remoteBuffer{};
@@ -269,26 +269,29 @@ inline void WorkspaceManager::LogRdmaInfo(const RdmaInfoHostLayout& layout) cons
     if (!Verbose()) {
         return;
     }
-    std::cerr << "[RoCE][rank " << rankId_ << "] (4/4) RdmaInfo filled (qpNum=" << layout.info->qpNum
-              << "):" << std::endl;
-    std::cerr << "[RoCE][rank " << rankId_ << "]   localMR[" << rankId_ << "] addr=0x" << std::hex
-              << layout.memory[rankId_].addr << std::dec << " size=" << layout.memory[rankId_].size << " lkey=0x"
-              << std::hex << layout.memory[rankId_].lkey << " rkey=0x" << layout.memory[rankId_].rkey << std::dec
-              << std::endl;
+    PTO_HOST_LOG_INFO(
+        "RDMA", "[RoCE][rank " << rankId_ << "] (4/4) RdmaInfo filled (qpNum=" << layout.info->qpNum << "):");
+    PTO_HOST_LOG_INFO(
+        "RDMA", "[RoCE][rank " << rankId_ << "]   localMR[" << rankId_ << "] addr=0x" << std::hex
+                               << layout.memory[rankId_].addr << std::dec << " size=" << layout.memory[rankId_].size
+                               << " lkey=0x" << std::hex << layout.memory[rankId_].lkey << " rkey=0x"
+                               << layout.memory[rankId_].rkey << std::dec);
     for (size_t channel = 0; channel < channelPeer_.size(); ++channel) {
         const uint32_t peer = channelPeer_[channel];
         const size_t qpIdx = channel % qpNum_;
         const size_t queueIndex = static_cast<size_t>(peer) * qpNum_ + qpIdx;
-        std::cerr << "[RoCE][rank " << rankId_ << "]   peer[" << peer << "] MR addr=0x" << std::hex
-                  << layout.memory[peer].addr << " rkey=0x" << layout.memory[peer].rkey << std::dec << " | QP=" << qpIdx
-                  << " SQ wqn=" << layout.sq[queueIndex].wqn << " depth=" << layout.sq[queueIndex].depth << " sqVa=0x"
-                  << std::hex << layout.sq[queueIndex].bufAddr << " dbHw=0x" << layout.sq[queueIndex].dbAddr
-                  << " dbSw=0x" << layout.sq[queueIndex].dbSwAddr << std::dec
-                  << " mtuShift=" << static_cast<int>(layout.sq[queueIndex].mtuShift)
-                  << " dbCos=" << static_cast<int>(layout.sq[queueIndex].dbCos)
-                  << " | CQ cqn=" << layout.scq[queueIndex].cqn << " depth=" << layout.scq[queueIndex].depth
-                  << " cqVa=0x" << std::hex << layout.scq[queueIndex].bufAddr << " dbSw=0x"
-                  << layout.scq[queueIndex].dbSwAddr << std::dec << std::endl;
+        PTO_HOST_LOG_INFO(
+            "RDMA",
+            "[RoCE][rank " << rankId_ << "]   peer[" << peer << "] MR addr=0x" << std::hex << layout.memory[peer].addr
+                           << " rkey=0x" << layout.memory[peer].rkey << std::dec << " | QP=" << qpIdx
+                           << " SQ wqn=" << layout.sq[queueIndex].wqn << " depth=" << layout.sq[queueIndex].depth
+                           << " sqVa=0x" << std::hex << layout.sq[queueIndex].bufAddr << " dbHw=0x"
+                           << layout.sq[queueIndex].dbAddr << " dbSw=0x" << layout.sq[queueIndex].dbSwAddr << std::dec
+                           << " mtuShift=" << static_cast<int>(layout.sq[queueIndex].mtuShift)
+                           << " dbCos=" << static_cast<int>(layout.sq[queueIndex].dbCos)
+                           << " | CQ cqn=" << layout.scq[queueIndex].cqn << " depth=" << layout.scq[queueIndex].depth
+                           << " cqVa=0x" << std::hex << layout.scq[queueIndex].bufAddr << " dbSw=0x"
+                           << layout.scq[queueIndex].dbSwAddr << std::dec);
     }
 }
 
@@ -297,7 +300,7 @@ inline bool WorkspaceManager::CopyRdmaInfoToDevice(const std::vector<uint8_t>& h
     if (aclrtMemcpy(rdmaInfoDevice_, totalSize, hostBuffer.data(), totalSize, ACL_MEMCPY_HOST_TO_DEVICE) == 0) {
         return true;
     }
-    std::cerr << "[RoCE] aclrtMemcpy(rdmaInfo H2D) failed" << std::endl;
+    PTO_HOST_LOG_ERROR("RDMA", "[RoCE] aclrtMemcpy(rdmaInfo H2D) failed");
     return false;
 }
 
@@ -322,9 +325,9 @@ inline bool WorkspaceManager::IsCacheLineAligned(uint64_t address) { return addr
 inline bool WorkspaceManager::ValidateChannelEntity(const host::ChannelEntity& entity, uint32_t peer)
 {
     if (entity.engine != COMM_ENGINE_AIV || entity.protocol != COMM_PROTOCOL_ROCE) {
-        std::cerr << "[RoCE] peer " << peer
-                  << " ChannelEntity has unexpected engine/protocol: " << static_cast<int>(entity.engine) << "/"
-                  << static_cast<int>(entity.protocol) << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] peer " << peer << " ChannelEntity has unexpected engine/protocol: "
+                                   << static_cast<int>(entity.engine) << "/" << static_cast<int>(entity.protocol));
         return false;
     }
     return true;
@@ -343,8 +346,9 @@ inline bool WorkspaceManager::ReadRegisteredBuffer(
             return ValidateRegisteredBuffer(output, expectedAddr, expectedSize, side, rank);
         }
     }
-    std::cerr << "[RoCE] " << side << " MR for rank " << rank << " is absent at address 0x" << std::hex << expectedAddr
-              << std::dec << std::endl;
+    PTO_HOST_LOG_ERROR(
+        "RDMA", "[RoCE] " << side << " MR for rank " << rank << " is absent at address 0x" << std::hex << expectedAddr
+                          << std::dec);
     return false;
 }
 
@@ -355,11 +359,12 @@ inline bool WorkspaceManager::ValidateRegisteredBuffer(
     const auto& rma = buffer.bufferInfo.rma;
     if (buffer.type != host::REGED_BUFFER_TYPE_RMA || rma.protectionInfo.type != host::PROTECTION_TYPE_ROCE ||
         rma.addr != expectedAddr || rma.size < expectedSize) {
-        std::cerr << "[RoCE] " << side << " MR for rank " << rank
-                  << " has invalid type/protection/address/size: type=" << static_cast<int>(buffer.type)
-                  << " protection=" << static_cast<int>(rma.protectionInfo.type) << " addr=0x" << std::hex << rma.addr
-                  << " expected=0x" << expectedAddr << std::dec << " size=" << rma.size
-                  << " expected-at-least=" << expectedSize << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] " << side << " MR for rank " << rank
+                              << " has invalid type/protection/address/size: type=" << static_cast<int>(buffer.type)
+                              << " protection=" << static_cast<int>(rma.protectionInfo.type) << " addr=0x" << std::hex
+                              << rma.addr << " expected=0x" << expectedAddr << std::dec << " size=" << rma.size
+                              << " expected-at-least=" << expectedSize);
         return false;
     }
     return true;
@@ -373,10 +378,11 @@ inline bool WorkspaceManager::ValidateSqContext(const host::SqContext& sq, uint3
         context.tailAddr == 0 || context.dbHwVa == 0 || context.dbSwVa == 0 || !IsCacheLineAligned(context.sqVa) ||
         !IsU32Aligned(context.headAddr) || !IsU32Aligned(context.tailAddr) || !IsU32Aligned(context.dbSwVa) ||
         context.mtuShift > kDbVendorFieldMask || context.dbCos > kDbVendorFieldMask) {
-        std::cerr << "[RoCE] peer " << peer << " has an unusable RoCE SQ context: type=" << static_cast<int>(sq.type)
-                  << " depth=" << context.depth << " wqeSize=" << context.wqeSize << " abi=" << context.abiName
-                  << " mtuShift=" << static_cast<int>(context.mtuShift) << " dbCos=" << static_cast<int>(context.dbCos)
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] peer " << peer << " has an unusable RoCE SQ context: type=" << static_cast<int>(sq.type)
+                                   << " depth=" << context.depth << " wqeSize=" << context.wqeSize
+                                   << " abi=" << context.abiName << " mtuShift=" << static_cast<int>(context.mtuShift)
+                                   << " dbCos=" << static_cast<int>(context.dbCos));
         return false;
     }
     return true;
@@ -391,8 +397,9 @@ inline bool WorkspaceManager::ValidateCqContext(const host::CqContext& cq, uint3
     if (cq.type != host::CQ_CONTEXT_TYPE_ROCE || !IsPowerOfTwo(cqRing) || cqRing < 4 || !supportedCqeSize ||
         context.cqVa == 0 || context.headAddr == 0 || context.tailAddr == 0 || context.dbSwVa == 0 ||
         !IsCacheLineAligned(context.cqVa) || !IsU32Aligned(context.tailAddr) || !IsU32Aligned(context.dbSwVa)) {
-        std::cerr << "[RoCE] peer " << peer << " has an unusable RoCE CQ context: type=" << static_cast<int>(cq.type)
-                  << " depth=" << context.cqDepth << " cqeSize=" << context.cqeSize << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] peer " << peer << " has an unusable RoCE CQ context: type=" << static_cast<int>(cq.type)
+                                   << " depth=" << context.cqDepth << " cqeSize=" << context.cqeSize);
         return false;
     }
     return true;

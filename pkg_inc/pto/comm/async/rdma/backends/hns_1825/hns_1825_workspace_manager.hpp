@@ -20,9 +20,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -33,6 +31,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include "acl/acl.h"
 
+#include "pto/comm/logger/host_log.hpp"
 #include "pto/comm/async/rdma/rdma_workspace_types.hpp"
 #include "pto/comm/async/rdma/backends/hns_1825/hns_1825_hcomm_defs.hpp"
 #include "pto/comm/async/rdma/backends/hns_1825/hns_1825_types.hpp"
@@ -52,7 +51,8 @@ namespace hns_1825 {
 //
 // Teardown releases resources in reverse ownership order: channels, registered
 // memory, endpoint, then device metadata. The caller supplies peer network and
-// symmetric-memory metadata; opt-in progress logs use PTO_ROCE_VERBOSE=1.
+// symmetric-memory metadata. PTO_ROCE_VERBOSE controls optional progress logs;
+// all diagnostics use the unified host logger.
 class WorkspaceManager {
 public:
     WorkspaceManager() = default;
@@ -103,6 +103,9 @@ private:
         RdmaMemInfo* memory{nullptr};
         uint64_t stateDeviceBase{0};
     };
+
+    template <typename... Args>
+    void Log(Args&&... args) const;
 
     template <typename... Args>
     void Trace(Args&&... args) const;

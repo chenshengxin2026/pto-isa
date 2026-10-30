@@ -28,10 +28,11 @@ bool BuildChannelsPerPeer()
         std::vector<PeerRouteChoice> choices;
         if (!PeerRouteChoices(route, peer, choices)) {
             if (route == UrmaPeerRoute::Direct) {
-                std::cerr << "[URMA] peer=" << peer
-                          << " has no layer-0 direct link; set PTO_URMA_PEER_ROUTE=uplink to route this rank's "
-                             "queues over uplink ports, or use the SharedPool layout instead"
-                          << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA",
+                    "peer=" << peer
+                            << " has no layer-0 direct link; set PTO_URMA_PEER_ROUTE=uplink to route this rank's "
+                               "queues over uplink ports, or use the SharedPool layout instead");
             }
             return false;
         }
@@ -45,7 +46,7 @@ bool BuildChannelsPerPeer()
     HcclResult rc = HcclChannelAcquire(
         comm_, COMM_ENGINE_AIV, descs.data(), static_cast<uint32_t>(descs.size()), channelHandles_.data());
     if (rc != HCCL_SUCCESS) {
-        std::cerr << "[URMA] HcclChannelAcquire failed: " << static_cast<int>(rc) << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "HcclChannelAcquire failed: " << static_cast<int>(rc));
         return false;
     }
     return true;
@@ -62,8 +63,9 @@ bool BuildChannelsSharedPoolOnRails()
     if (netLayer_ == 0U) {
         return false;
     }
-    std::cerr << "[URMA] rank=" << rankId_ << " shared jetty did not come up on the layer-" << netLayer_
-              << " rail; retrying on the canonical direct port" << std::endl;
+    PTO_HOST_LOG_INFO(
+        "URMA", "rank=" << rankId_ << " shared jetty did not come up on the layer-" << netLayer_
+                        << " rail; retrying on the canonical direct port");
     railPeerLinks_.clear();
     sharedPeerOrder_.clear();
     if (!BuildCanonicalRailPlan()) {
@@ -95,7 +97,7 @@ bool AcquireJettiesOnPlan()
 bool BuildRailPlan()
 {
     if (rankCount_ <= 1) {
-        std::cerr << "[URMA] shared pool needs at least one peer, rankCount=" << rankCount_ << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "shared pool needs at least one peer, rankCount=" << rankCount_);
         return false;
     }
 
@@ -349,8 +351,9 @@ bool FillRailPeerLinks(const std::vector<RailPort>& rank0Rails, const std::vecto
         }
         PeerLink from0{};
         if (!PickPairedLink(0, rankId_, rank0Rails[slot].port, rank0Rails[slot].proto, pairLinks, from0)) {
-            std::cerr << "[URMA] rank=" << rankId_ << " has no paired link from rank 0 on rail[" << slot
-                      << "] proto=" << static_cast<int>(rank0Rails[slot].proto) << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "rank=" << rankId_ << " has no paired link from rank 0 on rail[" << slot
+                                << "] proto=" << static_cast<int>(rank0Rails[slot].proto));
             return false;
         }
         myPorts[slot] = from0.remoteEp;
@@ -364,8 +367,9 @@ bool FillRailPeerLinks(const std::vector<RailPort>& rank0Rails, const std::vecto
         for (uint32_t slot = 0; slot < railCount_; ++slot) {
             PeerLink link{};
             if (!PickPairedLink(rankId_, peer, myPorts[slot], rank0Rails[slot].proto, pairLinks, link)) {
-                std::cerr << "[URMA] rank=" << rankId_ << " rail[" << slot << "] has no paired link to peer=" << peer
-                          << " proto=" << static_cast<int>(rank0Rails[slot].proto) << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA", "rank=" << rankId_ << " rail[" << slot << "] has no paired link to peer=" << peer
+                                    << " proto=" << static_cast<int>(rank0Rails[slot].proto));
                 return false;
             }
             railPeerLinks_[slot].push_back(link);
@@ -380,8 +384,8 @@ bool CollectPeerLinks(uint32_t layer, uint32_t src, uint32_t dst, std::vector<Pe
     uint32_t linkNum = 0;
     CommLink* linkList = nullptr;
     if (HcclRankGraphGetLinks(comm_, layer, src, dst, &linkList, &linkNum) != HCCL_SUCCESS) {
-        std::cerr << "[URMA] HcclRankGraphGetLinks layer=" << layer << " src=" << src << " dst=" << dst << " failed"
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA", "HcclRankGraphGetLinks layer=" << layer << " src=" << src << " dst=" << dst << " failed");
         return false;
     }
     for (uint32_t i = 0; i < linkNum; ++i) {
@@ -392,7 +396,7 @@ bool CollectPeerLinks(uint32_t layer, uint32_t src, uint32_t dst, std::vector<Pe
         out.push_back(PeerLink{dst, proto, linkList[i].srcEndpointDesc, linkList[i].dstEndpointDesc});
     }
     if (out.empty()) {
-        std::cerr << "[URMA] rank=" << src << " no UB link to peer=" << dst << " on layer=" << layer << std::endl;
+        PTO_HOST_LOG_INFO("URMA", "rank=" << src << " no UB link to peer=" << dst << " on layer=" << layer);
         return false;
     }
     return true;
@@ -412,8 +416,8 @@ bool CollectUbLinks(uint32_t layer, uint32_t src, uint32_t dst, std::vector<Peer
     uint32_t linkNum = 0;
     CommLink* linkList = nullptr;
     if (HcclRankGraphGetLinks(comm_, layer, src, dst, &linkList, &linkNum) != HCCL_SUCCESS) {
-        std::cerr << "[URMA] HcclRankGraphGetLinks layer=" << layer << " src=" << src << " dst=" << dst << " failed"
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA", "HcclRankGraphGetLinks layer=" << layer << " src=" << src << " dst=" << dst << " failed");
         return false;
     }
     for (uint32_t i = 0; i < linkNum; ++i) {
@@ -441,7 +445,7 @@ bool ResolvePeerRoute(UrmaPeerRoute& route) const
         route = UrmaPeerRoute::Uplink;
         return true;
     }
-    std::cerr << "[URMA] PTO_URMA_PEER_ROUTE=" << env << " is not one of direct, mix, uplink" << std::endl;
+    PTO_HOST_LOG_ERROR("URMA", "PTO_URMA_PEER_ROUTE=" << env << " is not one of direct, mix, uplink");
     return false;
 }
 
@@ -556,11 +560,11 @@ bool PeerRouteChoices(UrmaPeerRoute route, uint32_t peer, std::vector<PeerRouteC
     }
 
     if (choices.empty()) {
-        std::cerr << "[URMA] PTO_URMA_PEER_ROUTE=" << (route == UrmaPeerRoute::Mix ? "mix" : "uplink")
-                  << " peer=" << peer
-                  << " has no usable port: the rank graph offers no layer>0 port that reaches it. Use "
-                     "PTO_URMA_PEER_ROUTE=direct, where each peer rides its own layer-0 port."
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA",
+            "PTO_URMA_PEER_ROUTE=" << (route == UrmaPeerRoute::Mix ? "mix" : "uplink") << " peer=" << peer
+                                   << " has no usable port: the rank graph offers no layer>0 port that reaches it. Use "
+                                      "PTO_URMA_PEER_ROUTE=direct, where each peer rides its own layer-0 port.");
         return false;
     }
     return true;
@@ -587,7 +591,7 @@ bool AcquireOneJetty(uint32_t jetty, const std::vector<PeerLink>& links)
 {
     const std::string tag = sharedTagPrefix_ + "_j" + std::to_string(jetty);
     if (tag.size() >= HCCL_CHANNEL_CONFIG_SHARED_QUEUE_TAG_MAX_LEN) {
-        std::cerr << "[URMA] shared queue tag too long: " << tag << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "shared queue tag too long: " << tag);
         return false;
     }
 
@@ -599,7 +603,7 @@ bool AcquireOneJetty(uint32_t jetty, const std::vector<PeerLink>& links)
     HcclChannelConfig config = nullptr;
     HcclResult rc = HcclChannelConfigCreate(&config);
     if (rc != HCCL_SUCCESS) {
-        std::cerr << "[URMA] HcclChannelConfigCreate failed: " << static_cast<int>(rc) << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "HcclChannelConfigCreate failed: " << static_cast<int>(rc));
         return false;
     }
     rc = HcclChannelConfigSetInt(config, HCCL_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE, 1U);
@@ -614,14 +618,17 @@ bool AcquireOneJetty(uint32_t jetty, const std::vector<PeerLink>& links)
     (void)HcclChannelConfigDestroy(config);
 
     if (rc != HCCL_SUCCESS) {
-        std::cerr << "[URMA] shared jetty acquire failed, tag=" << tag << " ret=" << static_cast<int>(rc)
-                  << (rc == HCCL_E_TIMEOUT ? " (HCCL_E_TIMEOUT: endpoint handshake did not match)" : "")
-                  << " rank=" << rankId_ << " nDesc=" << descs.size() << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA", "shared jetty acquire failed, tag="
+                        << tag << " ret=" << static_cast<int>(rc)
+                        << (rc == HCCL_E_TIMEOUT ? " (HCCL_E_TIMEOUT: endpoint handshake did not match)" : "")
+                        << " rank=" << rankId_ << " nDesc=" << descs.size());
         for (size_t i = 0; i < descs.size(); ++i) {
-            std::cerr << "[URMA]   desc[" << i << "] remoteRank=" << descs[i].remoteRank
-                      << " channelProtocol=" << static_cast<int>(descs[i].channelProtocol)
-                      << " localEp.protocol=" << static_cast<int>(descs[i].localEndpoint.protocol)
-                      << " remoteEp.protocol=" << static_cast<int>(descs[i].remoteEndpoint.protocol) << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "  desc[" << i << "] remoteRank=" << descs[i].remoteRank
+                                  << " channelProtocol=" << static_cast<int>(descs[i].channelProtocol)
+                                  << " localEp.protocol=" << static_cast<int>(descs[i].localEndpoint.protocol)
+                                  << " remoteEp.protocol=" << static_cast<int>(descs[i].remoteEndpoint.protocol));
         }
         return false;
     }
@@ -631,7 +638,7 @@ bool AcquireOneJetty(uint32_t jetty, const std::vector<PeerLink>& links)
 bool SelectUniformLocalEndpoint(std::vector<PeerLink>& links) const
 {
     if (rankCount_ <= 1) {
-        std::cerr << "[URMA] shared pool needs at least one peer, rankCount=" << rankCount_ << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "shared pool needs at least one peer, rankCount=" << rankCount_);
         return false;
     }
 
@@ -656,11 +663,13 @@ bool SelectUniformLocalEndpoint(std::vector<PeerLink>& links) const
         }
 
         if (!IsSameLocalEndpoint(myCanonical, link.localEp) || !IsSameLocalEndpoint(peerCanonical, link.remoteEp)) {
-            std::cerr << "[URMA] rank=" << rankId_ << " shared pool cannot reach peer=" << peer
-                      << ": the rank graph routes it over a different physical port than this rank's canonical one, so "
-                         "no single shared jetty covers every peer. Use the PER_PEER layout, where each peer gets its "
-                         "own non-shared jetty on its own port."
-                      << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA",
+                "rank="
+                    << rankId_ << " shared pool cannot reach peer=" << peer
+                    << ": the rank graph routes it over a different physical port than this rank's canonical one, so "
+                       "no single shared jetty covers every peer. Use the PER_PEER layout, where each peer gets its "
+                       "own non-shared jetty on its own port.");
             return false;
         }
         links.push_back(link);

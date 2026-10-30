@@ -13,6 +13,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include <pto/common/arch_macro.hpp>
 #include <pto/npu/a6/TSync.hpp>
+#include <pto/common/syncall_soft.hpp>
 
 namespace pto {
 
@@ -49,12 +50,13 @@ PTO_INTERNAL void SYNCALL_IMPL()
     }
 
 #if defined(PTO_COMPILE_CUBE)
+    // A6 pairs one AIC with a single AIV, so the subblock-1 channel that A5 uses
+    // (flag id + SYNC_FLAG_ID_MAX) has no core on the other end: waiting on it would
+    // hang and setting it would leave a credit that releases the next barrier early.
     wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
-    wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
     ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
     wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
     set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
-    set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
 #elif defined(PTO_COMPILE_VEC)
     set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
     wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);

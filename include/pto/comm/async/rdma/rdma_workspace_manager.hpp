@@ -19,10 +19,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #endif
 
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <vector>
 
+#include "pto/comm/logger/host_log.hpp"
 #include "pto/comm/rdma_backend.hpp"
 #ifdef PTO_RDMA_BACKEND_HNS_1825_SUPPORTED
 #include "pto/comm/async/rdma/backends/hns_1825/hns_1825_arch.hpp"
@@ -92,9 +92,10 @@ public:
             case RdmaBackend::HNS_1825: {
                 const hns_1825::ArchitectureProbe arch = hns_1825::ProbeArchitecture();
                 if (!arch.supported) {
-                    std::cerr << "[RDMA] the compiled HNS_1825 backend is only supported on A5; "
-                                 "current architecture is "
-                              << hns_1825::DescribeArchitecture(arch) << std::endl;
+                    PTO_HOST_LOG_ERROR(
+                        "RDMA", "[RDMA] the compiled HNS_1825 backend is only supported on A5; "
+                                "current architecture is "
+                                    << hns_1825::DescribeArchitecture(arch));
                     return WorkspaceInitResult::ERROR;
                 }
             }

@@ -12,32 +12,45 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #define TCVT_FP4_LUT_CASES_H_
 
 // name, source rows/columns, destination rows/columns, valid rows/columns,
-// NZ destination, compact Normal, dynamic valid extents.
-#define FP4_LUT_CASES(M)                                                \
-    M(MainND, 32, 512, 32, 512, 32, 512, false, false, false)           \
-    M(MainNZ, 32, 512, 32, 512, 32, 512, true, false, false)            \
-    M(MinimumND, 1, 64, 1, 64, 1, 64, false, false, false)              \
-    M(MinimumNZ, 1, 64, 16, 64, 1, 64, true, false, false)              \
-    M(SingleNibbleND, 1, 64, 1, 96, 1, 1, false, false, true)           \
-    M(SingleNibbleNZ, 1, 64, 32, 96, 1, 1, true, true, true)            \
-    M(StridedStaticND, 5, 640, 7, 704, 3, 579, false, false, false)     \
-    M(StridedDynamicND, 5, 640, 7, 704, 3, 579, false, false, true)     \
-    M(StridedStaticNZ, 5, 640, 32, 704, 3, 579, true, false, false)     \
-    M(StridedDynamicNZ, 5, 640, 32, 704, 3, 579, true, false, true)     \
-    M(CompactStaticNZ, 5, 640, 32, 704, 3, 579, true, true, false)      \
-    M(CompactDynamicNZ, 5, 640, 32, 704, 3, 579, true, true, true)      \
-    M(RectangularNZ, 19, 128, 48, 192, 17, 93, true, false, false)      \
-    M(RectangularCompactNZ, 19, 128, 48, 192, 17, 93, true, true, true) \
-    M(WideND, 3, 1088, 5, 1152, 2, 1025, false, false, false)           \
-    M(WideNZ, 3, 1088, 32, 1152, 2, 1025, true, false, false)           \
-    M(SecondRegisterTailND, 2, 512, 4, 544, 1, 257, false, false, true) \
-    M(SecondRegisterTailNZ, 2, 512, 32, 544, 1, 257, true, false, true) \
-    M(Bulk64ND, 20, 128, 32, 192, 20, 128, false, false, true)          \
-    M(Bulk64NZ, 20, 128, 32, 192, 20, 128, true, false, true)           \
-    M(Bulk64CompactNZ, 20, 128, 32, 192, 20, 128, true, true, true)     \
-    M(Bulk128ND, 20, 256, 32, 320, 20, 256, false, false, true)         \
-    M(Bulk128NZ, 20, 256, 32, 320, 20, 256, true, false, true)          \
-    M(Bulk128CompactNZ, 20, 256, 32, 320, 20, 256, true, true, true)
+// NZ destination, compact mode (0 Null, 1 Normal, 2 RowPlusOne), dynamic valid extents.
+#define FP4_LUT_CASES(M)                                                  \
+    M(MainND, 32, 512, 32, 512, 32, 512, false, 0, false)                 \
+    M(MainNZ, 32, 512, 32, 512, 32, 512, true, 0, false)                  \
+    M(MinimumND, 1, 64, 1, 64, 1, 64, false, 0, false)                    \
+    M(MinimumNZ, 1, 64, 16, 64, 1, 64, true, 0, false)                    \
+    M(SingleNibbleND, 1, 64, 1, 96, 1, 1, false, 0, true)                 \
+    M(SingleNibbleNZ, 1, 64, 32, 96, 1, 1, true, 1, true)                 \
+    M(StridedStaticND, 5, 640, 7, 704, 3, 579, false, 0, false)           \
+    M(StridedDynamicND, 5, 640, 7, 704, 3, 579, false, 0, true)           \
+    M(StridedStaticNZ, 5, 640, 32, 704, 3, 579, true, 0, false)           \
+    M(StridedDynamicNZ, 5, 640, 32, 704, 3, 579, true, 0, true)           \
+    M(CompactStaticNZ, 5, 640, 32, 704, 3, 579, true, 1, false)           \
+    M(CompactDynamicNZ, 5, 640, 32, 704, 3, 579, true, 1, true)           \
+    M(RectangularNZ, 19, 128, 48, 192, 17, 93, true, 0, false)            \
+    M(RectangularCompactNZ, 19, 128, 48, 192, 17, 93, true, 1, true)      \
+    M(WideND, 3, 1088, 5, 1152, 2, 1025, false, 0, false)                 \
+    M(WideNZ, 3, 1088, 32, 1152, 2, 1025, true, 0, false)                 \
+    M(SecondRegisterTailND, 2, 512, 4, 544, 1, 257, false, 0, true)       \
+    M(SecondRegisterTailNZ, 2, 512, 32, 544, 1, 257, true, 0, true)       \
+    M(Bulk64ND, 20, 128, 32, 192, 20, 128, false, 0, true)                \
+    M(Bulk64NZ, 20, 128, 32, 192, 20, 128, true, 0, true)                 \
+    M(Bulk64CompactNZ, 20, 128, 32, 192, 20, 128, true, 1, true)          \
+    M(Bulk128ND, 20, 256, 32, 320, 20, 256, false, 0, true)               \
+    M(Bulk128NZ, 20, 256, 32, 320, 20, 256, true, 0, true)                \
+    M(Bulk128CompactNZ, 20, 256, 32, 320, 20, 256, true, 1, true)         \
+    M(RowPlusOneFull, 128, 256, 128, 256, 128, 256, true, 2, false)       \
+    M(RowPlusOneDynamicFull, 128, 256, 128, 256, 128, 256, true, 2, true) \
+    M(RowPlusOneLegacyPadded, 32, 128, 33, 128, 32, 128, true, 2, false)  \
+    M(RowPlusOneTail, 5, 640, 31, 704, 3, 579, true, 2, true)             \
+    M(RowPlusOneMinimum, 1, 64, 16, 96, 1, 1, true, 2, true)              \
+    M(RowPlusOneBulk64, 20, 128, 32, 192, 19, 128, true, 2, true)         \
+    M(RowPlusOneBulk128, 20, 256, 32, 320, 19, 256, true, 2, true)        \
+    M(RowPlusOneRegisterTail, 2, 512, 32, 544, 1, 257, true, 2, true)
+
+constexpr int kFp4LutStoreSourceRows = 19;
+constexpr int kFp4LutStoreColumns = 128;
+constexpr int kFp4LutStoreRows = 32;
+constexpr int kFp4LutStorePanelColumns = 32;
 
 struct Fp4LutCase {
     const char* name;
@@ -48,7 +61,7 @@ struct Fp4LutCase {
     int validRows;
     int validCols;
     bool nz;
-    bool compact;
+    int compact;
     bool dynamic;
 };
 
@@ -67,5 +80,6 @@ void launchFp4Lut(
     int caseId, unsigned char* dst, unsigned char* src, int rows, int cols, int round, int api, void* stream);
 void launchFp4LutRegression(int pair, unsigned char* dst, unsigned char* src, void* stream);
 void launchFp4LutBulkPrimitive(unsigned char* dst, unsigned char* src, int sourceOffset, bool rotation, void* stream);
+void launchFp4LutStore(unsigned char* dst, unsigned char* src, int compactMode, void* stream);
 
 #endif

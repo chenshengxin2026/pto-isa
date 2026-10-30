@@ -72,17 +72,27 @@ PTO_INST RecordEvent TCVT(TileDataD &dst, TileDataS &src, TmpTileData &tmp, Roun
       E4M3 的 `0x7f`/`0xff` 解码为 NaN，E5M2 区分无穷大与 NaN。
       E8M0 转换及单参数 MXType 编码构造函数保持不变。
 - **A5 FP4 E2M1 到 FP8 E4M3**:
-  - 直接转换 `float4_e2m1x2_t -> float8_e4m3_t` 仅在 A5 支持。所有 `RoundMode` 及两种饱和模式均精确
+  - A5 上的直接转换 `float4_e2m1x2_t -> float8_e4m3_t` 在所有 `RoundMode` 及两种饱和模式下均精确
     保留数值（包括负零）；带临时 Tile 的重载行为相同，且不使用临时存储。
   - 源为 `Vec`、RowMajor/NoneBox、`CompactMode::Null`；物理逻辑列数至少为 64，且为 64 的倍数。
     FP4 的列数及有效列数按 nibble 计数，每个物理行占 `Cols / 2` 字节。
-  - 目标为 `Vec` ND（RowMajor/NoneBox、Null）或标准 512 字节 NZ（ColMajor/RowMajor 分形、Null 或 Normal）。
+  - 目标为 `Vec` ND（RowMajor/NoneBox、Null）或标准 512 字节 NZ（ColMajor/RowMajor 分形、Null、Normal 或 RowPlusOne）。
     源和目标的有效行数及逻辑有效列数必须相同，支持部分及动态有效区；两者物理尺寸可不同。无效输出字节保持原值。
-  - NZ 物理行数须为 16 的倍数。逻辑坐标 `(r,c)` 的字节偏移为
+  - Null 和 Normal 要求 NZ 物理行数为 16 的倍数；RowPlusOne 还接受旧声明
+    `Rows = ceil(ValidRow / 16) * 16 + 1`。逻辑坐标 `(r,c)` 的字节偏移为
     `(c / 32) * panelRows * 32 + r * 32 + c % 32`；Null 使用物理 `Rows`，Normal 使用
-    `ceil(validRows / 16) * 16`，与 Vec 到 Mat 的 NZ 传输一致。`RowPlusOne` 会得到不支持的编译诊断。
+    `ceil(validRows / 16) * 16`；RowPlusOne 使用 `ceil(validRows / 16) * 16 + 1`。
+    既有 Vec 到 Mat 的 `TINSERT`/`TPUSH` 传输及 `TSTORE` NZ 输出会去掉每个 panel 间的一行 padding。
+    compact 输出的消费方必须保留生产时的 `validRows`；修改该值后需要重新生成输出，因为 panel 步长取决于该值。
+  - RowPlusOne 保持逻辑 `Rows`、`Cols`、`Numel` 不变。对于 16 对齐的 RowPlusOne `Rows`，
+    标准 Vec NZ Tile 提供 `StorageNumel = (Rows + 1) * Cols` 和 `StorageBytes`；已含额外行的静态旧声明使用
+    `Rows * Cols`，动态有效形状保留最大包络。自动分配使用该容量；显式 `TASSIGN` 调用方必须预留至少
+    `StorageBytes`，裸地址无法表示底层容量。例如逻辑 `128 x 256` FP8 Tile 需要 33024 字节，
+    `Rows=33, ValidRow=32, Cols=128` 则需要 4224 字节。TCVT 在编译期拒绝超出 16 位 panel pitch
+    或有符号 32 位字节偏移的类型。
   - 此类型对通过寄存器字节 LUT 直接写入 ND/NZ，不分配显式 UB 表、索引 Tile 或 ND 中间 Tile。
-    本扩展不为 A2/A3 或 CPU_SIM 增加 FP4 到 FP8 的实现。
+    该精确转换及原生 compact 输出扩展仅适用于 A5，A2/A3 支持范围不变。
+    CPU_SIM 保留既有标量转换及基于物理 `Rows` 的寻址；本契约不保证 CPU/原生原始布局一致或 CPU 负零保留。
 - **临时Tile**:
   - **CPU_SIM**：两个带 `tmp` 的重载与各自对应的不带 `tmp` 重载结果一致。CPU_SIM 为保持源码兼容而接受
     `tmp`，但不会调用 `tmp.data()` 或访问其存储。跨后端 kernel 仍须按照目标 NPU 后端的要求声明并分配

@@ -28,18 +28,18 @@ PTO_INTERNAL T makeTile(unsigned rows, unsigned cols)
     }
 }
 
-template <int SR, int SC, int DR, int DC, int VR, int VC, bool NZ, bool Compact, bool Dynamic>
+template <int SR, int SC, int DR, int DC, int VR, int VC, bool NZ, int Compact, bool Dynamic>
 __global__ AICORE void runFp4Lut(
     __gm__ uint8_t* dst, __gm__ uint8_t* src, unsigned rows, unsigned cols, int round, int api)
 {
     constexpr int srcBytes = SR * SC / 2;
-    constexpr int dstBytes = DR * DC + 2 * kGuardBytes;
     using Source =
         Tile<TileType::Vec, float4_e2m1x2_t, SR, SC, BLayout::RowMajor, Dynamic ? DYNAMIC : VR, Dynamic ? DYNAMIC : VC>;
     using Destination = Tile<
         TileType::Vec, float8_e4m3_t, DR, DC, NZ ? BLayout::ColMajor : BLayout::RowMajor, Dynamic ? DYNAMIC : VR,
         Dynamic ? DYNAMIC : VC, NZ ? SLayout::RowMajor : SLayout::NoneBox, TileConfig::fractalABSize, PadValue::Null,
-        Compact ? CompactMode::Normal : CompactMode::Null>;
+        Compact == 2 ? CompactMode::RowPlusOne : (Compact == 1 ? CompactMode::Normal : CompactMode::Null)>;
+    constexpr int dstBytes = Destination::StorageBytes + 2 * kGuardBytes;
     auto source = makeTile<Source, Dynamic>(rows, cols);
     auto destination = makeTile<Destination, Dynamic>(rows, cols);
     Tile<TileType::Vec, uint8_t, 1, srcBytes> rawInput;
@@ -143,6 +143,62 @@ __global__ AICORE void runBulkPrimitive(__gm__ uint8_t* dst, __gm__ uint8_t* src
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(output, rawOutput);
 }
+template <CompactMode compactMode>
+__global__ AICORE void runFp4LutStore(__gm__ uint8_t* dst, __gm__ uint8_t* src)
+{
+    constexpr int sourceRows = kFp4LutStoreSourceRows;
+    constexpr int columns = kFp4LutStoreColumns;
+    constexpr int storeRows = kFp4LutStoreRows;
+    constexpr int panelColumns = kFp4LutStorePanelColumns;
+    constexpr int sourceBytes = sourceRows * columns / 2;
+    using Source = Tile<TileType::Vec, float4_e2m1x2_t, sourceRows, columns, BLayout::RowMajor, sourceRows, columns>;
+    using CompactTile = Tile<
+        TileType::Vec, float8_e4m3_t, 64, columns, BLayout::ColMajor, DYNAMIC, columns, SLayout::RowMajor,
+        TileConfig::fractalABSize, PadValue::Null, compactMode>;
+    using OutShape = Shape<1, columns / panelColumns, storeRows / FRACTAL_NZ_ROW, FRACTAL_NZ_ROW, panelColumns>;
+    using OutStride =
+        pto::Stride<columns * storeRows, storeRows * panelColumns, FRACTAL_NZ_ROW * panelColumns, panelColumns, 1>;
+    using OutGlobal = GlobalTensor<float8_e4m3_t, OutShape, OutStride, Layout::NZ>;
+
+    static_assert(compactMode == CompactMode::Normal || compactMode == CompactMode::RowPlusOne);
+    constexpr int storageRows = compactMode == CompactMode::RowPlusOne ? 65 : 64;
+    static_assert(storeRows == (sourceRows + FRACTAL_NZ_ROW - 1) / FRACTAL_NZ_ROW * FRACTAL_NZ_ROW);
+    static_assert(CompactTile::StorageBytes == storageRows * columns && CompactTile::Rows == 64);
+
+    Source source;
+    CompactTile compact(sourceRows);
+    TASSIGN(source, 0x0);
+    TASSIGN(compact, 0x10000);
+    OutGlobal output(reinterpret_cast<__gm__ float8_e4m3_t*>(dst + kGuardBytes));
+
+    constexpr uint16_t sourceBurstLen = sourceBytes / BLOCK_BYTE_SIZE;
+    copy_gm_to_ubuf((__ubuf__ void*)source.data(), (__gm__ void*)src, 0, 1, sourceBurstLen, 0, 0);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    __ubuf__ uint8_t* compactPtr = (__ubuf__ uint8_t*)compact.data();
+    constexpr uint32_t elementsPerRepeat = CCE_VL / sizeof(uint8_t);
+    constexpr uint16_t fillRepeats = (CompactTile::StorageBytes + elementsPerRepeat - 1) / elementsPerRepeat;
+    __VEC_SCOPE__
+    {
+        RegTensor<uint8_t> fill;
+        for (uint16_t repeat = 0; repeat < fillRepeats; ++repeat) {
+            uint32_t offset = repeat * elementsPerRepeat;
+            uint32_t remaining = CompactTile::StorageBytes - offset;
+            uint32_t count = remaining < elementsPerRepeat ? remaining : elementsPerRepeat;
+            MaskReg mask = CreatePredicate<uint8_t>(count);
+            vdup(fill, static_cast<uint8_t>(0x7f), mask, MODE_ZEROING);
+            vsts(fill, compactPtr, offset, NORM_B8, mask);
+        }
+    }
+
+    TCVT(compact, source, RoundMode::CAST_RINT);
+    // Preserve the producer pitch while exposing the complete aligned region.
+    compact.SetValidRow(storeRows);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(output, compact);
+}
 } // namespace
 
 void launchFp4Lut(
@@ -171,4 +227,13 @@ void launchFp4LutRegression(int pair, unsigned char* dst, unsigned char* src, vo
 void launchFp4LutBulkPrimitive(unsigned char* dst, unsigned char* src, int sourceOffset, bool rotation, void* stream)
 {
     runBulkPrimitive<<<1, nullptr, stream>>>(dst, src, sourceOffset, rotation);
+}
+
+void launchFp4LutStore(unsigned char* dst, unsigned char* src, int compactMode, void* stream)
+{
+    if (compactMode == 1) {
+        runFp4LutStore<CompactMode::Normal><<<1, nullptr, stream>>>(dst, src);
+    } else if (compactMode == 2) {
+        runFp4LutStore<CompactMode::RowPlusOne><<<1, nullptr, stream>>>(dst, src);
+    }
 }
