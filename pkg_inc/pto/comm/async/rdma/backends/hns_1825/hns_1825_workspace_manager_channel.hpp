@@ -25,7 +25,7 @@ inline bool WorkspaceManager::CreateEndpoint()
     EndpointDesc description{};
     HcommResult result = EndpointDescInit(&description, 1);
     if (result != 0) {
-        std::cerr << "[RoCE] EndpointDescInit failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] EndpointDescInit failed: " << result);
         return false;
     }
     // HCOMM initializes unspecified descriptor bytes to 0xFF. Replace those
@@ -34,20 +34,21 @@ inline bool WorkspaceManager::CreateEndpoint()
     description.protocol = COMM_PROTOCOL_ROCE;
     description.commAddr.type = COMM_ADDR_TYPE_IP_V4;
     if (inet_pton(AF_INET, localIp_.c_str(), &description.commAddr.addr) != 1) {
-        std::cerr << "[RoCE] invalid local ip: " << localIp_ << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] invalid local ip: " << localIp_);
         return false;
     }
     description.loc.locType = ENDPOINT_LOC_TYPE_HOST;
     description.loc.device.devPhyId = phyId_;
     result = HcommEndpointCreate(&description, &endpoint_);
     if (result != 0 || endpoint_ == nullptr) {
-        std::cerr << "[RoCE] HcommEndpointCreate failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommEndpointCreate failed: " << result);
         return false;
     }
     Trace("CREATE endpoint handle=", endpoint_, " phyId=", phyId_, " ip=", localIp_);
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] (1/4) endpoint created (ROCE, phyId=" << phyId_
-                  << ", ip=" << localIp_ << ")" << std::endl;
+        PTO_HOST_LOG_INFO(
+            "RDMA", "[RoCE][rank " << rankId_ << "] (1/4) endpoint created (ROCE, phyId=" << phyId_
+                                   << ", ip=" << localIp_ << ")");
     }
     return true;
 }
@@ -60,23 +61,22 @@ inline bool WorkspaceManager::RegisterMemory()
     memory.size = symmetricSize_;
     const HcommResult result = HcommMemReg(endpoint_, "PtoRoceBuffer", &memory, &memHandle_);
     if (result != 0 || memHandle_ == nullptr) {
-        std::cerr << "[RoCE] HcommMemReg failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommMemReg failed: " << result);
         return false;
     }
     Trace("CREATE mem-reg handle=", memHandle_, " addr=", symmetricAddr_, " size=", symmetricSize_);
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] (2/4) MR registered: addr=0x" << std::hex
-                  << reinterpret_cast<uint64_t>(symmetricAddr_) << std::dec << " size=" << symmetricSize_ << std::endl;
+        PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] (2/4) MR registered: size=" << symmetricSize_);
     }
     const uint64_t notifyBytes = static_cast<uint64_t>(rankCount_) * qpNum_ * kNotifyOperandSlots * sizeof(int32_t);
     if (aclrtMalloc(&notifyOperands_, notifyBytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
-        std::cerr << "[RoCE] notify operand allocation failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] notify operand allocation failed");
         return false;
     }
     memory.addr = notifyOperands_;
     memory.size = notifyBytes;
     if (HcommMemReg(endpoint_, "PtoRoceNotify", &memory, &notifyMemHandle_) != 0 || notifyMemHandle_ == nullptr) {
-        std::cerr << "[RoCE] notify operand registration failed" << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] notify operand registration failed");
         return false;
     }
     return true;
@@ -86,7 +86,7 @@ inline bool WorkspaceManager::InitializeChannelDescriptions(std::vector<HcommCha
 {
     const HcommResult result = HcommChannelDescInit(descriptions.data(), static_cast<uint32_t>(descriptions.size()));
     if (result != 0) {
-        std::cerr << "[RoCE] HcommChannelDescInit failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommChannelDescInit failed: " << result);
         return false;
     }
     for (HcommChannelDesc& description : descriptions) {
@@ -102,7 +102,7 @@ inline bool WorkspaceManager::ConfigureChannelDescription(
     description.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     description.remoteEndpoint.commAddr.type = COMM_ADDR_TYPE_IP_V4;
     if (inet_pton(AF_INET, peerIps_[remoteRank].c_str(), &description.remoteEndpoint.commAddr.addr) != 1) {
-        std::cerr << "[RoCE] invalid peer ip[" << remoteRank << "]: " << peerIps_[remoteRank] << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] invalid peer ip[" << remoteRank << "]: " << peerIps_[remoteRank]);
         return false;
     }
     description.remoteEndpoint.loc.locType = ENDPOINT_LOC_TYPE_HOST;
@@ -132,12 +132,13 @@ inline bool WorkspaceManager::ConfigureChannelDescription(
     description.port = static_cast<uint16_t>(
         basePort_ + (serverRank % kMaxRanksPerNic) * kMaxRanksPerNic + (clientRank % kMaxRanksPerNic));
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "]   channel[" << channelIndex << "] -> peer " << remoteRank
-                  << " ip=" << peerIps_[remoteRank] << " role=" << (isServer ? "SERVER" : "CLIENT")
-                  << " phyId=" << peerPhyIds_[remoteRank] << " port=" << description.port
-                  << " tc=" << static_cast<int>(tc) << " sl=" << static_cast<int>(sl)
-                  << " retryCnt=" << description.roceAttr.retryCnt
-                  << " retryIntervalMs=" << description.roceAttr.retryInterval << std::endl;
+        PTO_HOST_LOG_INFO(
+            "RDMA", "[RoCE][rank " << rankId_ << "]   channel[" << channelIndex << "] -> peer " << remoteRank
+                                   << " ip=" << peerIps_[remoteRank] << " role=" << (isServer ? "SERVER" : "CLIENT")
+                                   << " phyId=" << peerPhyIds_[remoteRank] << " port=" << description.port
+                                   << " tc=" << static_cast<int>(tc) << " sl=" << static_cast<int>(sl)
+                                   << " retryCnt=" << description.roceAttr.retryCnt
+                                   << " retryIntervalMs=" << description.roceAttr.retryInterval);
     }
     return true;
 }
@@ -170,19 +171,20 @@ inline bool WorkspaceManager::CreateAndValidateChannels(std::vector<HcommChannel
     const uint32_t channelNum = static_cast<uint32_t>(descriptions.size());
     channelHandles_.assign(channelNum, 0);
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] (3/4) HcommChannelCreate: " << channelNum
-                  << " channel(s), waiting for QP handshake ..." << std::endl;
+        PTO_HOST_LOG_INFO(
+            "RDMA", "[RoCE][rank " << rankId_ << "] (3/4) HcommChannelCreate: " << channelNum
+                                   << " channel(s), waiting for QP handshake ...");
     }
     const HcommResult result = HcommChannelCreate(
         endpoint_, COMM_ENGINE_AIV, descriptions.data(), channelNum,
         reinterpret_cast<ChannelHandle*>(channelHandles_.data()));
     if (result != 0) {
-        std::cerr << "[RoCE] HcommChannelCreate failed: " << result << std::endl;
+        PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommChannelCreate failed: " << result);
         return false;
     }
     for (uint32_t index = 0; index < channelNum; ++index) {
         if (channelHandles_[index] == 0) {
-            std::cerr << "[RoCE] HcommChannelCreate returned a null handle at index " << index << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommChannelCreate returned a null handle at index " << index);
             return false;
         }
         Trace(
@@ -193,7 +195,7 @@ inline bool WorkspaceManager::CreateAndValidateChannels(std::vector<HcommChannel
         return false;
     }
     if (Verbose()) {
-        std::cerr << "[RoCE][rank " << rankId_ << "] (3/4) all channels READY" << std::endl;
+        PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] (3/4) all channels READY");
     }
     return true;
 }
@@ -227,7 +229,7 @@ inline bool WorkspaceManager::WaitChannelsReady()
     while (elapsedMs <= pollTimeoutMs) {
         const HcommResult result = HcommChannelGetStatus(channelHandles_.data(), channelNum, statuses.data());
         if (result != 0) {
-            std::cerr << "[RoCE] HcommChannelGetStatus failed: " << result << std::endl;
+            PTO_HOST_LOG_ERROR("RDMA", "[RoCE] HcommChannelGetStatus failed: " << result);
             return false;
         }
         bool allReady = true;
@@ -243,20 +245,21 @@ inline bool WorkspaceManager::WaitChannelsReady()
             const char* reason = status == kChannelFailed  ? "failed" :
                                  status == kChannelTimeout ? "timed out" :
                                                              "returned an unknown status";
-            std::cerr << "[RoCE] channel " << index << " (peer " << channelPeer_[index] << ") " << reason << ": "
-                      << status << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "RDMA",
+                "[RoCE] channel " << index << " (peer " << channelPeer_[index] << ") " << reason << ": " << status);
             return false;
         }
         if (allReady) {
             if (Verbose()) {
-                std::cerr << "[RoCE][rank " << rankId_ << "] channels READY after " << elapsedMs << " ms" << std::endl;
+                PTO_HOST_LOG_INFO("RDMA", "[RoCE][rank " << rankId_ << "] channels READY after " << elapsedMs << " ms");
             }
             return true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
         elapsedMs += pollIntervalMs;
     }
-    std::cerr << "[RoCE] wait channel READY timed out after " << elapsedMs << " ms" << std::endl;
+    PTO_HOST_LOG_ERROR("RDMA", "[RoCE] wait channel READY timed out after " << elapsedMs << " ms");
     return false;
 }
 
@@ -270,13 +273,15 @@ inline uint8_t WorkspaceManager::GetEnvU8(
     char* end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     if (end == value || *end != '\0' || parsed < 0 || parsed > maximumValue) {
-        std::cerr << "[RoCE] env " << name << "='" << value << "' invalid (expect 0.." << maximumValue
-                  << "); using default " << static_cast<int>(defaultValue) << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] env " << name << "='" << value << "' invalid (expect 0.." << maximumValue
+                                  << "); using default " << static_cast<int>(defaultValue));
         return defaultValue;
     }
     if (requireMultipleOf4 && parsed % 4 != 0) {
-        std::cerr << "[RoCE] env " << name << "=" << parsed << " must be a multiple of 4; using default "
-                  << static_cast<int>(defaultValue) << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "RDMA", "[RoCE] env " << name << "=" << parsed << " must be a multiple of 4; using default "
+                                  << static_cast<int>(defaultValue));
         return defaultValue;
     }
     return static_cast<uint8_t>(parsed);

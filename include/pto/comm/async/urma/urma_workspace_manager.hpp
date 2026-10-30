@@ -19,7 +19,6 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <limits>
 #include <string>
 #include <utility>
@@ -36,6 +35,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "pto/comm/async/urma/urma_types.hpp"
 #include "pto/comm/async/urma/urma_hccl_defs.hpp"
 #include "pto/comm/async/urma/urma_channel_helper.hpp"
+#include "pto/comm/logger/host_log.hpp"
 
 namespace pto {
 namespace comm {
@@ -90,13 +90,15 @@ public:
             return true;
         }
         if (rankCount < 2U || rankId >= rankCount) {
-            std::cerr << "[URMA] rankId=" << rankId << " rankCount=" << rankCount
-                      << " is not a usable group; need rankCount >= 2 and rankId < rankCount" << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "rankId=" << rankId << " rankCount=" << rankCount
+                                  << " is not a usable group; need rankCount >= 2 and rankId < rankCount");
             return false;
         }
         if (symmetricAddr == nullptr || symmetricSize == 0U) {
-            std::cerr << "[URMA] symmetric memory must be a non-empty device region, addr=" << symmetricAddr
-                      << " size=" << symmetricSize << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "symmetric memory must be a non-empty device region, addr=" << symmetricAddr
+                                                                                    << " size=" << symmetricSize);
             return false;
         }
 
@@ -197,35 +199,39 @@ private:
             if (resolvedAivCount == kUrmaAutoAivCount) {
                 resolvedAivCount = QueryDeviceAivCount();
                 if (resolvedAivCount == 0U) {
-                    std::cerr << "[URMA] cannot query the device AIV count; pass aivCount explicitly" << std::endl;
+                    PTO_HOST_LOG_ERROR("URMA", "cannot query the device AIV count; pass aivCount explicitly");
                     return false;
                 }
             } else if (resolvedAivCount == 0U) {
-                std::cerr << "[URMA] aivCount=0 is not a PerPeer size; omit it for the device AIV count or pass N >= 1"
-                          << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA", "aivCount=0 is not a PerPeer size; omit it for the device AIV count or pass N >= 1");
                 return false;
             }
             if (jettiesPerCore > kUrmaMaxJettiesPerCore) {
-                std::cerr << "[URMA] jettiesPerCore=" << jettiesPerCore << " must be in [1, " << kUrmaMaxJettiesPerCore
-                          << "] or " << kUrmaAutoJettiesPerCore << " for one queue per AIV per peer" << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA", "jettiesPerCore=" << jettiesPerCore << " must be in [1, " << kUrmaMaxJettiesPerCore
+                                              << "] or " << kUrmaAutoJettiesPerCore
+                                              << " for one queue per AIV per peer");
                 return false;
             }
             resolvedJettiesPerCore = (jettiesPerCore == kUrmaAutoJettiesPerCore) ? 1U : jettiesPerCore;
             if (resolvedAivCount > std::numeric_limits<uint32_t>::max() / resolvedJettiesPerCore) {
-                std::cerr << "[URMA] aivCount=" << resolvedAivCount << " * jettiesPerCore=" << resolvedJettiesPerCore
-                          << " overflows the per-peer queue count" << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA", "aivCount=" << resolvedAivCount << " * jettiesPerCore=" << resolvedJettiesPerCore
+                                        << " overflows the per-peer queue count");
                 return false;
             }
             resolvedRowsPerPeer = resolvedAivCount * resolvedJettiesPerCore;
             if (resolvedRowsPerPeer == 0U || resolvedRowsPerPeer > kUrmaMaxRowsPerPeer) {
-                std::cerr << "[URMA] PerPeer queues per peer=" << resolvedRowsPerPeer << " must be in [1, "
-                          << kUrmaMaxRowsPerPeer << "]" << std::endl;
+                PTO_HOST_LOG_ERROR(
+                    "URMA", "PerPeer queues per peer=" << resolvedRowsPerPeer << " must be in [1, "
+                                                       << kUrmaMaxRowsPerPeer << "]");
                 return false;
             }
             return true;
         }
         if (layout != UrmaLayout::SHARED_POOL) {
-            std::cerr << "[URMA] unknown layout " << static_cast<uint32_t>(layout) << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "unknown layout " << static_cast<uint32_t>(layout));
             return false;
         }
 
@@ -233,32 +239,34 @@ private:
         if (resolvedAivCount == kUrmaAutoAivCount) {
             resolvedAivCount = QueryDeviceAivCount();
             if (resolvedAivCount == 0U) {
-                std::cerr << "[URMA] cannot query the device AIV count; pass aivCount explicitly" << std::endl;
+                PTO_HOST_LOG_ERROR("URMA", "cannot query the device AIV count; pass aivCount explicitly");
                 return false;
             }
         } else if (resolvedAivCount == 0U) {
-            std::cerr << "[URMA] aivCount=0 is not a SharedPool size; omit it for the device AIV "
-                         "count, pass N >= 1, or use UrmaLayout::PER_PEER"
-                      << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "aivCount=0 is not a SharedPool size; omit it for the device AIV "
+                        "count, pass N >= 1, or use UrmaLayout::PER_PEER");
             return false;
         }
         if (jettiesPerCore > kUrmaMaxJettiesPerCore) {
-            std::cerr << "[URMA] jettiesPerCore=" << jettiesPerCore << " must be in [1, " << kUrmaMaxJettiesPerCore
-                      << "] or " << kUrmaAutoJettiesPerCore << " to take the rail count" << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "jettiesPerCore=" << jettiesPerCore << " must be in [1, " << kUrmaMaxJettiesPerCore << "] or "
+                                          << kUrmaAutoJettiesPerCore << " to take the rail count");
             return false;
         }
         if (jettiesPerCore == kUrmaAutoJettiesPerCore && railCount_ > kUrmaMaxJettiesPerCore) {
-            std::cerr << "[URMA] rail plan found " << railCount_ << " ports but a core may own at most "
-                      << kUrmaMaxJettiesPerCore
-                      << " jetties; pass jettiesPerCore explicitly or raise kUrmaMaxJettiesPerCore (it sizes "
-                         "AsyncEvent's per-jetty targets)"
-                      << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "rail plan found "
+                            << railCount_ << " ports but a core may own at most " << kUrmaMaxJettiesPerCore
+                            << " jetties; pass jettiesPerCore explicitly or raise kUrmaMaxJettiesPerCore (it sizes "
+                               "AsyncEvent's per-jetty targets)");
             return false;
         }
         resolvedJettiesPerCore = (jettiesPerCore == kUrmaAutoJettiesPerCore) ? railCount_ : jettiesPerCore;
         if (resolvedAivCount > std::numeric_limits<uint32_t>::max() / resolvedJettiesPerCore) {
-            std::cerr << "[URMA] aivCount=" << resolvedAivCount << " * jettiesPerCore=" << resolvedJettiesPerCore
-                      << " overflows the jetty count" << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "aivCount=" << resolvedAivCount << " * jettiesPerCore=" << resolvedJettiesPerCore
+                                    << " overflows the jetty count");
             return false;
         }
         return true;
@@ -282,18 +290,18 @@ private:
         const uint64_t regionCount = TargetRowCount();
         if (regionCount == 0U ||
             regionCount > std::numeric_limits<uint64_t>::max() / sizeof(UrmaNotifyResourceRegion)) {
-            std::cerr << "[URMA] invalid notify pool region count=" << regionCount << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "invalid notify pool region count=" << regionCount);
             return false;
         }
         notifyPoolSize_ = regionCount * sizeof(UrmaNotifyResourceRegion);
         aclError err = aclrtMalloc(&notifyPoolDevice_, notifyPoolSize_, ACL_MEM_MALLOC_HUGE_FIRST);
         if (err != ACL_SUCCESS) {
-            std::cerr << "[URMA] aclrtMalloc(notifyPool) failed: " << err << " size=" << notifyPoolSize_ << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "aclrtMalloc(notifyPool) failed: " << err << " size=" << notifyPoolSize_);
             return false;
         }
         err = aclrtMemset(notifyPoolDevice_, notifyPoolSize_, 0, notifyPoolSize_);
         if (err != ACL_SUCCESS) {
-            std::cerr << "[URMA] aclrtMemset(notifyPool) failed: " << err << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "aclrtMemset(notifyPool) failed: " << err);
             return false;
         }
         return true;
@@ -308,7 +316,7 @@ private:
 
         HcclResult ret = HcclCommMemReg(comm_, kUrmaSymMemTag, &mem, &memHandle_);
         if (ret != HCCL_SUCCESS) {
-            std::cerr << "[URMA] HcclCommMemReg failed: " << static_cast<int>(ret) << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "HcclCommMemReg failed: " << static_cast<int>(ret));
             return false;
         }
 
@@ -318,7 +326,7 @@ private:
         notifyMem.size = notifyPoolSize_;
         ret = HcclCommMemReg(comm_, kUrmaNotifyMemTag, &notifyMem, &notifyMemHandle_);
         if (ret != HCCL_SUCCESS) {
-            std::cerr << "[URMA] HcclCommMemReg(notifyPool) failed: " << static_cast<int>(ret) << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "HcclCommMemReg(notifyPool) failed: " << static_cast<int>(ret));
             return false;
         }
         memHandles_[0] = memHandle_;
@@ -340,8 +348,9 @@ private:
         CommLink* linkList = nullptr;
         HcclResult rc = HcclRankGraphGetLinks(comm_, 0, srcRank, dstRank, &linkList, &linkNum);
         if (rc != HCCL_SUCCESS) {
-            std::cerr << "[URMA] HcclRankGraphGetLinks src=" << srcRank << " dst=" << dstRank
-                      << " ret=" << static_cast<int>(rc) << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA",
+                "HcclRankGraphGetLinks src=" << srcRank << " dst=" << dstRank << " ret=" << static_cast<int>(rc));
             return false;
         }
         for (uint32_t i = 0; i < linkNum; ++i) {
@@ -352,7 +361,7 @@ private:
             out = PeerLink{dstRank, proto, linkList[i].srcEndpointDesc, linkList[i].dstEndpointDesc};
             return true;
         }
-        std::cerr << "[URMA] rank=" << srcRank << " no UBC_TP/CTP link to peer=" << dstRank << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "rank=" << srcRank << " no UBC_TP/CTP link to peer=" << dstRank);
         return false;
     }
 

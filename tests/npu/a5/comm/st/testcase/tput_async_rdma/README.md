@@ -63,6 +63,8 @@ The ST does not generate or modify either topology file and does not provide pat
 | `PTO_ROCE_IPS` | Final fallback list containing exactly one IPv4 per MPI rank, in rank order. |
 | `PTO_ROCE_BASE_PORT` | Common channel base port; default `60032`. |
 | `PTO_ROCE_VERBOSE` | Set to `1` for endpoint, MR, channel, and cleanup progress logs. |
+| `PTO_ISA_GLOBAL_LOG_LEVEL` | `0` DEBUG, `1` INFO, `2` WARNING, `3` ERROR (default); `4` disables PTO file/stdout business logs. |
+| `PTO_ISA_SLOG_PRINT_TO_STDOUT` | Set to exactly `1` for library logs on stdout; otherwise logs are written to PTO files under plog. |
 | `HCCL_RDMA_TC` | HCOMM traffic class; default `132`. |
 | `HCCL_RDMA_SL` | HCOMM service level; default `4`. |
 
@@ -73,4 +75,5 @@ The ST does not generate or modify either topology file and does not provide pat
 - If CMake reports that RDMA is disabled, set `PTO_RDMA_BACKEND=HNS_1825` and reconfigure without `-w`.
 - If endpoint discovery fails, verify the physical device mapping and the RoCE IPv4 in root-info or virtual topology, then use the test-only IP fallback if required.
 - If HCOMM cannot load the HNS1825 verbs provider from its default search path, set `IBV_EXTEND_DRIVERS` to the driver-provided `libhrn5-rdmav34.so`.
-- Set `PTO_ROCE_VERBOSE=1` to distinguish endpoint discovery, MR registration, channel setup, and cleanup failures.
+- Set `PTO_ROCE_VERBOSE=1`, `PTO_ISA_GLOBAL_LOG_LEVEL=1`, and `PTO_ISA_SLOG_PRINT_TO_STDOUT=1` to inspect INFO-level endpoint, MR, channel, and cleanup logs in the terminal.
+- For log paths and file management rules, see [Host logging](../../../../../../../include/pto/comm/logger/README.md).

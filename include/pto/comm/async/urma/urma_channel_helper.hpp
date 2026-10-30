@@ -17,7 +17,6 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 
 #include "securec.h"
 
@@ -26,6 +25,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #include "hccl/hccl_res.h"
 
 #include "pto/comm/async/urma/urma_hccl_defs.hpp"
+#include "pto/comm/logger/host_log.hpp"
 
 namespace pto {
 namespace comm {
@@ -55,7 +55,7 @@ public:
         if (IsLikelyDevicePtr(srcPtr)) {
             aclError err = aclrtMemcpy(dst, size, srcPtr, size, ACL_MEMCPY_DEVICE_TO_HOST);
             if (err != ACL_SUCCESS) {
-                std::cerr << "[URMA] aclrtMemcpy(" << name << ") peer=" << peer << " err=" << err << std::endl;
+                PTO_HOST_LOG_ERROR("URMA", "aclrtMemcpy(" << name << ") peer=" << peer << " err=" << err);
                 return false;
             }
             return true;
@@ -104,14 +104,15 @@ public:
         aclError err = aclrtMemcpy(
             &hostEntity, sizeof(ChannelEntity), devEntityPtr, sizeof(ChannelEntity), ACL_MEMCPY_DEVICE_TO_HOST);
         if (err != ACL_SUCCESS) {
-            std::cerr << "[URMA] aclrtMemcpy(ChannelEntity) peer=" << peer << " err=" << err << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "aclrtMemcpy(ChannelEntity) peer=" << peer << " err=" << err);
             return false;
         }
 
         if (!IsValidChannelEntityHeader(hostEntity)) {
-            std::cerr << "[URMA] invalid ChannelEntity header peer=" << peer << " magic=0x" << std::hex
-                      << hostEntity.abiHeader.magicWord << " engine=" << std::dec << static_cast<int>(hostEntity.engine)
-                      << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "URMA", "invalid ChannelEntity header peer=" << peer << " magic=0x" << std::hex
+                                                             << hostEntity.abiHeader.magicWord << " engine=" << std::dec
+                                                             << static_cast<int>(hostEntity.engine));
             return false;
         }
 
@@ -162,7 +163,7 @@ public:
             break;
         }
         if (!found) {
-            std::cerr << "[URMA] peer=" << peer << " no RegedBufferEntity matches " << symMemTag << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "peer=" << peer << " no RegedBufferEntity matches " << symMemTag);
             return false;
         }
         return true;
@@ -225,8 +226,7 @@ private:
         char** memTags = nullptr;
         HcclResult rc = HcclChannelGetRemoteMems(comm, handle, &memNum, &remoteMems, &memTags);
         if (rc != HCCL_SUCCESS) {
-            std::cerr << "[URMA] HcclChannelGetRemoteMems peer=" << peer << " ret=" << static_cast<int>(rc)
-                      << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "HcclChannelGetRemoteMems peer=" << peer << " ret=" << static_cast<int>(rc));
             return false;
         }
         for (uint32_t i = 0; i < memNum; ++i) {
@@ -237,7 +237,7 @@ private:
                 return true;
             }
         }
-        std::cerr << "[URMA] peer=" << peer << " tag " << symMemTag << " not found" << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "peer=" << peer << " tag " << symMemTag << " not found");
         return false;
     }
 

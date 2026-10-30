@@ -76,7 +76,7 @@ bool InitializeAsyncQueueState(std::vector<UrmaWQCtx>& wqList, const std::vector
                 &cqTail, sizeof(cqTail), reinterpret_cast<void*>(cqList[row].tailAddr), sizeof(cqTail),
                 ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
             sqHead != sqTail) {
-            std::cerr << "[URMA] ctx row=" << row << " async queue initialization requires an empty SQ" << std::endl;
+            PTO_HOST_LOG_ERROR("URMA", "ctx row=" << row << " async queue initialization requires an empty SQ");
             return false;
         }
         wqList[row].submittedWqeCount = cqTail;
@@ -146,9 +146,9 @@ static bool IsSameJetty(
                       refWq.headAddr == wq.headAddr && refWq.tailAddr == wq.tailAddr && refCq.cqn == cq.cqn &&
                       refCq.bufAddr == cq.bufAddr && refCq.headAddr == cq.headAddr;
     if (!same) {
-        std::cerr << "[URMA] shared jetty " << jetty << " not shared: peer=" << peer << " reports jfsID=" << wq.wqn
-                  << "/jfcID=" << cq.cqn << " but jetty uses jfsID=" << refWq.wqn << "/jfcID=" << refCq.cqn
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA", "shared jetty " << jetty << " not shared: peer=" << peer << " reports jfsID=" << wq.wqn << "/jfcID="
+                                    << cq.cqn << " but jetty uses jfsID=" << refWq.wqn << "/jfcID=" << refCq.cqn);
     }
     return same;
 }
@@ -182,12 +182,13 @@ static bool RowsAliasOneQueue(
     if (!wqAlias && !cqAlias) {
         return false;
     }
-    std::cerr << "[URMA] ctx row " << row << " aliases row " << prev << ": jfsID=" << wq.wqn << "/" << wqList[prev].wqn
-              << " jfcID=" << cq.cqn << "/" << cqList[prev].cqn << std::hex << " sqVa=0x" << wq.bufAddr << "/0x"
-              << wqList[prev].bufAddr << " dbAddr=0x" << wq.dbAddr << "/0x" << wqList[prev].dbAddr << " sqTail=0x"
-              << wq.tailAddr << "/0x" << wqList[prev].tailAddr << " scqVa=0x" << cq.bufAddr << "/0x"
-              << cqList[prev].bufAddr << std::dec << "; two AIVs would post into one queue and race its head/tail"
-              << std::endl;
+    PTO_HOST_LOG_ERROR(
+        "URMA", "ctx row " << row << " aliases row " << prev << ": jfsID=" << wq.wqn << "/" << wqList[prev].wqn
+                           << " jfcID=" << cq.cqn << "/" << cqList[prev].cqn << std::hex << " sqVa=0x" << wq.bufAddr
+                           << "/0x" << wqList[prev].bufAddr << " dbAddr=0x" << wq.dbAddr << "/0x" << wqList[prev].dbAddr
+                           << " sqTail=0x" << wq.tailAddr << "/0x" << wqList[prev].tailAddr << " scqVa=0x" << cq.bufAddr
+                           << "/0x" << cqList[prev].bufAddr << std::dec
+                           << "; two AIVs would post into one queue and race its head/tail");
     return true;
 }
 
@@ -202,18 +203,20 @@ bool ReadPeerChannel(uint32_t peer, uint32_t channelIdx, PeerChannelState& state
 {
     state.handle = channelHandles_[channelIdx];
     if (state.handle != 0 && static_cast<uint64_t>(state.handle) < kDeviceVaThreshold) {
-        std::cerr << "[URMA] ChannelHandle looks like host pointer (0x" << std::hex << state.handle << std::dec
-                  << ") for peer=" << peer
-                  << ". Upgrade CANN: HcclChannelAcquire must return device ChannelEntity pointers for AIV URMA."
-                  << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA",
+            "ChannelHandle looks like host pointer (0x"
+                << std::hex << state.handle << std::dec << ") for peer=" << peer
+                << ". Upgrade CANN: HcclChannelAcquire must return device ChannelEntity pointers for AIV URMA.");
         return false;
     }
     RegedBufferEntity remoteBuf{};
     RegedBufferEntity localBuf{};
     if (state.handle == 0 || !UrmaChannelHelper::TryReadChannelEntity(
                                  state.handle, peer, state.entity, state.sq, state.cq, remoteBuf, localBuf)) {
-        std::cerr << "[URMA] Cannot read ChannelEntity for peer=" << peer << " handle=0x" << std::hex
-                  << static_cast<uint64_t>(state.handle) << std::dec << std::endl;
+        PTO_HOST_LOG_ERROR(
+            "URMA", "Cannot read ChannelEntity for peer=" << peer << " handle=0x" << std::hex
+                                                          << static_cast<uint64_t>(state.handle) << std::dec);
         return false;
     }
     return true;
@@ -231,14 +234,14 @@ bool ExtractPeerRegistrations(
     RegedBufferEntity symLocalBuf{};
     if (!UrmaChannelHelper::FindLocalRmaRegistration(
             reinterpret_cast<uint64_t>(symmetricAddr_), symmetricSize_, state.entity, peer, symLocalBuf)) {
-        std::cerr << "[URMA] peer=" << peer << " no local symmetric registration found" << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "peer=" << peer << " no local symmetric registration found");
         return false;
     }
     mem.localTokenId = symLocalBuf.bufferInfo.rma.protectionInfo.memInfo.ub.tokenId;
     RegedBufferEntity notifyLocalBuf{};
     if (!UrmaChannelHelper::FindLocalRmaRegistration(
             reinterpret_cast<uint64_t>(notifyPoolDevice_), notifyPoolSize_, state.entity, peer, notifyLocalBuf)) {
-        std::cerr << "[URMA] peer=" << peer << " no local notify pool registration found" << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "peer=" << peer << " no local notify pool registration found");
         return false;
     }
     mem.notifyTokenId = notifyLocalBuf.bufferInfo.rma.protectionInfo.memInfo.ub.tokenId;
@@ -283,9 +286,9 @@ static bool ValidateQueueDepths(uint32_t peer, const UrmaWQCtx& wq, const UrmaCq
     if (validSqDepth && validCqDepth) {
         return true;
     }
-    std::cerr << "[URMA] peer=" << peer << " queue depths must be non-zero powers of two and CQ depth must be >= "
-              << kUrmaCompletionRecordMinCqDepth << ", got sqDepth=" << wq.depth << " cqDepth=" << cq.depth
-              << std::endl;
+    PTO_HOST_LOG_ERROR(
+        "URMA", "peer=" << peer << " queue depths must be non-zero powers of two and CQ depth must be >= "
+                        << kUrmaCompletionRecordMinCqDepth << ", got sqDepth=" << wq.depth << " cqDepth=" << cq.depth);
     return false;
 }
 
@@ -295,10 +298,11 @@ static bool ContextTagsAreUb(uint32_t peer, uint32_t channelIdx, const SqContext
     if (sq.type == kUbContextType && cq.type == kUbContextType) {
         return true;
     }
-    std::cerr << "[URMA] peer=" << peer << " channel=" << channelIdx << " sqType=" << sq.type << " cqType=" << cq.type
-              << " is not a UB jetty context (UB is 0, RoCE is 1, uninitialised is -1); the ubJfs/ubJfc arm would be "
-                 "the wrong one to read"
-              << std::endl;
+    PTO_HOST_LOG_ERROR(
+        "URMA",
+        "peer=" << peer << " channel=" << channelIdx << " sqType=" << sq.type << " cqType=" << cq.type
+                << " is not a UB jetty context (UB is 0, RoCE is 1, uninitialised is -1); the ubJfs/ubJfc arm would be "
+                   "the wrong one to read");
     return false;
 }
 
@@ -346,12 +350,12 @@ bool AllocAndCopyEidTable(UrmaPeerInfoTables& tables)
     const size_t eidDevSize = tables.eidTable.size();
     aclError err = aclrtMalloc(&eidDevice_, eidDevSize, ACL_MEM_MALLOC_HUGE_FIRST);
     if (err != ACL_SUCCESS) {
-        std::cerr << "[URMA] aclrtMalloc(eidTable) failed: " << err << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "aclrtMalloc(eidTable) failed: " << err);
         return false;
     }
     err = aclrtMemcpy(eidDevice_, eidDevSize, tables.eidTable.data(), eidDevSize, ACL_MEMCPY_HOST_TO_DEVICE);
     if (err != ACL_SUCCESS) {
-        std::cerr << "[URMA] aclrtMemcpy(eidTable) failed: " << err << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "aclrtMemcpy(eidTable) failed: " << err);
         return false;
     }
     for (size_t row = 0; row < tables.memList.size(); ++row) {
@@ -368,7 +372,7 @@ bool BuildAndCopyUrmaInfoTable(const UrmaPeerInfoTables& tables)
 
     aclError err = aclrtMalloc(&urmaInfoDevice_, totalSize, ACL_MEM_MALLOC_HUGE_FIRST);
     if (err != ACL_SUCCESS) {
-        std::cerr << "[URMA] aclrtMalloc(urmaInfo) failed: " << err << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "aclrtMalloc(urmaInfo) failed: " << err);
         return false;
     }
 
@@ -377,7 +381,7 @@ bool BuildAndCopyUrmaInfoTable(const UrmaPeerInfoTables& tables)
 
     err = aclrtMemcpy(urmaInfoDevice_, totalSize, hostBuf.data(), totalSize, ACL_MEMCPY_HOST_TO_DEVICE);
     if (err != ACL_SUCCESS) {
-        std::cerr << "[URMA] aclrtMemcpy(urmaInfo) failed: " << err << std::endl;
+        PTO_HOST_LOG_ERROR("URMA", "aclrtMemcpy(urmaInfo) failed: " << err);
         return false;
     }
     return true;

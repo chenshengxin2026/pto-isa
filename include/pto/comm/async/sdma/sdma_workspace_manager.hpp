@@ -18,7 +18,6 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include <cstdint>
 #include <cstddef>
-#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -26,6 +25,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include "acl/acl.h"
 #include "pto/comm/async_common/sdma_constants.hpp"
+#include "pto/comm/logger/host_log.hpp"
 
 #ifndef ACL_STREAM_DEVICE_USE_ONLY
 #define ACL_STREAM_DEVICE_USE_ONLY 0x00000020U
@@ -170,7 +170,7 @@ private:
 
         rtHandle_ = dlopen("libruntime.so", RTLD_NOW);
         if (!rtHandle_) {
-            std::cerr << "[SDMA] dlopen libruntime.so failed: " << dlerror() << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "dlopen libruntime.so failed: " << dlerror());
             return false;
         }
 
@@ -178,13 +178,13 @@ private:
         pRtStreamGetCqid_ = reinterpret_cast<detail::RtStreamGetCqidFn>(dlsym(rtHandle_, "rtStreamGetCqid"));
         pRtGetDeviceInfo_ = reinterpret_cast<detail::RtGetDeviceInfoFn>(dlsym(rtHandle_, "rtGetDeviceInfo"));
         if (!pRtStreamGetSqid_ || !pRtStreamGetCqid_ || !pRtGetDeviceInfo_) {
-            std::cerr << "[SDMA] Failed to resolve runtime symbols: " << dlerror() << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "Failed to resolve runtime symbols: " << dlerror());
             return false;
         }
 
         opapiHandle_ = dlopen("libopapi.so", RTLD_NOW);
         if (!opapiHandle_) {
-            std::cerr << "[SDMA] dlopen libopapi.so failed: " << dlerror() << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "dlopen libopapi.so failed: " << dlerror());
             return false;
         }
 
@@ -192,7 +192,7 @@ private:
             reinterpret_cast<detail::AclnnGetWsSizeFn>(dlsym(opapiHandle_, "aclnnShmemSdmaStarsQueryGetWorkspaceSize"));
         pAclnnExec_ = reinterpret_cast<detail::AclnnExecFn>(dlsym(opapiHandle_, "aclnnShmemSdmaStarsQuery"));
         if (!pAclnnGetWsSize_ || !pAclnnExec_) {
-            std::cerr << "[SDMA] Failed to resolve opapi symbols: " << dlerror() << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "Failed to resolve opapi symbols: " << dlerror());
             return false;
         }
 
@@ -222,33 +222,35 @@ private:
         info.stream_ = 0;
 
         void* stream = nullptr;
-        if (aclrtCreateStreamWithConfig(reinterpret_cast<aclrtStream*>(&stream), 0, ACL_STREAM_DEVICE_USE_ONLY) != 0) {
-            std::cerr << "[SDMA] aclrtCreateStreamWithConfig channel " << channelIdx << " failed" << std::endl;
+        if (const auto ret =
+                aclrtCreateStreamWithConfig(reinterpret_cast<aclrtStream*>(&stream), 0, ACL_STREAM_DEVICE_USE_ONLY);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtCreateStreamWithConfig channel " << channelIdx << " failed, ret=" << ret);
             return false;
         }
         info.stream_ = reinterpret_cast<uint64_t>(stream);
 
         int32_t streamId = 0;
-        if (aclrtStreamGetId(reinterpret_cast<aclrtStream>(stream), &streamId) != 0) {
-            std::cerr << "[SDMA] aclrtStreamGetId channel " << channelIdx << " failed" << std::endl;
+        if (const auto ret = aclrtStreamGetId(reinterpret_cast<aclrtStream>(stream), &streamId); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtStreamGetId channel " << channelIdx << " failed, ret=" << ret);
             return false;
         }
 
         uint32_t sqId = 0;
-        if (pRtStreamGetSqid_(stream, &sqId) != 0) {
-            std::cerr << "[SDMA] rtStreamGetSqid channel " << channelIdx << " failed" << std::endl;
+        if (const auto ret = pRtStreamGetSqid_(stream, &sqId); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "rtStreamGetSqid channel " << channelIdx << " failed, ret=" << ret);
             return false;
         }
 
         uint32_t cqId = 0, logicCqId = 0;
-        if (pRtStreamGetCqid_(stream, &cqId, &logicCqId) != 0) {
-            std::cerr << "[SDMA] rtStreamGetCqid channel " << channelIdx << " failed" << std::endl;
+        if (const auto ret = pRtStreamGetCqid_(stream, &cqId, &logicCqId); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "rtStreamGetCqid channel " << channelIdx << " failed, ret=" << ret);
             return false;
         }
 
         void* ctx = nullptr;
-        if (aclrtGetCurrentContext(&ctx) != 0) {
-            std::cerr << "[SDMA] aclrtGetCurrentContext channel " << channelIdx << " failed" << std::endl;
+        if (const auto ret = aclrtGetCurrentContext(&ctx); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtGetCurrentContext channel " << channelIdx << " failed, ret=" << ret);
             return false;
         }
 
@@ -264,15 +266,16 @@ private:
     bool CreateStarsStreams(int32_t channelNum)
     {
         int32_t deviceId = -1;
-        if (aclrtGetDevice(&deviceId) != 0) {
-            std::cerr << "[SDMA] aclrtGetDevice failed" << std::endl;
+        if (const auto ret = aclrtGetDevice(&deviceId); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtGetDevice failed, ret=" << ret);
             return false;
         }
 
         int64_t dieId = -1;
         constexpr int32_t kInfoTypePhyDieId = 19;
-        if (pRtGetDeviceInfo_(static_cast<uint32_t>(deviceId), 0, kInfoTypePhyDieId, &dieId) != 0) {
-            std::cerr << "[SDMA] rtGetDeviceInfo (die_id) failed" << std::endl;
+        if (const auto ret = pRtGetDeviceInfo_(static_cast<uint32_t>(deviceId), 0, kInfoTypePhyDieId, &dieId);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "rtGetDeviceInfo (die_id) failed, ret=" << ret);
             return false;
         }
 
@@ -283,19 +286,19 @@ private:
             }
         }
 
-        std::cerr << "[SDMA] Created " << channelNum << " STARS streams OK" << std::endl;
+        PTO_HOST_LOG_INFO("SDMA", "Created " << channelNum << " STARS streams OK");
         return true;
     }
 
     bool MallocWorkspace(size_t workspaceSize)
     {
         void* workspace = nullptr;
-        if (aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-            std::cerr << "[SDMA] aclrtMalloc workspace failed" << std::endl;
+        if (const auto ret = aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMalloc workspace failed, ret=" << ret);
             return false;
         }
-        if (aclrtMemset(workspace, workspaceSize, 0, workspaceSize) != 0) {
-            std::cerr << "[SDMA] aclrtMemset workspace failed" << std::endl;
+        if (const auto ret = aclrtMemset(workspace, workspaceSize, 0, workspaceSize); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMemset workspace failed, ret=" << ret);
             aclrtFree(workspace);
             return false;
         }
@@ -306,13 +309,14 @@ private:
     bool CopyOpResToDevice()
     {
         size_t streamsBytes = streams_.size() * sizeof(detail::HostStreamInfo);
-        if (aclrtMalloc(&streamsDevicePtr_, streamsBytes, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-            std::cerr << "[SDMA] aclrtMalloc streams device failed" << std::endl;
+        if (const auto ret = aclrtMalloc(&streamsDevicePtr_, streamsBytes, ACL_MEM_MALLOC_HUGE_FIRST); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMalloc streams device failed, ret=" << ret);
             return false;
         }
-        if (aclrtMemcpy(streamsDevicePtr_, streamsBytes, streams_.data(), streamsBytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
-            0) {
-            std::cerr << "[SDMA] CopyOpResToDevice streams memcpy failed" << std::endl;
+        if (const auto ret =
+                aclrtMemcpy(streamsDevicePtr_, streamsBytes, streams_.data(), streamsBytes, ACL_MEMCPY_HOST_TO_DEVICE);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "CopyOpResToDevice streams memcpy failed, ret=" << ret);
             return false;
         }
 
@@ -320,13 +324,17 @@ private:
         opResInfo_.streams_addr = reinterpret_cast<uint64_t>(streamsDevicePtr_);
 
         size_t opResSize = sizeof(opResInfo_);
-        if (aclrtMalloc(&opResDevicePtr_, opResSize, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-            std::cerr << "[SDMA] aclrtMalloc opResDevice failed" << std::endl;
+        if (const auto ret = aclrtMalloc(&opResDevicePtr_, opResSize, ACL_MEM_MALLOC_HUGE_FIRST); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMalloc opResDevice failed, ret=" << ret);
             return false;
         }
-        if (aclrtMemset(opResDevicePtr_, opResSize, 0, opResSize) != 0 ||
-            aclrtMemcpy(opResDevicePtr_, opResSize, &opResInfo_, opResSize, ACL_MEMCPY_HOST_TO_DEVICE) != 0) {
-            std::cerr << "[SDMA] CopyOpResToDevice opRes memset/memcpy failed" << std::endl;
+        if (const auto ret = aclrtMemset(opResDevicePtr_, opResSize, 0, opResSize); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMemset(opRes) failed, ret=" << ret);
+            return false;
+        }
+        if (const auto ret = aclrtMemcpy(opResDevicePtr_, opResSize, &opResInfo_, opResSize, ACL_MEMCPY_HOST_TO_DEVICE);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtMemcpy(opRes) failed, ret=" << ret);
             return false;
         }
         return true;
@@ -351,18 +359,18 @@ private:
     bool CalculateElementCount(const std::vector<int64_t>& shape, uint64_t& elemCount)
     {
         if (shape.empty()) {
-            std::cerr << "[SDMA] CalculateElementCount empty shape" << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "CalculateElementCount empty shape");
             return false;
         }
         elemCount = 1;
         for (int64_t dim : shape) {
             if (dim <= 0) {
-                std::cerr << "[SDMA] CalculateElementCount invalid dim: " << dim << std::endl;
+                PTO_HOST_LOG_ERROR("SDMA", "CalculateElementCount invalid dim: " << dim);
                 return false;
             }
             const uint64_t uDim = static_cast<uint64_t>(dim);
             if (elemCount > std::numeric_limits<uint64_t>::max() / uDim) {
-                std::cerr << "[SDMA] CalculateElementCount shape overflow" << std::endl;
+                PTO_HOST_LOG_ERROR("SDMA", "CalculateElementCount shape overflow");
                 return false;
             }
             elemCount *= uDim;
@@ -377,22 +385,25 @@ private:
             return false;
         }
         if (elemCount != hostData.size()) {
-            std::cerr << "[SDMA] CreateAclTensor hostData size mismatch, elemCount=" << elemCount
-                      << ", hostData.size=" << hostData.size() << std::endl;
+            PTO_HOST_LOG_ERROR(
+                "SDMA", "CreateAclTensor hostData size mismatch, elemCount=" << elemCount
+                                                                             << ", hostData.size=" << hostData.size());
             return false;
         }
         if (elemCount > std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
-            std::cerr << "[SDMA] CreateAclTensor totalBytes overflow" << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "CreateAclTensor totalBytes overflow");
             return false;
         }
         size_t totalBytes = static_cast<size_t>(elemCount * sizeof(uint64_t));
 
-        if (aclrtMalloc(&guard.deviceAddr, totalBytes, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-            std::cerr << "[SDMA] CreateAclTensor aclrtMalloc failed" << std::endl;
+        if (const auto ret = aclrtMalloc(&guard.deviceAddr, totalBytes, ACL_MEM_MALLOC_HUGE_FIRST); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "CreateAclTensor aclrtMalloc failed, ret=" << ret);
             return false;
         }
-        if (aclrtMemcpy(guard.deviceAddr, totalBytes, hostData.data(), totalBytes, ACL_MEMCPY_HOST_TO_DEVICE) != 0) {
-            std::cerr << "[SDMA] CreateAclTensor aclrtMemcpy failed" << std::endl;
+        if (const auto ret =
+                aclrtMemcpy(guard.deviceAddr, totalBytes, hostData.data(), totalBytes, ACL_MEMCPY_HOST_TO_DEVICE);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "CreateAclTensor aclrtMemcpy failed, ret=" << ret);
             guard.Release();
             return false;
         }
@@ -406,7 +417,7 @@ private:
             shape.data(), shape.size(), aclDataType::ACL_UINT64, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
             shape.data(), shape.size(), guard.deviceAddr);
         if (!guard.tensor) {
-            std::cerr << "[SDMA] aclCreateTensor failed" << std::endl;
+            PTO_HOST_LOG_ERROR("SDMA", "aclCreateTensor failed");
             guard.Release();
             return false;
         }
@@ -428,24 +439,25 @@ private:
 
         uint64_t aclnnWsSize = 0;
         aclOpExecutor* executor = nullptr;
-        if (pAclnnGetWsSize_(inputGuard.tensor, outputGuard.tensor, &aclnnWsSize, &executor) != 0) {
-            std::cerr << "[SDMA] aclnnShmemSdmaStarsQueryGetWorkspaceSize failed" << std::endl;
+        if (const auto ret = pAclnnGetWsSize_(inputGuard.tensor, outputGuard.tensor, &aclnnWsSize, &executor);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclnnShmemSdmaStarsQueryGetWorkspaceSize failed, ret=" << ret);
             return false;
         }
 
         void* aclnnWs = nullptr;
         if (aclnnWsSize > 0) {
-            if (aclrtMalloc(&aclnnWs, aclnnWsSize, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-                std::cerr << "[SDMA] aclrtMalloc aclnn workspace failed" << std::endl;
+            if (const auto ret = aclrtMalloc(&aclnnWs, aclnnWsSize, ACL_MEM_MALLOC_HUGE_FIRST); ret != 0) {
+                PTO_HOST_LOG_ERROR("SDMA", "aclrtMalloc aclnn workspace failed, ret=" << ret);
                 return false;
             }
         }
 
         bool ok = false;
-        if (pAclnnExec_(aclnnWs, aclnnWsSize, executor, aicpuStream) != 0) {
-            std::cerr << "[SDMA] aclnnShmemSdmaStarsQuery exec failed" << std::endl;
-        } else if (aclrtSynchronizeStream(aicpuStream) != 0) {
-            std::cerr << "[SDMA] aclrtSynchronizeStream (aicpu) failed" << std::endl;
+        if (const auto ret = pAclnnExec_(aclnnWs, aclnnWsSize, executor, aicpuStream); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclnnShmemSdmaStarsQuery exec failed, ret=" << ret);
+        } else if (const auto ret = aclrtSynchronizeStream(aicpuStream); ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtSynchronizeStream (aicpu) failed, ret=" << ret);
         } else {
             ok = true;
         }
@@ -460,8 +472,10 @@ private:
     bool LaunchAicpuKernel(uint64_t streamsAddr, uint64_t workspaceAddr)
     {
         aclrtStream aicpuStream = nullptr;
-        if (aclrtCreateStreamWithConfig(&aicpuStream, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC) != 0) {
-            std::cerr << "[SDMA] aclrtCreateStreamWithConfig (aicpu) failed" << std::endl;
+        if (const auto ret =
+                aclrtCreateStreamWithConfig(&aicpuStream, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+            ret != 0) {
+            PTO_HOST_LOG_ERROR("SDMA", "aclrtCreateStreamWithConfig (aicpu) failed, ret=" << ret);
             return false;
         }
 
@@ -473,7 +487,7 @@ private:
         aclrtDestroyStream(aicpuStream);
 
         if (ok) {
-            std::cerr << "[SDMA] STARS query AICPU kernel completed OK" << std::endl;
+            PTO_HOST_LOG_INFO("SDMA", "STARS query AICPU kernel completed OK");
         }
         return ok;
     }
