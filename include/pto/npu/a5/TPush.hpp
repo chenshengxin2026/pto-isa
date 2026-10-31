@@ -130,9 +130,10 @@ struct TPipe {
          * 1. (iter >= Depth): Startup protection. Don't check flags when buffer is empty.
          * 2. (iter % Period == 0): Sparse sync. Only check flag periodically.
          */
-        template <TileSplitAxis Split = TileSplitAxis::TILE_UP_DOWN>
+        template <TileSplitAxis Split = kDefaultSplitMode>
         PTO_INTERNAL void allocate() const
         {
+            CheckSplitMode<Split>();
             if constexpr (is_c2v) {
 #ifdef PTO_COMPILE_CUBE
                 waitIntraBlockBySplit<PIPE_FIX, Split>(FlagIDPlusOne);
@@ -173,9 +174,10 @@ struct TPipe {
          * record - Producer signals that data is ready
          * Called by the producer after completing the operation (TSTORE_C2GM or TSTORE_V2GM)
          */
-        template <TileSplitAxis Split = TileSplitAxis::TILE_UP_DOWN>
+        template <TileSplitAxis Split = kDefaultSplitMode>
         PTO_INTERNAL void record() const
         {
+            CheckSplitMode<Split>();
             if constexpr (is_c2v) {
 #ifdef PTO_COMPILE_CUBE
                 setIntraBlockBySplit<PIPE_FIX, Split>(FlagID);
@@ -343,6 +345,7 @@ struct TPipe {
         template <typename TileProd, TileSplitAxis Split>
         PTO_INTERNAL void push(RingFiFo& fifo, TileProd& tile, int32_t subBlockId)
         {
+            CheckSplitMode<Split>();
             if constexpr (TileProd::Loc == TileType::Acc) {
                 if constexpr (is_c2v_ub || is_both) {
                     pushAcc2VecFiFo<TileProd, Split>(fifo, tile);
@@ -494,9 +497,10 @@ struct TPipe {
         /**
          * wait: Block until data is ready
          */
-        template <TileSplitAxis Split = TileSplitAxis::TILE_UP_DOWN>
+        template <TileSplitAxis Split = kDefaultSplitMode>
         PTO_INTERNAL void wait() const
         {
+            CheckSplitMode<Split>();
             if constexpr (is_c2v_gm) {
                 wait_intra_block(PIPE_MTE2, FlagID);
             } else if constexpr (is_c2v_ub) {
@@ -531,9 +535,10 @@ struct TPipe {
         /**
          * free: Release space in FIFO
          */
-        template <TileSplitAxis Split = TileSplitAxis::TILE_UP_DOWN>
+        template <TileSplitAxis Split = kDefaultSplitMode>
         PTO_INTERNAL void free() const
         {
+            CheckSplitMode<Split>();
             if constexpr (is_c2v_gm) {
 #ifdef PTO_COMPILE_VEC
                 set_intra_block(PIPE_MTE2, FlagIDPlusOne);
@@ -663,6 +668,7 @@ struct TPipe {
         template <typename TileCons, TileSplitAxis Split>
         PTO_INTERNAL bool pop(RingFiFo& fifo, TileCons& tile, int32_t subBlockId)
         {
+            CheckSplitMode<Split>();
             static_assert(
                 TileCons::Loc == TileType::Vec || TileCons::Loc == TileType::Mat || TileCons::Loc == TileType::Ctrl,
                 "Fix: TPOP has unsupported tile type!");
@@ -715,13 +721,7 @@ struct TPipe {
             }
         }
         const uint32_t drainCount = (numPopFree > numPushWait) ? (numPopFree - numPushWait) : 0;
-        for (uint32_t i = 0; i < drainCount; ++i) {
-            if constexpr (IsNoSplit) {
-                prod.template allocate<TileSplitAxis::TILE_NO_SPLIT>();
-            } else {
-                prod.template allocate<TileSplitAxis::TILE_UP_DOWN>();
-            }
-        }
+        ClearFreeSignal<IsNoSplit>(prod, drainCount);
     }
 };
 
