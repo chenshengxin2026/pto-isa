@@ -165,6 +165,71 @@ class SyncTests(unittest.TestCase):
         sync.validate_result(base, source, paths)
         self.assertEqual(Path("node/child").read_text(), "source child\n")
 
+    def document_split(self):
+        self.write("docs/isa/comm/TGET.md", "# TGET in English\n")
+        self.write("docs/isa/comm/TGET_zh.md", "# 通信指令\n")
+        cut = self.commit("legacy documentation")
+        sync.git("checkout", "-b", "source", cut)
+        for lang, old_name in (("en", "TGET.md"), ("zh", "TGET_zh.md")):
+            destination = Path(f"docs/{lang}/isa/comm/TGET.md")
+            destination.parent.mkdir(parents=True)
+            sync.git("mv", f"docs/isa/comm/{old_name}", str(destination))
+        return cut, self.commit("split documentation by language")
+
+    def test_document_split_restores_missing_source_files_and_migrates_github_docs(self):
+        cut, source = self.document_split()
+        sync.git("checkout", "main")
+        sync.git("rm", "docs/isa/comm/TGET_zh.md")
+        self.write("docs/isa/comm/runtime.md", "# GitHub runtime\n")
+        self.write("docs/isa/comm/runtime_zh.md", "[中文指令](TGET_zh.md)\n[说明](../../guide.md)\n")
+        guide = (
+            "[通信](isa/comm/runtime_zh.md#intro)\r\n"
+            "[指令]: isa/comm/TGET_zh.md\r\n"
+            "`[sample](isa/comm/runtime_zh.md)`\r\n"
+            "```md\r\n[sample](isa/comm/runtime_zh.md)\r\n```\r\n"
+        )
+        Path("docs/guide.md").write_bytes(guide.encode("utf-8"))
+        self.write("docs/isa/untouched.md", "GitHub keeps this file in place.\n")
+        base = self.commit("GitHub docs and missing translation")
+        with patch.dict(sync.DOCUMENT_SPLITS, {source: ("docs/isa/comm/",)}):
+            paths = sync.baseline_paths(base, cut, source)
+            moves, renames, directories = sync.plan_document_moves(base, cut, source, paths)
+            _, mismatches, reconciliation = sync.reconcile_baseline(base, cut, source, paths)
+            self.assertEqual(mismatches, ["docs/isa/comm/TGET_zh.md"])
+            self.assertEqual(sync.replay(cut, source, reconciliation), (1, 0))
+            entries = sync.migrate_documents(base, paths, moves, renames, directories)
+            sync.validate_result(base, source, paths, entries)
+
+        self.assertFalse(Path("docs/isa/comm/runtime_zh.md").exists())
+        self.assertEqual(Path("docs/en/isa/comm/runtime.md").read_text(), "# GitHub runtime\n")
+        self.assertEqual(Path("docs/zh/isa/comm/TGET.md").read_text(), "# 通信指令\n")
+        self.assertEqual(
+            Path("docs/zh/isa/comm/runtime.md").read_text(), "[中文指令](TGET.md)\n[说明](../../../guide.md)\n"
+        )
+        expected_guide = guide.replace("(isa/comm/runtime_zh.md#intro)", "(zh/isa/comm/runtime.md#intro)").replace(
+            "[指令]: isa/comm/TGET_zh.md", "[指令]: zh/isa/comm/TGET.md"
+        )
+        self.assertEqual(Path("docs/guide.md").read_bytes(), expected_guide.encode("utf-8"))
+        self.assertNotIn("docs/isa/untouched.md", entries)
+
+    def test_document_split_rejects_destination_occupied_in_github_or_later_source(self):
+        cut, migration = self.document_split()
+        destination = "docs/zh/isa/comm/runtime.md"
+        self.write(destination, "# Incoming source document\n")
+        source = self.commit("add document after the split")
+        sync.git("checkout", "main")
+        self.write("docs/isa/comm/runtime_zh.md", "# GitHub document\n")
+        base = self.commit("GitHub document")
+        self.write(destination, "# Existing GitHub destination\n")
+        occupied_base = self.commit("GitHub takes the destination")
+        with patch.dict(sync.DOCUMENT_SPLITS, {migration: ("docs/isa/comm/",)}):
+            for github, gitcode in ((base, source), (occupied_base, migration)):
+                with self.subTest(github=github, gitcode=gitcode):
+                    paths = sync.baseline_paths(github, cut, gitcode)
+                    with self.assertRaisesRegex(sync.SyncError, "destination already occupied"):
+                        sync.plan_document_moves(github, cut, gitcode, paths)
+        self.assertEqual(sync.git("status", "--porcelain"), "")
+
     def test_merge_replays_side_change_exactly_once(self):
         sync.git("checkout", "-b", "side", self.cut)
         self.write("side.txt", "side\n")

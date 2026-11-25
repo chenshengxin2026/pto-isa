@@ -11,12 +11,25 @@
 
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
-from urllib.parse import urlencode
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, unquote, urlencode
+
+
+# GitCode !2153 split these directories by language. The source commit itself
+# supplies the changes to GitCode files. These rules cover extra GitHub files.
+DOCUMENT_SPLITS = {"4b72edf542d63820ecb591296163f6f595af41de": ("docs/isa/comm/", "docs/reference/")}
+MARKDOWN_LINK = re.compile(
+    r"(?P<code>^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?"
+    r"^[ \t]{0,3}(?P=fence)[`~]*[ \t]*(?=\r?$)|(?P<ticks>`+)[^\n]*?(?P=ticks))"
+    r"|(?P<prefix>\]\([ \t]*|^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*)"
+    r"(?P<destination><[^>\n]+>|[^\s)]+)",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 class SyncError(RuntimeError):
@@ -104,9 +117,10 @@ def baseline_paths(base, cut, source):
     return paths
 
 
-def reconcile_baseline(base, cut, source):
+def reconcile_baseline(base, cut, source, paths=None):
     """Commit the relevant GitCode cut-point versions before replaying new work."""
-    paths = baseline_paths(base, cut, source)
+    if paths is None:
+        paths = baseline_paths(base, cut, source)
     target_tree, cut_tree = tree(base), tree(cut)
     mismatches = [p for p in sorted(paths) if target_tree.get(p) != cut_tree.get(p)]
     git("checkout", "-B", "sync_work", base)
@@ -139,6 +153,112 @@ def reconcile_baseline(base, cut, source):
     return paths, mismatches, reconciliation
 
 
+def plan_document_moves(base, cut, source, paths):
+    """Identify GitHub-only files under explicitly registered directory splits."""
+    moves, source_renames, legacy_dirs = {}, {}, []
+    for sha in first_parent_commits(cut, source):
+        directories = DOCUMENT_SPLITS.get(sha)
+        if not directories:
+            continue
+        parent = f"{sha}^1"
+        target, source_parent = tree(base), tree(parent)
+        occupied = (target.keys() | source_parent.keys() | tree(source).keys() | paths).union(moves.values())
+        legacy_dirs.extend(directories)
+        fields = git("diff", "--name-status", "--diff-filter=R", "-M", "-z", parent, sha).split("\0")
+        source_renames.update(zip(fields[1::3], fields[2::3]))
+        for old in sorted(target.keys() - source_parent.keys() - paths):
+            if not old.startswith(directories):
+                continue
+            if old in moves or not old.endswith(".md") or not target[old].startswith("100"):
+                raise SyncError(f"No unambiguous document migration for {old} at {sha}.")
+            relative = old.removeprefix("docs/")
+            if relative.endswith("_zh.md"):
+                new = f"docs/zh/{relative.removesuffix('_zh.md')}.md"
+            else:
+                new = f"docs/en/{relative}"
+            if (
+                new in occupied
+                or any(str(parent_path) in occupied for parent_path in PurePosixPath(new).parents)
+                or any(path.startswith(f"{new}/") for path in occupied)
+            ):
+                raise SyncError(f"Document migration destination already occupied: {old} -> {new}")
+            moves[old] = new
+            occupied.add(new)
+    return moves, source_renames, tuple(legacy_dirs)
+
+
+def rewrite_document_links(content, old, new, moves, source_renames, legacy_dirs, final_paths):
+    """Rebase local Markdown links and follow known moves within the repository."""
+    old_dir, new_dir = posixpath.dirname(old), posixpath.dirname(new)
+
+    def replace(match):
+        if match["code"] is not None:
+            return match[0]
+        destination = match["destination"]
+        wrapped = destination.startswith("<")
+        url = destination[1:-1] if wrapped else destination
+        path = re.split(r"[?#]", url, maxsplit=1)[0]
+        if not path or path.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
+            return match[0]
+        rooted = path.startswith("/")
+        relative = unquote(path).lstrip("/") if rooted else posixpath.join(old_dir, unquote(path))
+        target = posixpath.normpath(relative)
+        moved_target = moves.get(target)
+        in_split_docs = old.startswith("docs/") and target.startswith(legacy_dirs)
+        if moved_target is None and (old != new or in_split_docs):
+            moved_target = source_renames.get(target)
+        result = moved_target or target
+        if result not in final_paths:
+            if moved_target:
+                raise SyncError(f"Document link target missing after migration: {old} -> {result}")
+            return match[0]
+        if result == target and (rooted or old_dir == new_dir):
+            return match[0]
+        updated = f"/{result}" if rooted else posixpath.relpath(result, new_dir or ".")
+        updated = quote(updated, safe="/") + url[len(path) :]
+        return match["prefix"] + (f"<{updated}>" if wrapped else updated)
+
+    return MARKDOWN_LINK.sub(replace, content)
+
+
+def migrate_documents(base, paths, moves, source_renames, legacy_dirs):
+    """Apply planned moves and link edits together after replay and record their expected tree entries."""
+    if not legacy_dirs:
+        return {}
+    current, target = tree("HEAD"), tree(base)
+    final_paths = (current.keys() - moves.keys()).union(moves.values())
+    expected, rewrites = {}, {}
+    for old, entry in sorted(current.items()):
+        if old in paths or not old.endswith(".md") or not entry.startswith("100"):
+            continue
+        new = moves.get(old, old)
+        content = Path(old).read_bytes().decode("utf-8", errors="surrogateescape")
+        updated = rewrite_document_links(content, old, new, moves, source_renames, legacy_dirs, final_paths)
+        if updated != content:
+            if entry != target.get(old):
+                raise SyncError(f"Document changed during source replay: {old}")
+            rewrites[new] = (updated.encode("utf-8", errors="surrogateescape"), entry)
+    for old, new in moves.items():
+        if current.get(old) != target[old]:
+            raise SyncError(f"Document changed during source replay: {old}")
+        if Path(new).exists() or Path(new).is_symlink():
+            raise SyncError(f"Document migration destination already occupied: {old} -> {new}")
+    for old, new in moves.items():
+        Path(new).parent.mkdir(parents=True, exist_ok=True)
+        git("mv", "--", old, new)
+        expected[old], expected[new] = None, current[old]
+        print(f"Migrated GitHub document: {old} -> {new}", flush=True)
+    for path, (content, entry) in rewrites.items():
+        Path(path).write_bytes(content)
+        git("add", "--update", "--", f":(literal){path}")
+        blob = git("hash-object", f"--path={path}", "--", path)
+        expected[path] = f"{entry.rsplit(' ', 1)[0]} {blob}"
+        print(f"Updated Markdown links: {path}", flush=True)
+    if expected:
+        git("commit", "-m", "sync: migrate GitHub documentation and update links")
+    return expected
+
+
 def literal_includes(content):
     return {
         "include/" + dependency
@@ -161,12 +281,17 @@ def check_includes(source, paths):
         raise SyncError("Missing historical include dependencies:\n" + "\n".join(missing))
 
 
-def validate_result(base, source, paths):
+def validate_result(base, source, paths, document_entries=None):
     """Verify source alignment and preserve unrelated target paths before pushing."""
     result_tree, source_tree, base_tree = tree("HEAD"), tree(source), tree(base)
     mismatches = sorted(p for p in paths if result_tree.get(p) != source_tree.get(p))
     if mismatches:
         raise SyncError("Replayed paths differ from GitCode source:\n" + "\n".join(mismatches))
+    for path, entry in (document_entries or {}).items():
+        if entry is None:
+            base_tree.pop(path, None)
+        else:
+            base_tree[path] = entry
     unrelated = sorted(
         p for p in result_tree.keys() | base_tree.keys() if p not in paths and result_tree.get(p) != base_tree.get(p)
     )
@@ -243,7 +368,10 @@ def replay(cut, source, base):
     skipped = 0
     for sha in commits:
         parents = git("rev-list", "--parents", "-n", "1", sha).split()[1:]
-        args = ["git", "-c", "core.editor=true", "cherry-pick"]
+        args = ["git", "-c", "core.editor=true"]
+        if sha in DOCUMENT_SPLITS:
+            args += ["-c", "merge.directoryRenames=false"]
+        args.append("cherry-pick")
         if len(parents) > 1:
             args += ["-m", "1"]
         result = command(*args, sha, check=False)
@@ -260,7 +388,9 @@ def replay(cut, source, base):
             skipped += 1
             continue
         command("git", "cherry-pick", "--abort", check=False)
-        raise SyncError(f"Cannot replay {sha}; no conflict was automatically overwritten.\n{result.stderr}")
+        raise SyncError(
+            f"Cannot replay {sha}; no conflict was automatically overwritten.\n{result.stdout}{result.stderr}"
+        )
     return len(commits), skipped
 
 
@@ -320,9 +450,12 @@ def sync():
     expected_head = remote.split()[0] if remote else ""
     if existing and expected_head != existing["headRefOid"]:
         raise SyncError("PR head changed during planning; retry without overwriting it.")
-    paths, reconciled_paths, reconciliation = reconcile_baseline(base, cut, source)
+    paths = baseline_paths(base, cut, source)
+    moves, source_renames, legacy_dirs = plan_document_moves(base, cut, source, paths)
+    _, reconciled_paths, reconciliation = reconcile_baseline(base, cut, source, paths)
     count, skipped = replay(cut, source, reconciliation or base)
-    source_whitespace = validate_result(base, source, paths)
+    document_entries = migrate_documents(base, paths, moves, source_renames, legacy_dirs)
+    source_whitespace = validate_result(base, source, paths, document_entries)
     generated = git("rev-parse", "HEAD")
     print(f"First-parent commits: {count}; skipped empty: {skipped}; sync head: {generated}", flush=True)
     if command("git", "diff", "--quiet", base, "HEAD", check=False).returncode == 0:
@@ -355,6 +488,13 @@ def sync():
         if source_whitespace
         else ""
     )
+    migration_details = (
+        "GitHub documents migrated using the GitCode layout:\n"
+        + "\n".join(f"- `{old}` → `{new}`" for old, new in moves.items())
+        + "\n\n"
+        if moves
+        else ""
+    )
     body = (
         f"Automated sync from GitCode `cann/pto-isa:{config['source']}` into GitHub `{upstream}:{config['target']}`.\n\n"
         "Includes historical baseline reconciliation and subsequent source commits in this single PR.\n\n"
@@ -363,6 +503,7 @@ def sync():
         f"Sync head SHA:\n`{generated}`\n\nSync mode:\n`baseline-reconciliation-and-first-parent-cherry-pick`\n\n"
         f"{reconciliation_details}"
         f"Replayed source commits: {count}; skipped empty: {skipped}.\n\n"
+        f"{migration_details}"
         f"{formatting_note}"
         "GitHub CI still needs to pass before this PR is merged.\n"
     )
